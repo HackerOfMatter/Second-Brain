@@ -20,7 +20,7 @@ copy config.example.yaml config.yaml
 notepad config.yaml          # set `vault:` to your Obsidian vault path
 ```
 
-Then pull a model (you already have Ollama):
+Then pull a model :
 
 ```powershell
 ollama pull llama3.1:8b
