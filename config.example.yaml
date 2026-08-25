@@ -1,0 +1,149 @@
+# Second Brain configuration.
+# Copy to config.yaml and edit. Every value below is the default, so an empty
+# config.yaml is valid — you only need the ones you want to change.
+
+# ---------------------------------------------------------------- vault ----
+# Where your Obsidian vault lives. This is the only setting most people change.
+# Windows: use forward slashes or double backslashes.
+vault: C:/Users/lj/Obsidian/SecondBrain
+
+host: 127.0.0.1        # localhost only. Do not expose this to a network.
+port: 8787
+
+# ------------------------------------------------------------------ llm ----
+llm:
+  provider: ollama     # ollama (local, default) | cloud | heuristic (no model)
+  ollama_url: http://localhost:11434
+  # ---- two lanes ----
+  # Every model call names a job, and the job decides which model answers it.
+  # The split is not about importance, it is about what the job needs.
+  #
+  #   model         the fast lane. `parse` runs on every capture while you
+  #                 wait, and sb/extract.py has already settled the parts that
+  #                 matter most. Small and quick beats large and thorough.
+  #   study_model   the good lane. A flashcard is permanent and gets drilled
+  #                 into you on an optimal schedule; marking a typed answer is
+  #                 a judgement about meaning; explaining and answering are
+  #                 teaching. None of these run mid-sentence, so quality wins.
+  #
+  # Leave study_model blank to run one model for everything — the right
+  # setting on a machine that cannot spare the VRAM.
+  model: llama3.1:8b   # ollama pull llama3.1:8b
+  study_model: ""      # e.g. phi4 — ollama pull phi4
+  study_roles: [generate, grade, explain, ask]   # anything not here uses `model`
+
+  embed_model: nomic-embed-text   # used by the RAG index
+
+  # How long Ollama holds each model in VRAM after a call. These differ on
+  # purpose: a 12GB card cannot keep an 8B and a 14B resident at once, so the
+  # lanes take turns, and the turn-taking should favour whichever one you are
+  # in the middle of. A capture is one call; a review session is fifty.
+  keep_alive: "5m"
+  study_keep_alive: "30m"
+
+  # If the provider is unreachable, parse with rules instead of failing the
+  # capture. Turn off only if you would rather a capture error out.
+  fallback_to_heuristic: true
+
+  temperature: 0.1
+  timeout_s: 120
+
+  # Only used when provider: cloud. The key is read from the environment,
+  # never stored in this file.
+  cloud_provider: anthropic       # anthropic | openai
+  cloud_model: claude-sonnet-4-5
+  cloud_api_key_env: ANTHROPIC_API_KEY
+
+# -------------------------------------------------------------- planner ----
+# How Project steps become calendar blocks.
+planner:
+  work_start: "09:00"
+  work_end: "18:00"
+  workdays: [0, 1, 2, 3, 4]      # 0 = Monday
+  max_minutes_per_day: 180       # cap on scheduled deep work per day
+  block_gap_minutes: 15
+  deadline_buffer_days: 1
+  respect_area_blocks: false     # true = never schedule work over a habit
+
+# ------------------------------------------------------------- calendar ----
+# Two streams, and the split matters:
+#   events — things that occupy time (project work blocks, recurring areas)
+#   tasks  — things that are due. Projects only; areas never fall due.
+calendar:
+  sink: ics                      # events: ics | google | both
+  task_sink: auto                # due dates: auto (follow sink) | ics | google | both | none
+  ics_filename: secondbrain.ics
+  reminder_minutes: [1440, 60]   # 1 day and 1 hour before a due date
+  google_calendar_id: primary
+  google_tasklist: Second Brain  # created on first sync; "@default" uses your main list
+  google_credentials_file: credentials.json   # placed in <vault>/_system/
+  google_token_file: token.json
+  timezone: ""                   # blank = system local
+
+  emoji_prefix: true             # 📝 / 💚 / 🧹 in front of a title. Google Tasks
+                                 # has no colour API, so this is a task's only
+                                 # colour signal — leave it on.
+  color_events: true             # COLOR: in the .ics, colorId in Google Calendar
+
+  # Extend or override the keyword→colour table in sb/taxonomy.py. Keywords are
+  # *added* to the built-in list unless you pass replace_keywords: true.
+  categories: {}
+  #   hw:     {keywords: [calc, orgo, bio 201]}
+  #   church: {emoji: "⛪", color: teal, hex: "#009688", google_color_id: "7",
+  #            keywords: [church, service, small group]}
+
+# ---------------------------------------------------------------- areas ----
+# Areas are ongoing, so they get a recurring block of real time instead of a
+# deadline. New areas start here; change any of it per-area in the dashboard.
+areas:
+  default_time: "18:00"
+  default_duration_minutes: 30
+  schedule_review: true          # one weekly event to revisit every area
+  schedule_review_weekday: 6     # 6 = Sunday
+  schedule_review_time: "19:00"
+  schedule_review_minutes: 20
+
+# --------------------------------------------------------------- review ----
+review:
+  resource_cycle_days: 90        # how often a Resource is asked "still needed?"
+  habit_checkin_weekday: 6       # 6 = Sunday
+  graduation_mastery_threshold: 0.85
+  graduation_min_reps: 4
+
+# ---------------------------------------------------------------- study ----
+# The tutor: flashcards, spaced repetition, and the mixed-subject session.
+# Decks live in `_decks/` inside the vault. Unlike `_system/`, that folder is
+# not disposable — it holds your review history.
+study:
+  # FSRS. This is the one dial worth touching: 0.9 means a card is shown when
+  # the model puts your chance of having forgotten it at 10%. Raising it
+  # shortens every interval and multiplies your daily load steeply.
+  desired_retention: 0.9
+  maximum_interval_days: 3650
+  # Personal FSRS weights, if you ever fit them from _decks/_reviews.jsonl.
+  # Empty means the published FSRS-5 defaults, which are good for anyone.
+  weights: []
+
+  # Daily volume. Caps exist so a backlog is a slope, not a wall.
+  new_cards_per_day: 10
+  max_reviews_per_day: 120
+  session_size: 40
+  # Mix subjects within one session rather than finishing a deck at a time.
+  # Harder in the moment, measurably better retention. Set false for blocked
+  # practice if you'd rather.
+  interleave: true
+
+  # Card generation
+  generate_max_cards: 20
+  generate_per_passage: 3
+
+  # Graduation (blueprint §4). A card counts as learned once it has survived
+  # `review.graduation_min_reps` spaced attempts *and* the model predicts it
+  # will still be there this many days out.
+  mature_stability_days: 21
+  min_cards_to_graduate: 6
+
+  # A daily review block on the calendar, like any other recurring commitment.
+  calendar_event: true
+  study_time: "19:30"
+  study_minutes: 20

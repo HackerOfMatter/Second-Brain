@@ -1,0 +1,931 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14'%3E%F0%9F%93%9A%3C/text%3E%3C/svg%3E">
+<title>Second Brain — Study</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --panel-2: #f0efea; --line: #e2e0d9;
+    --ink: #1a1a17; --muted: #6f6d66; --faint: #94918a;
+    --accent: #b8502a; --accent-soft: #f3e3dc;
+    --area: #3f7d6b; --project: #b8502a; --resource: #4a6b9c;
+    --warn: #a8571b; --danger: #a33232; --good: #3f7d6b;
+    --radius: 10px; --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --panel: #1e1e23; --panel-2: #26262c; --line: #34343c;
+      --ink: #e8e6e1; --muted: #9d9a94; --faint: #77746e;
+      --accent: #e08b5f; --accent-soft: #3a2a22;
+      --area: #6fb39c; --project: #e08b5f; --resource: #7fa3d6;
+      --warn: #d99b52; --danger: #d97070; --good: #6fb39c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 28px 20px 80px; }
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--faint); font-size: 13px; }
+  .spacer { flex: 1; }
+  a { color: var(--accent); }
+
+  button {
+    font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--ink); padding: 8px 14px; transition: .12s;
+  }
+  button:hover { border-color: var(--muted); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { filter: brightness(1.06); }
+  input[type=text], textarea, select {
+    font: inherit; width: 100%; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  }
+  textarea { resize: vertical; }
+  kbd {
+    font: 11px var(--mono); background: var(--bg); border: 1px solid var(--line);
+    border-bottom-width: 2px; border-radius: 4px; padding: 1px 5px; color: var(--muted);
+  }
+
+  nav.tabs { display: flex; gap: 6px; margin-bottom: 18px; flex-wrap: wrap; }
+  nav.tabs button.on { background: var(--ink); border-color: var(--ink); color: var(--bg); }
+
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 18px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; font-weight: 600;
+       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { color: var(--faint); font-size: 13.5px; font-style: italic; }
+  .hint { color: var(--faint); font-size: 12.5px; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .pill.good { color: var(--good); border-color: var(--good); }
+  .pill.new  { color: var(--resource); border-color: var(--resource); }
+  .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 3px; flex: none; }
+  .bar { height: 4px; background: var(--panel-2); border-radius: 2px; overflow: hidden; margin: 8px 0; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+  /* ---- review ---- */
+  .subjects { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+  .subjects button { padding: 4px 10px; font-size: 12.5px; border-radius: 999px; }
+  .subjects button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--ink); }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 30px 26px; min-height: 190px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .card .qmeta { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--faint); }
+  .card .q { font-size: 21px; line-height: 1.45; white-space: pre-wrap; }
+  .card .a { font-size: 17px; line-height: 1.5; white-space: pre-wrap; border-top: 1px solid var(--line); padding-top: 14px; }
+  .card .why { font-size: 13px; color: var(--muted); border-left: 2px solid var(--line); padding-left: 10px; white-space: pre-wrap; }
+  .progressline { display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--faint); margin-bottom: 10px; }
+  .progressline .bar { flex: 1; margin: 0; }
+
+  .grades { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 14px; }
+  .grades button { display: flex; flex-direction: column; gap: 2px; align-items: center; padding: 10px 6px; }
+  .grades .lbl { font-size: 14px; }
+  .grades .iv { font: 11px var(--mono); color: var(--muted); }
+  .grades button[data-grade="1"]:hover { border-color: var(--danger); }
+  .grades button[data-grade="3"]:hover { border-color: var(--good); }
+
+  .marking { border-radius: 8px; padding: 12px 14px; font-size: 14px; }
+  .marking.hit  { background: color-mix(in srgb, var(--good) 12%, transparent); border: 1px solid var(--good); }
+  .marking.miss { background: color-mix(in srgb, var(--danger) 12%, transparent); border: 1px solid var(--danger); }
+  .marking .score { font: 12px var(--mono); color: var(--muted); }
+
+  #explain { white-space: pre-wrap; font-size: 14px; line-height: 1.6; }
+
+  /* ---- decks ---- */
+  .deck { border-top: 1px solid var(--line); padding: 14px 0; }
+  .deck:first-of-type { border-top: none; padding-top: 0; }
+  .deck strong { font-weight: 600; }
+  .deck strong, .card .qmeta span, .subjects button {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40ch;
+  }
+  .deck strong { display: inline-block; vertical-align: bottom; }
+  .card .qmeta span:not(#cflags) { display: inline-block; vertical-align: bottom; }
+  code { font: 13px var(--mono); background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
+  .deckstats { color: var(--muted); font-size: 12.5px; display: flex; gap: 12px; flex-wrap: wrap; margin-top: 3px; }
+  .cardrow { border-top: 1px dashed var(--line); padding: 10px 0; font-size: 14px; }
+  .cardrow .cq { font-weight: 500; }
+  .cardrow .ca { color: var(--muted); margin-top: 2px; }
+  .cardrow .acts { display: flex; gap: 6px; margin-top: 7px; }
+  .cardrow .acts button { padding: 3px 9px; font-size: 12px; }
+
+  /* ---- ask ---- */
+  .askbar { display: flex; gap: 8px; align-items: stretch; flex-wrap: wrap; }
+  .askbar input[type=text] { flex: 1; min-width: 240px; font-size: 15.5px; padding: 11px 13px; }
+  #answer { font-size: 15.5px; line-height: 1.65; white-space: pre-wrap; }
+  #answer cite {
+    font-style: normal; font: 11px var(--mono); vertical-align: super;
+    color: var(--accent); cursor: pointer; padding: 0 1px;
+  }
+  #answer cite:hover { text-decoration: underline; }
+  .src { border-top: 1px solid var(--line); padding: 11px 0; font-size: 13.5px; }
+  .src:first-child { border-top: none; padding-top: 0; }
+  .src.unused { opacity: .55; }
+  .src .n { font: 11px var(--mono); color: var(--accent); }
+  .src .q { color: var(--muted); display: block; margin-top: 4px; }
+  .src.flash { background: var(--accent-soft); border-radius: 6px; }
+  .ungrounded { color: var(--muted); font-style: italic; }
+
+  /* ---- progress ---- */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
+  .kpi { background: var(--panel-2); border-radius: 8px; padding: 12px 14px; }
+  .kpi b { display: block; font-size: 23px; font-weight: 600; letter-spacing: -0.02em; }
+  .kpi span { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .heat { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 11px); gap: 3px; overflow-x: auto; padding-bottom: 4px; }
+  .heat i { width: 11px; height: 11px; border-radius: 2px; background: var(--panel-2); display: block; }
+  .forecast { display: flex; align-items: flex-end; gap: 4px; height: 90px; }
+  .forecast div { flex: 1; background: var(--accent-soft); border-top: 2px solid var(--accent); border-radius: 2px 2px 0 0; min-height: 2px; position: relative; }
+  .forecast div span { position: absolute; bottom: -18px; left: 0; right: 0; text-align: center; font: 9px var(--mono); color: var(--faint); }
+
+  #toast {
+    position: fixed; right: 18px; bottom: 18px; max-width: 380px; z-index: 20;
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 12px 14px; box-shadow: 0 8px 28px rgba(0,0,0,.18);
+    font-size: 13.5px; opacity: 0; transform: translateY(8px); transition: .18s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; transform: none; }
+  #toast .t-head { font-weight: 600; margin-bottom: 3px; }
+  #toast.warn { border-left-color: var(--warn); }
+  #toast.err  { border-left-color: var(--danger); }
+  .hide { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Study<span>.</span></h1>
+    <span class="sub" id="subline"></span>
+    <span class="spacer"></span>
+    <a href="/">← dashboard</a>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="review" class="on">Review</button>
+    <button data-tab="decks">Decks &amp; cards</button>
+    <button data-tab="progress">Progress</button>
+    <button data-tab="ask">Ask</button>
+  </nav>
+
+  <!-- ================= REVIEW ================= -->
+  <div id="tab-review">
+    <section id="startpanel">
+      <h2>Start a session</h2>
+      <div class="subjects" id="subjects"></div>
+      <div class="row">
+        <button class="primary" id="start">Start reviewing</button>
+        <label class="hint"><input type="checkbox" id="recallmode"> Type my answers (marked by the tutor)</label>
+        <span class="spacer"></span>
+        <span class="hint" id="availability"></span>
+      </div>
+      <p class="hint" style="margin:12px 0 0">
+        Subjects are mixed together on purpose. Studying one deck at a time feels
+        more productive and remembers worse — the context never changes, so you
+        recall from working memory instead of from storage.
+      </p>
+    </section>
+
+    <div id="runner" class="hide">
+      <div class="progressline">
+        <span id="posn"></span>
+        <div class="bar"><i id="sessbar" style="width:0"></i></div>
+        <span id="remaining"></span>
+        <button id="quit" style="padding:3px 9px;font-size:12px">End</button>
+      </div>
+
+      <div class="card">
+        <div class="qmeta">
+          <span class="swatch" id="csw"></span>
+          <span id="csubject"></span>
+          <span id="cflags"></span>
+        </div>
+        <div class="q" id="cq"></div>
+
+        <div id="typedbox" class="hide">
+          <textarea id="typed" rows="3" placeholder="Write the answer from memory, then press Ctrl+Enter."></textarea>
+          <div class="row" style="margin-top:8px">
+            <button class="primary" id="marks">Mark it<kbd style="margin-left:7px">⌃⏎</kbd></button>
+            <button id="skipmark">Show answer</button>
+          </div>
+        </div>
+
+        <div id="markresult" class="marking hide"></div>
+        <div class="a hide" id="ca"></div>
+        <div class="why hide" id="cwhy"></div>
+
+        <div class="row hide" id="explainrow">
+          <button id="explainbtn">Explain this<kbd style="margin-left:7px">e</kbd></button>
+          <input type="text" id="explainq" placeholder="or ask something specific…" style="flex:1;min-width:180px">
+        </div>
+        <div id="explain" class="hide"></div>
+      </div>
+
+      <div id="revealrow" class="row" style="margin-top:14px">
+        <button class="primary" id="reveal">Show answer<kbd style="margin-left:7px">space</kbd></button>
+      </div>
+
+      <div class="grades hide" id="grades">
+        <button data-grade="1"><span class="lbl">Again</span><span class="iv" id="iv1"></span></button>
+        <button data-grade="2"><span class="lbl">Hard</span><span class="iv" id="iv2"></span></button>
+        <button data-grade="3"><span class="lbl">Good</span><span class="iv" id="iv3"></span></button>
+        <button data-grade="4"><span class="lbl">Easy</span><span class="iv" id="iv4"></span></button>
+      </div>
+      <p class="hint" id="gradehint" style="margin-top:10px"></p>
+    </div>
+
+    <section id="donepanel" class="hide">
+      <h2>Session finished</h2>
+      <div id="donebody"></div>
+    </section>
+
+    <section id="gradpanel" class="hide">
+      <h2>Ready to graduate?</h2>
+      <div id="gradbody"></div>
+    </section>
+  </div>
+
+  <!-- ================= DECKS ================= -->
+  <div id="tab-decks" class="hide">
+    <section>
+      <h2>Make cards from a note</h2>
+      <div class="row">
+        <select id="notepick" style="flex:1;min-width:200px"></select>
+        <button class="primary" id="gen">Generate cards</button>
+      </div>
+      <p class="hint" style="margin:10px 0 0">
+        Cards land as drafts. Nothing is scheduled until you have read it — a wrong
+        flashcard is worse than no flashcard, because spaced repetition will drill
+        the error into you on a perfect schedule.
+      </p>
+    </section>
+    <section>
+      <h2>Decks</h2>
+      <div id="decklist"><p class="empty">Loading…</p></div>
+    </section>
+    <section id="deckdetail" class="hide">
+      <h2 id="deckname"></h2>
+      <div id="deckcards"></div>
+      <div style="border-top:1px solid var(--line);margin-top:14px;padding-top:14px">
+        <div class="row" style="align-items:stretch">
+          <input type="text" id="newfront" placeholder="Question" style="flex:2;min-width:180px">
+          <input type="text" id="newback" placeholder="Answer" style="flex:2;min-width:180px">
+          <button id="addcard">Add</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ================= ASK ================= -->
+  <div id="tab-ask" class="hide">
+    <section>
+      <h2>Ask your notes</h2>
+      <div class="askbar">
+        <input type="text" id="q" placeholder="What did I write about…?" autocomplete="off">
+        <button class="primary" id="asksend">Ask</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label class="hint"><input type="checkbox" id="inclarchive"> Include archive</label>
+        <span class="spacer"></span>
+        <span class="hint" id="idxstate"></span>
+        <button id="reindex" style="padding:4px 10px;font-size:12px">Re-index</button>
+      </div>
+      <p class="hint" style="margin:10px 0 0">
+        Answers come from your resources only, with citations. Archived notes are
+        left out unless you tick the box — archiving something is a decision that
+        it is no longer relevant, and quietly ignoring that would make Archive
+        meaningless.
+      </p>
+    </section>
+
+    <section id="answerbox" class="hide">
+      <h2 id="answerhead">Answer</h2>
+      <div id="answer"></div>
+      <div id="answernote" class="hint" style="margin-top:10px"></div>
+    </section>
+
+    <section id="sourcebox" class="hide">
+      <h2>Sources</h2>
+      <div id="sources"></div>
+    </section>
+  </div>
+
+  <!-- ================= PROGRESS ================= -->
+  <div id="tab-progress" class="hide">
+    <section>
+      <h2>How often you study</h2>
+      <div class="kpis" id="kpis"></div>
+      <div style="margin-top:18px">
+        <div class="heat" id="heat"></div>
+        <p class="hint" style="margin-top:8px">Last 26 weeks. Each column is a week, each square a day.</p>
+      </div>
+    </section>
+    <section>
+      <h2>Coming due — next 14 days</h2>
+      <div class="forecast" id="forecast"></div>
+      <div style="height:22px"></div>
+    </section>
+    <section>
+      <h2>By subject</h2>
+      <div id="bysubject"></div>
+    </section>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// Answers are markdown-ish: a cloze answer marks its filled blank in bold, and
+// the model writes `code` and **emphasis**. Escape first, then re-admit exactly
+// those two — nothing here can inject markup.
+const md = s => esc(s)
+  .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+  .replace(/`([^`]+)`/g, "<code>$1</code>");
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: {"Content-Type": "application/json"}}, opts));
+  const data = await r.json().catch(() => ({error: "bad response"}));
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+
+let toastTimer;
+function toast(head, body, kind) {
+  const el = $("#toast");
+  el.className = "show " + (kind || "");
+  el.innerHTML = `<div class="t-head">${esc(head)}</div><div>${esc(body || "")}</div>`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.className = ""), kind === "err" ? 9000 : 5000);
+}
+
+function human(days) {
+  if (days == null) return "";
+  if (days < 1) return "<1d";
+  if (days < 31) return days + "d";
+  if (days < 365) return (days / 30.44).toFixed(1).replace(".0", "") + "mo";
+  return (days / 365.25).toFixed(1).replace(".0", "") + "y";
+}
+
+let CATS = {}, STATE = {overview: null, selected: new Set(), openDeck: null};
+const swatch = key => CATS[key] ? `<span class="swatch" style="background:${esc(CATS[key].hex)}"></span>` : "";
+
+// ------------------------------------------------------------------ tabs
+$$("nav.tabs button").forEach(b => b.addEventListener("click", () => {
+  $$("nav.tabs button").forEach(x => x.classList.toggle("on", x === b));
+  ["review", "decks", "progress", "ask"].forEach(t =>
+    $("#tab-" + t).classList.toggle("hide", t !== b.dataset.tab));
+  if (b.dataset.tab !== "review") endSession(true);
+  if (b.dataset.tab === "ask") { loadIndexState(); setTimeout(() => $("#q").focus(), 40); }
+}));
+
+// ------------------------------------------------------------------ overview
+async function loadOverview() {
+  const d = await api("/api/study/overview");
+  STATE.overview = d;
+  CATS = Object.fromEntries((d.categories || []).map(c => [c.key, c]));
+  renderSubjects(d);
+  renderDecks(d);
+  renderNotePicker(d);
+  renderProgress(d.stats, d.decks);
+  renderGraduation(d.graduation);
+  const s = d.stats;
+  $("#subline").textContent =
+    `${s.cards.due_today} due · ${s.cards.active} cards · ${s.streak}-day streak`;
+}
+
+function renderSubjects(d) {
+  const el = $("#subjects");
+  const decks = d.decks.filter(x => x.active > 0);
+  if (!decks.length) {
+    el.innerHTML = `<span class="empty">No cards yet — make some under “Decks &amp; cards”.</span>`;
+    $("#start").disabled = true;
+    $("#availability").textContent = "";
+    return;
+  }
+  $("#start").disabled = false;
+  el.innerHTML = decks.map(x => `
+    <button data-subject="${esc(x.note_id)}" class="${STATE.selected.has(x.note_id) ? "on" : ""}">
+      ${swatch(x.category)} ${esc(x.subject)}
+      <span class="pill" style="margin-left:5px">${x.due}${x.new ? "+" + x.new : ""}</span>
+    </button>`).join("");
+  const due = decks.reduce((a, x) => a + x.due, 0);
+  const fresh = decks.reduce((a, x) => a + x.new, 0);
+  $("#availability").textContent =
+    `${due} due, ${fresh} new · ${d.today.reviewed} done today` +
+    (STATE.selected.size ? ` · ${STATE.selected.size} subject(s) selected` : " · all subjects");
+}
+
+$("#subjects").addEventListener("click", e => {
+  const b = e.target.closest("button[data-subject]");
+  if (!b) return;
+  const id = b.dataset.subject;
+  STATE.selected.has(id) ? STATE.selected.delete(id) : STATE.selected.add(id);
+  renderSubjects(STATE.overview);
+});
+
+function renderGraduation(list) {
+  const panel = $("#gradpanel");
+  if (!list || !list.length) { panel.classList.add("hide"); return; }
+  panel.classList.remove("hide");
+  $("#gradbody").innerHTML = list.map(g => `
+    <div class="row" style="padding:8px 0">
+      <strong>${esc(g.title)}</strong>
+      <span class="pill good">${Math.round(g.mastery * 100)}% mastered</span>
+      <span class="hint">${g.mature} of ${g.active} cards mature</span>
+      <span class="spacer"></span>
+      <button class="primary" data-grad="${esc(g.note_id)}">Move to Resources</button>
+      <button data-keep="${esc(g.note_id)}">Not yet</button>
+    </div>`).join("") +
+    `<p class="hint" style="margin-top:8px">The cards and their history come with it — a
+     graduated Project keeps being reviewed, it just stops being work in progress.</p>`;
+}
+
+document.addEventListener("click", async e => {
+  const g = e.target.closest("button[data-grad]");
+  if (g) {
+    try {
+      await api(`/api/notes/${g.dataset.grad}/move`, {method: "POST", body: JSON.stringify({bucket: "resource"})});
+      toast("Graduated", "Filed under Resources. Its deck came along.");
+      loadOverview();
+    } catch (err) { toast("Could not graduate", err.message, "err"); }
+  }
+  const k = e.target.closest("button[data-keep]");
+  if (k) { $("#gradpanel").classList.add("hide"); toast("Left as a Project", "It will ask again next session."); }
+});
+
+// ------------------------------------------------------------------ session
+let SESSION = null;
+
+$("#start").addEventListener("click", startSession);
+
+async function startSession() {
+  try {
+    const body = {subjects: [...STATE.selected]};
+    const d = await api("/api/study/session", {method: "POST", body: JSON.stringify(body)});
+    if (!d.queue.length) { toast("Nothing to review", d.message); return; }
+    SESSION = {queue: d.queue, i: 0, total: d.queue.length, done: 0, again: 0, started: Date.now()};
+    $("#startpanel").classList.add("hide");
+    $("#donepanel").classList.add("hide");
+    $("#runner").classList.remove("hide");
+    showCard();
+  } catch (e) { toast("Could not start", e.message, "err"); }
+}
+
+function endSession(silent) {
+  if (!SESSION) return;
+  const {done, again} = SESSION;
+  SESSION = null;
+  $("#runner").classList.add("hide");
+  $("#startpanel").classList.remove("hide");
+  if (!silent && done) {
+    $("#donepanel").classList.remove("hide");
+    $("#donebody").innerHTML =
+      `<p>${done} card${done === 1 ? "" : "s"} reviewed${again ? `, ${again} to see again` : ""}.</p>`;
+  }
+  loadOverview();
+}
+
+$("#quit").addEventListener("click", () => endSession(false));
+
+let CARD = null, REVEALED = false, SHOWN_AT = 0;
+
+function showCard() {
+  if (!SESSION) return;
+  if (SESSION.i >= SESSION.queue.length) { endSession(false); return; }
+  CARD = SESSION.queue[SESSION.i];
+  REVEALED = false;
+  SHOWN_AT = Date.now();
+
+  $("#csw").style.background = (CATS[CARD.category] || {}).hex || "transparent";
+  $("#csubject").textContent = CARD.subject;
+  $("#cflags").innerHTML =
+    (CARD.reason === "new" ? `<span class="pill new">new</span> ` : "") +
+    (CARD.overdue_days > 0 ? `<span class="pill warn">${CARD.overdue_days}d overdue</span> ` : "") +
+    (CARD.kind === "cloze" ? `<span class="pill">cloze</span>` : "");
+  $("#cq").innerHTML = md(CARD.question);
+
+  $("#ca").classList.add("hide");
+  $("#cwhy").classList.add("hide");
+  $("#grades").classList.add("hide");
+  $("#explainrow").classList.add("hide");
+  $("#explain").classList.add("hide");
+  $("#markresult").classList.add("hide");
+  $("#gradehint").textContent = "";
+  $("#typed").value = "";
+
+  const recall = $("#recallmode").checked;
+  $("#typedbox").classList.toggle("hide", !recall);
+  $("#revealrow").classList.toggle("hide", recall);
+  if (recall) setTimeout(() => $("#typed").focus(), 30);
+
+  $("#posn").textContent = `${SESSION.i + 1} / ${SESSION.queue.length}`;
+  $("#remaining").textContent = `${SESSION.queue.length - SESSION.i - 1} left`;
+  $("#sessbar").style.width = (SESSION.i / SESSION.queue.length * 100) + "%";
+}
+
+async function reveal() {
+  if (!CARD || REVEALED) return;
+  REVEALED = true;
+  try {
+    const full = await api(`/api/study/${CARD.note_id}/${CARD.id}/reveal`);
+    CARD.answer = full.answer;
+    CARD.intervals = full.intervals;
+    $("#ca").innerHTML = md(full.answer);
+    $("#ca").classList.remove("hide");
+    if (full.source) { $("#cwhy").textContent = full.source; $("#cwhy").classList.remove("hide"); }
+    showGrades(full.intervals);
+    $("#explainrow").classList.remove("hide");
+    $("#revealrow").classList.add("hide");
+    $("#typedbox").classList.add("hide");
+  } catch (e) { toast("Could not load the answer", e.message, "err"); REVEALED = false; }
+}
+
+function showGrades(intervals) {
+  $("#iv1").textContent = human(intervals.again);
+  $("#iv2").textContent = human(intervals.hard);
+  $("#iv3").textContent = human(intervals.good);
+  $("#iv4").textContent = human(intervals.easy);
+  $("#grades").classList.remove("hide");
+  $("#gradehint").textContent = "How well did you actually know it? Keys 1–4.";
+}
+
+$("#reveal").addEventListener("click", reveal);
+$("#skipmark").addEventListener("click", reveal);
+
+$("#marks").addEventListener("click", markTyped);
+$("#typed").addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); markTyped(); }
+});
+
+async function markTyped() {
+  if (!CARD || REVEALED) return;
+  const typed = $("#typed").value.trim();
+  $("#marks").disabled = true;
+  try {
+    const m = await api(`/api/study/${CARD.note_id}/${CARD.id}/mark`,
+      {method: "POST", body: JSON.stringify({typed})});
+    CARD.typed = typed;
+    const box = $("#markresult");
+    box.className = "marking " + (m.correct ? "hit" : "miss");
+    box.innerHTML =
+      `<div>${esc(m.feedback || (m.correct ? "Correct." : "Not quite."))}</div>` +
+      (m.missed ? `<div class="score" style="margin-top:5px">missed: ${esc(m.missed)}</div>` : "") +
+      `<div class="score" style="margin-top:5px">scored ${Math.round(m.score * 100)}% by the ${esc(m.graded_by)} marker · suggested <b>${["", "Again", "Hard", "Good", "Easy"][m.grade]}</b></div>`;
+    box.classList.remove("hide");
+    await reveal();
+    $("#gradehint").textContent =
+      "The marker suggested " + ["", "Again", "Hard", "Good", "Easy"][m.grade] +
+      " — take it or overrule it. You are the one who knows whether you knew it.";
+  } catch (e) { toast("Could not mark", e.message, "err"); }
+  finally { $("#marks").disabled = false; }
+}
+
+$("#grades").addEventListener("click", e => {
+  const b = e.target.closest("button[data-grade]");
+  if (b) grade(Number(b.dataset.grade));
+});
+
+async function grade(g) {
+  if (!CARD || !REVEALED) return;
+  $$("#grades button").forEach(b => b.disabled = true);
+  try {
+    const r = await api(`/api/study/${CARD.note_id}/${CARD.id}/answer`, {
+      method: "POST",
+      body: JSON.stringify({
+        grade: g,
+        mode: CARD.typed !== undefined ? "recall" : "self",
+        typed: CARD.typed || "",
+        seconds: (Date.now() - SHOWN_AT) / 1000,
+      }),
+    });
+    SESSION.done += 1;
+    if (r.again) {
+      // A forgotten card comes back before the session ends, not tomorrow.
+      SESSION.again += 1;
+      const spot = Math.min(SESSION.queue.length, SESSION.i + 4);
+      SESSION.queue.splice(spot, 0, Object.assign({}, CARD, {typed: undefined, reason: "again"}));
+    }
+    if (r.graduation) {
+      toast("Looks learned", `${r.graduation.title} — ${Math.round(r.graduation.mastery * 100)}% mastered. Asking at the end.`);
+    }
+    SESSION.i += 1;
+    showCard();
+  } catch (e) { toast("Could not save the answer", e.message, "err"); }
+  finally { $$("#grades button").forEach(b => b.disabled = false); }
+}
+
+$("#explainbtn").addEventListener("click", explainCard);
+$("#explainq").addEventListener("keydown", e => { if (e.key === "Enter") explainCard(); });
+
+async function explainCard() {
+  if (!CARD) return;
+  const el = $("#explain");
+  el.classList.remove("hide");
+  el.textContent = "Thinking…";
+  try {
+    const r = await api(`/api/study/${CARD.note_id}/${CARD.id}/explain`,
+      {method: "POST", body: JSON.stringify({question: $("#explainq").value})});
+    el.innerHTML = md(r.answer);
+  } catch (e) { el.textContent = "Could not reach the tutor: " + e.message; }
+}
+
+document.addEventListener("keydown", e => {
+  const typing = ["TEXTAREA", "INPUT"].includes(document.activeElement.tagName);
+  if (!SESSION) return;
+  if (e.key === " " && !typing && !REVEALED) { e.preventDefault(); reveal(); return; }
+  if (typing) return;
+  if (["1", "2", "3", "4"].includes(e.key) && REVEALED) { e.preventDefault(); grade(Number(e.key)); }
+  if (e.key === "e" && REVEALED) { e.preventDefault(); explainCard(); }
+});
+
+// ------------------------------------------------------------------ decks
+function renderNotePicker(d) {
+  const opts = [
+    ...d.decks.map(x => `<option value="${esc(x.note_id)}">${esc(x.subject)} — add more</option>`),
+    ...d.candidates.map(c =>
+      `<option value="${esc(c.note_id)}">${esc(c.title)} (${esc(c.bucket)}, ${c.words} words)</option>`),
+  ];
+  $("#notepick").innerHTML = opts.length
+    ? opts.join("")
+    : `<option value="">Nothing to make cards from yet</option>`;
+  $("#gen").disabled = !opts.length;
+}
+
+$("#gen").addEventListener("click", async () => {
+  const id = $("#notepick").value;
+  if (!id) return;
+  $("#gen").disabled = true;
+  $("#gen").textContent = "Reading the note…";
+  try {
+    const r = await api(`/api/decks/${id}/generate`, {method: "POST", body: JSON.stringify({})});
+    toast(
+      r.generated ? `${r.generated} draft cards` : "No cards made",
+      (r.note || `From ${r.passages} passages${r.rejected ? `, ${r.rejected} rejected` : ""}. Review them below.`),
+      r.generated ? (r.degraded ? "warn" : "") : "warn"
+    );
+    await loadOverview();
+    openDeck(id);
+  } catch (e) { toast("Generation failed", e.message, "err"); }
+  finally { $("#gen").disabled = false; $("#gen").textContent = "Generate cards"; }
+});
+
+function renderDecks(d) {
+  const el = $("#decklist");
+  if (!d.decks.length) { el.innerHTML = `<p class="empty">No decks yet.</p>`; return; }
+  el.innerHTML = d.decks.map(x => `
+    <div class="deck">
+      <div class="row">
+        ${swatch(x.category)}
+        <strong>${esc(x.subject)}</strong>
+        ${x.drafts ? `<span class="pill warn">${x.drafts} to review</span>` : ""}
+        ${x.due ? `<span class="pill">${x.due} due</span>` : ""}
+        ${x.ready_to_graduate ? `<span class="pill good">mastered</span>` : ""}
+        <span class="spacer"></span>
+        <button data-open="${esc(x.note_id)}">Open</button>
+      </div>
+      <div class="bar"><i style="width:${Math.round(x.mastery * 100)}%"></i></div>
+      <div class="deckstats">
+        <span>${x.active} active · ${x.new} new · ${x.mature} mature</span>
+        <span>${Math.round(x.mastery * 100)}% mastered</span>
+        <span>${x.retention ? Math.round(x.retention * 100) + "% recall right now" : "not studied yet"}</span>
+      </div>
+    </div>`).join("");
+}
+
+$("#decklist").addEventListener("click", e => {
+  const b = e.target.closest("button[data-open]");
+  if (b) openDeck(b.dataset.open);
+});
+
+async function openDeck(noteId) {
+  try {
+    const deck = await api(`/api/decks/${noteId}`);
+    STATE.openDeck = noteId;
+    $("#deckdetail").classList.remove("hide");
+    $("#deckname").textContent = deck.subject;
+    const drafts = deck.cards.filter(c => c.status === "draft");
+    $("#deckcards").innerHTML =
+      (drafts.length ? `<div class="row" style="margin-bottom:10px">
+          <span class="pill warn">${drafts.length} drafts</span>
+          <button class="primary" id="approveall">Approve all</button>
+          <span class="hint">or approve them one at a time below</span>
+        </div>` : "") +
+      (deck.cards.length ? deck.cards.map(c => `
+        <div class="cardrow">
+          <div class="cq">${md(c.question)}</div>
+          <div class="ca">${md(c.back)}</div>
+          ${c.source ? `<div class="hint" style="margin-top:3px">${esc(c.source)}</div>` : ""}
+          <div class="acts">
+            <span class="pill ${c.status === "draft" ? "warn" : c.status === "suspended" ? "" : "good"}">${esc(c.status)}</span>
+            ${c.reps ? `<span class="pill">${c.reps} reps · ${human(Math.round(c.stability))} stable</span>` : ""}
+            <span class="spacer"></span>
+            ${c.status === "draft" ? `<button data-card-approve="${esc(c.id)}">Approve</button>` : ""}
+            ${c.status === "active" ? `<button data-card-suspend="${esc(c.id)}">Suspend</button>` : ""}
+            ${c.status === "suspended" ? `<button data-card-approve="${esc(c.id)}">Resume</button>` : ""}
+            <button data-card-edit="${esc(c.id)}">Edit</button>
+            <button data-card-del="${esc(c.id)}">Delete</button>
+          </div>
+        </div>`).join("") : `<p class="empty">No cards in this deck.</p>`);
+    $("#deckdetail").scrollIntoView({behavior: "smooth", block: "nearest"});
+  } catch (e) { toast("Could not open deck", e.message, "err"); }
+}
+
+$("#deckdetail").addEventListener("click", async e => {
+  const id = STATE.openDeck;
+  if (!id) return;
+  const post = async (cardId, patch) => {
+    await api(`/api/decks/${id}/cards/${cardId}`, {method: "POST", body: JSON.stringify(patch)});
+    await openDeck(id); loadOverview();
+  };
+  try {
+    if (e.target.id === "approveall") {
+      await api(`/api/decks/${id}/approve`, {method: "POST", body: JSON.stringify({})});
+      toast("Approved", "They enter the schedule from your next session.");
+      await openDeck(id); loadOverview(); return;
+    }
+    const ap = e.target.closest("button[data-card-approve]");
+    if (ap) return post(ap.dataset.cardApprove, {status: "active"});
+    const su = e.target.closest("button[data-card-suspend]");
+    if (su) return post(su.dataset.cardSuspend, {status: "suspended"});
+    const de = e.target.closest("button[data-card-del]");
+    if (de) return post(de.dataset.cardDel, {delete: true});
+    const ed = e.target.closest("button[data-card-edit]");
+    if (ed) {
+      const row = ed.closest(".cardrow");
+      const front = prompt("Question:", row.querySelector(".cq").textContent);
+      if (front === null) return;
+      const back = prompt("Answer:", row.querySelector(".ca").textContent);
+      if (back === null) return;
+      return post(ed.dataset.cardEdit, {front, back});
+    }
+  } catch (err) { toast("Could not update card", err.message, "err"); }
+});
+
+$("#addcard").addEventListener("click", async () => {
+  const id = STATE.openDeck;
+  if (!id) return;
+  try {
+    await api(`/api/decks/${id}/cards`, {method: "POST", body: JSON.stringify({
+      front: $("#newfront").value, back: $("#newback").value,
+    })});
+    $("#newfront").value = ""; $("#newback").value = "";
+    await openDeck(id); loadOverview();
+  } catch (e) { toast("Could not add card", e.message, "err"); }
+});
+
+// ------------------------------------------------------------------ ask
+async function loadIndexState() {
+  try {
+    const s = await api("/api/index");
+    const bits = [];
+    if (!s.built) bits.push("no index yet");
+    else {
+      bits.push(`${s.chunks} passages from ${s.notes} note${s.notes === 1 ? "" : "s"}`);
+      bits.push(s.semantic ? "semantic" : "keyword only");
+      const behind = [];
+      if (s.missing) behind.push(`${s.missing} new`);
+      if (s.stale) behind.push(`${s.stale} edited`);
+      if (s.removed) behind.push(`${s.removed} gone`);
+      if (behind.length) bits.push("· " + behind.join(", ") + " — re-index");
+    }
+    $("#idxstate").textContent = bits.join(" · ");
+  } catch (e) { $("#idxstate").textContent = ""; }
+}
+
+$("#reindex").addEventListener("click", async () => {
+  const b = $("#reindex");
+  b.disabled = true; b.textContent = "Reading your notes…";
+  try {
+    const r = await api("/api/index/rebuild", {method: "POST", body: JSON.stringify({})});
+    toast("Index rebuilt",
+      `${r.chunks} passages · ${r.embedded} embedded, ${r.reused} reused` +
+      (r.warning ? " — " + r.warning : ""), r.warning ? "warn" : "");
+    loadIndexState();
+  } catch (e) { toast("Could not rebuild", e.message, "err"); }
+  finally { b.disabled = false; b.textContent = "Re-index"; }
+});
+
+$("#asksend").addEventListener("click", askNotes);
+$("#q").addEventListener("keydown", e => { if (e.key === "Enter") askNotes(); });
+
+async function askNotes() {
+  const question = $("#q").value.trim();
+  if (!question) { $("#q").focus(); return; }
+  const btn = $("#asksend");
+  btn.disabled = true; btn.textContent = "Reading…";
+  $("#answerbox").classList.remove("hide");
+  $("#answerhead").textContent = "Answer";
+  $("#answer").textContent = "Looking through your notes…";
+  $("#answernote").textContent = "";
+  $("#sourcebox").classList.add("hide");
+  $("#sources").innerHTML = "";
+  try {
+    const r = await api("/api/ask", {method: "POST", body: JSON.stringify({
+      question, include_archive: $("#inclarchive").checked,
+    })});
+    renderAnswer(r);
+  } catch (e) {
+    $("#answer").textContent = "";
+    $("#answernote").textContent = "Could not ask: " + e.message;
+  } finally { btn.disabled = false; btn.textContent = "Ask"; }
+}
+
+function renderAnswer(r) {
+  const el = $("#answer");
+  if (r.answer) {
+    // Turn [1] into a clickable marker that scrolls to the source it names.
+    el.innerHTML = md(r.answer).replace(/\[(\d{1,2})\]/g,
+      (m, n) => `<cite data-src="${n}">${n}</cite>`);
+  } else {
+    el.innerHTML = `<span class="ungrounded">${esc(r.note || "No answer.")}</span>`;
+  }
+  // One caveat, not three. When there is no model the note already says to
+  // start Ollama, and repeating it under a different wording reads as two
+  // separate problems.
+  const notes = [];
+  if (r.note) notes.push(r.note[0].toUpperCase() + r.note.slice(1) +
+                         (/[.!?]$/.test(r.note) ? "" : "."));
+  if (!r.grounded) notes.push("Nothing matched, so nothing was invented to fill the gap.");
+  else if (!r.semantic && !r.note) {
+    notes.push("Keyword search — start Ollama and re-index for semantic matching.");
+  }
+  if (r.searched_archive) notes.push("Archive included.");
+  $("#answernote").textContent = notes.join(" ");
+
+  const box = $("#sourcebox");
+  if (!r.sources.length) { box.classList.add("hide"); $("#sources").innerHTML = ""; return; }
+  box.classList.remove("hide");
+  const used = new Set(r.used || []);
+  $("#sources").innerHTML = r.sources.map(s => `
+    <div class="src ${used.size && !used.has(s.n) ? "unused" : ""}" id="src-${s.n}">
+      <span class="n">[${s.n}]</span>
+      ${swatch(s.category)}
+      <strong>${esc(s.title)}</strong>
+      ${s.heading ? `<span class="hint"> › ${esc(s.heading)}</span>` : ""}
+      ${s.bucket === "archive" ? `<span class="pill">archived</span>` : ""}
+      <span class="q">${esc(s.excerpt)}</span>
+    </div>`).join("");
+}
+
+$("#answer").addEventListener("click", e => {
+  const c = e.target.closest("cite[data-src]");
+  if (!c) return;
+  const row = $("#src-" + c.dataset.src);
+  if (!row) return;
+  row.scrollIntoView({behavior: "smooth", block: "center"});
+  row.classList.add("flash");
+  setTimeout(() => row.classList.remove("flash"), 1200);
+});
+
+// ------------------------------------------------------------------ progress
+function renderProgress(s, decks) {
+  $("#kpis").innerHTML = [
+    [s.streak, "day streak"],
+    [s.today, "today"],
+    [s.reviews_total, "reviews all time"],
+    [s.days_studied, "days studied"],
+    [s.longest_streak, "longest streak"],
+    [s.accuracy_30d == null ? "—" : Math.round(s.accuracy_30d * 100) + "%", "recalled, 30d"],
+    [s.predicted_retention == null ? "—" : Math.round(s.predicted_retention * 100) + "%", "known right now"],
+    [s.cards.mature + "/" + s.cards.active, "mature cards"],
+  ].map(([v, k]) => `<div class="kpi"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join("");
+
+  const max = Math.max(1, ...s.heatmap.map(h => h.count));
+  $("#heat").innerHTML = s.heatmap.map(h => {
+    const a = h.count ? (0.22 + 0.78 * Math.min(1, h.count / max)) : 0;
+    const bg = h.count ? `background:color-mix(in srgb, var(--accent) ${Math.round(a * 100)}%, var(--panel-2))` : "";
+    return `<i style="${bg}" title="${h.date}: ${h.count} reviews"></i>`;
+  }).join("");
+
+  const fmax = Math.max(1, ...s.forecast.map(f => f.count));
+  $("#forecast").innerHTML = s.forecast.map((f, i) => `
+    <div style="height:${Math.max(2, f.count / fmax * 100)}%" title="${f.date}: ${f.count} due">
+      <span>${i === 0 ? "today" : f.date.slice(8)}</span>
+    </div>`).join("");
+
+  $("#bysubject").innerHTML = decks.length ? decks.map(x => `
+    <div class="deck">
+      <div class="row">${swatch(x.category)}<strong>${esc(x.subject)}</strong>
+        <span class="spacer"></span>
+        <span class="hint">${Math.round(x.mastery * 100)}% · ${x.mature}/${x.active} mature</span>
+      </div>
+      <div class="bar"><i style="width:${Math.round(x.mastery * 100)}%"></i></div>
+    </div>`).join("") : `<p class="empty">Nothing studied yet.</p>`;
+}
+
+loadOverview().catch(e => toast("Could not load", e.message, "err"));
+</script>
+</body>
+</html>

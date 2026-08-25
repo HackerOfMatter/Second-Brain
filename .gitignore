@@ -1,0 +1,18 @@
+# runtime / environment
+__pycache__/
+*.pyc
+.venv/
+config.yaml
+_system/
+
+# personal vault content (not part of the code repo)
+00-Inbox/
+10-Areas/
+20-Projects/
+30-Resources/
+40-Archive/
+.obsidian/
+_to_delete/
+*.lnk
+Start here.md
+Untitled.md

@@ -1,0 +1,763 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14'%3E%F0%9F%A7%A0%3C/text%3E%3C/svg%3E">
+<title>Second Brain</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --panel-2: #f0efea; --line: #e2e0d9;
+    --ink: #1a1a17; --muted: #6f6d66; --faint: #94918a;
+    --accent: #b8502a; --accent-soft: #f3e3dc;
+    --area: #3f7d6b; --project: #b8502a; --resource: #4a6b9c;
+    --warn: #a8571b; --danger: #a33232;
+    --radius: 10px; --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --panel: #1e1e23; --panel-2: #26262c; --line: #34343c;
+      --ink: #e8e6e1; --muted: #9d9a94; --faint: #77746e;
+      --accent: #e08b5f; --accent-soft: #3a2a22;
+      --area: #6fb39c; --project: #e08b5f; --resource: #7fa3d6;
+      --warn: #d99b52; --danger: #d97070;
+    }
+  }
+  * { box-sizing: border-box; }
+  /* Native date pickers: the OS dropdown calendar, keyboard-navigable, and
+     theme-aware — `color-scheme` is what makes the popup dark in dark mode. */
+  input[type=date] {
+    font: inherit; font-size: 12.5px; padding: 3px 7px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+    color-scheme: light dark; cursor: pointer;
+  }
+  input[type=date]:hover { border-color: var(--muted); }
+  /* A guessed date reads amber until it is approved. A confirmed one is plain,
+     because "we are sure" is the boring state and should look like it. */
+  input[type=date].guess { border-color: var(--warn); color: var(--warn); }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 20px 80px; }
+
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 22px; flex-wrap: wrap; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--faint); font-size: 13px; }
+  .spacer { flex: 1; }
+
+  /* ---- capture ---- */
+  .capture { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 24px; }
+  textarea {
+    width: 100%; min-height: 84px; resize: vertical; border: none; outline: none;
+    background: transparent; color: var(--ink); font: inherit; line-height: 1.5;
+  }
+  textarea::placeholder { color: var(--faint); }
+  .buttons { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  button {
+    font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--ink); padding: 8px 14px; transition: .12s;
+  }
+  button:hover { border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: default; }
+  .btn-area:hover    { background: var(--area);     border-color: var(--area);     color: #fff; }
+  .btn-project:hover { background: var(--project);  border-color: var(--project);  color: #fff; }
+  .btn-resource:hover{ background: var(--resource); border-color: var(--resource); color: #fff; }
+  kbd {
+    font: 11px var(--mono); background: var(--bg); border: 1px solid var(--line);
+    border-bottom-width: 2px; border-radius: 4px; padding: 1px 5px; color: var(--muted); margin-left: 6px;
+  }
+  .hint { color: var(--faint); font-size: 12px; }
+
+  /* ---- confirm these dates ---- */
+  #datesbox { border-left: 3px solid var(--warn); }
+  .daterow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 9px 0; border-top: 1px solid var(--line); }
+  .daterow:first-child { border-top: none; padding-top: 0; }
+  .daterow strong { font-weight: 600; font-size: 14.5px; }
+  .daterow .why { color: var(--muted); font-size: 12.5px; }
+  .daterow .why q { font-style: italic; }
+
+  /* ---- layout ---- */
+  .cols { display: grid; grid-template-columns: 1.55fr 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 860px) { .cols { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 20px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+
+  /* ---- projects ---- */
+  .project { border-top: 1px solid var(--line); padding: 14px 0; }
+  .project:first-of-type { border-top: none; padding-top: 0; }
+  .ptitle { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .ptitle strong { font-weight: 600; font-size: 15px; }
+  .meta { color: var(--muted); font-size: 12.5px; display: flex; gap: 10px; flex-wrap: wrap; margin-top: 3px; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.due   { color: var(--warn); border-color: var(--warn); }
+  .pill.over  { color: #fff; background: var(--danger); border-color: var(--danger); }
+  .bar { height: 3px; background: var(--panel-2); border-radius: 2px; margin: 9px 0; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  ul.steps { list-style: none; margin: 8px 0 0; padding: 0; }
+  ul.steps li { display: flex; gap: 9px; align-items: flex-start; padding: 3px 0; font-size: 14px; }
+  ul.steps input { margin-top: 4px; accent-color: var(--accent); cursor: pointer; }
+  ul.steps .when { color: var(--faint); font-size: 12px; white-space: nowrap; }
+  .done { color: var(--faint); text-decoration: line-through; }
+  .rowacts { display: flex; gap: 6px; margin-top: 10px; }
+  .rowacts button { padding: 4px 9px; font-size: 12px; }
+
+  /* ---- category colour ---- */
+  .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 3px; flex: none; }
+  select.cat {
+    font: 11px ui-sans-serif, system-ui, sans-serif; padding: 1px 4px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); cursor: pointer;
+    margin-left: auto;
+  }
+
+  /* ---- due tasks ---- */
+  .tasks { list-style: none; margin: 0; padding: 0; }
+  .tasks li { display: flex; gap: 9px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  .tasks li:first-child { border-top: none; }
+  .tasks .t-body { flex: 1; min-width: 0; }
+  .tasks .t-body div { color: var(--muted); font-size: 12px; }
+  .tasks .t-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---- areas ---- */
+  .area { border-top: 1px solid var(--line); padding: 12px 0; }
+  .area:first-of-type { border-top: none; padding-top: 0; }
+  .area.paused { opacity: .55; }
+  .area-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .area-head strong { font-weight: 600; font-size: 14.5px; }
+  .area-ctl { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .area-ctl input[type=time], .area-ctl input[type=number] {
+    font: inherit; font-size: 12.5px; padding: 3px 6px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+  }
+  .area-ctl input[type=number] { width: 62px; }
+  .area-ctl select {
+    font: inherit; font-size: 12.5px; padding: 3px 6px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); cursor: pointer;
+  }
+  .target { display: flex; gap: 0; align-items: stretch; }
+  .target button { padding: 3px 9px; font: 13px var(--mono); border-radius: 0; }
+  .target button:first-child { border-radius: 6px 0 0 6px; }
+  .target button:last-child { border-radius: 0 6px 6px 0; border-left: none; }
+  .target span {
+    padding: 3px 9px; font-size: 12.5px; border: 1px solid var(--line);
+    border-left: none; border-right: none; background: var(--panel-2); display: flex; align-items: center;
+  }
+  .days { display: flex; gap: 3px; }
+  .days button {
+    padding: 3px 7px; font: 11px var(--mono); border-radius: 6px; min-width: 30px;
+  }
+  .days button.on { background: var(--area); border-color: var(--area); color: #fff; }
+
+  /* ---- reviews / archive ---- */
+  #reviewbox { border-left: 3px solid var(--resource); }
+  .revrow { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; padding: 10px 0; border-top: 1px solid var(--line); }
+  .revrow:first-child { border-top: none; padding-top: 0; }
+  .revrow strong { font-weight: 600; font-size: 14.5px; }
+  .revrow .when { color: var(--faint); font-size: 12px; }
+  .revrow button { padding: 4px 10px; font-size: 12.5px; }
+  .revacts { display: flex; gap: 6px; flex: none; }
+  .arcrow { display: flex; gap: 9px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  .arcrow:first-child { border-top: none; }
+  .arcrow .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .arcrow button { padding: 3px 9px; font-size: 12px; }
+
+  /* ---- lists ---- */
+  .queue { list-style: none; margin: 0; padding: 0; }
+  .queue li { padding: 9px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  .queue li:first-child { border-top: none; }
+  .queue .q-title { color: var(--muted); font-size: 12px; }
+  .urg { display: inline-block; width: 34px; font: 11px var(--mono); color: var(--faint); }
+  .empty { color: var(--faint); font-size: 13.5px; font-style: italic; }
+
+  /* ---- toast ---- */
+  #toast {
+    position: fixed; right: 18px; bottom: 18px; max-width: 380px; z-index: 20;
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 12px 14px; box-shadow: 0 8px 28px rgba(0,0,0,.18);
+    font-size: 13.5px; opacity: 0; transform: translateY(8px); transition: .18s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; transform: none; }
+  #toast .t-head { font-weight: 600; margin-bottom: 3px; }
+  #toast.warn { border-left-color: var(--warn); }
+  #toast.err  { border-left-color: var(--danger); }
+
+  footer { margin-top: 26px; color: var(--faint); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); margin-right: 5px; }
+  .dot.on { background: var(--area); }
+  .dot.off { background: var(--warn); }
+  a { color: var(--accent); }
+  .hide { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Second <span>Brain</span></h1>
+    <span class="sub" id="vaultpath"></span>
+    <span class="spacer"></span>
+    <button id="studybtn" title="Flashcards, spaced repetition, the tutor">Study<span id="duebadge"></span></button>
+    <button id="refresh" title="Reload from vault">Refresh</button>
+    <button id="syncal" title="Rewrite the calendar from vault state">Sync calendar</button>
+  </header>
+
+  <div class="capture">
+    <textarea id="capturebox" placeholder="Capture anything — “learn Rust generics by next Friday, ~4h, start with the Book ch.10”"></textarea>
+    <div class="buttons">
+      <button class="btn-area"     data-bucket="area">Area<kbd>1</kbd></button>
+      <button class="btn-project"  data-bucket="project">Project<kbd>2</kbd></button>
+      <button class="btn-resource" data-bucket="resource">Resource<kbd>3</kbd></button>
+      <span class="hint" style="margin-left:6px">Due</span>
+      <input type="date" id="duepick" title="Beats anything in the text — no confirmation needed">
+      <span class="spacer"></span>
+      <span class="hint">Classification is yours. Everything after it is automatic.</span>
+    </div>
+  </div>
+
+  <section id="datesbox" class="hide">
+    <h2>Confirm these dates</h2>
+    <div id="dateslist"></div>
+    <p class="hint" style="margin:10px 0 0">
+      These are on the calendar already — a forgotten confirmation shouldn’t mean no
+      reminder. But nobody agrees what “next Friday” means, so they are worth a glance.
+    </p>
+  </section>
+
+  <section id="reviewbox" class="hide">
+    <h2>Still needed?</h2>
+    <div id="reviewlist"></div>
+    <p class="hint" style="margin:10px 0 0">
+      Archiving is a move, not a delete — everything comes back, flashcards included.
+    </p>
+  </section>
+
+  <div class="cols">
+    <div>
+      <section>
+        <h2>Active projects</h2>
+        <div id="projects"><p class="empty">Loading…</p></div>
+      </section>
+      <section id="areas">
+        <h2>Areas — recurring</h2>
+        <div id="arealist"><p class="empty">Loading…</p></div>
+        <p class="hint" style="margin:10px 0 0">Areas never fall due. They hold a repeating block of real time — change it here, or at the weekly schedule review.</p>
+      </section>
+    </div>
+    <div>
+      <section>
+        <h2>Due — tasks</h2>
+        <ul class="tasks" id="tasks"></ul>
+        <p class="hint" style="margin:8px 0 0">Only projects have due dates.</p>
+      </section>
+      <section>
+        <h2>Next up</h2>
+        <ul class="queue" id="queue"></ul>
+      </section>
+      <section>
+        <h2>Next 14 days</h2>
+        <ul class="queue" id="upcoming"></ul>
+      </section>
+      <section id="studycard">
+        <h2>Study</h2>
+        <div id="studybody"><p class="empty">Loading…</p></div>
+      </section>
+      <section id="archivebox" class="hide">
+        <h2>Archive</h2>
+        <div id="archivelist"></div>
+      </section>
+      <section>
+        <h2>Vault</h2>
+        <ul class="queue" id="counts"></ul>
+      </section>
+    </div>
+  </div>
+
+  <footer id="footer"></footer>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: {"Content-Type": "application/json"}}, opts));
+  const data = await r.json().catch(() => ({error: "bad response"}));
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+
+let toastTimer;
+function toast(head, body, kind) {
+  const el = $("#toast");
+  el.className = "show " + (kind || "");
+  el.innerHTML = `<div class="t-head">${esc(head)}</div><div>${esc(body || "")}</div>`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.className = ""), kind === "err" ? 9000 : 5500);
+}
+
+function daysUntil(iso) {
+  if (!iso) return null;
+  const d = new Date(iso + "T00:00:00"), t = new Date(); t.setHours(0,0,0,0);
+  return Math.round((d - t) / 86400000);
+}
+
+function duePill(iso) {
+  const n = daysUntil(iso);
+  if (n === null) return "";
+  if (n < 0)   return `<span class="pill over">${-n}d overdue</span>`;
+  if (n === 0) return `<span class="pill due">due today</span>`;
+  if (n <= 7)  return `<span class="pill due">${n}d left</span>`;
+  return `<span class="pill">due ${esc(iso)}</span>`;
+}
+
+function fmtWhen(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return esc(iso);
+  const opts = iso.length > 10
+    ? {weekday: "short", day: "numeric", month: "short", hour: "numeric", minute: "2-digit"}
+    : {weekday: "short", day: "numeric", month: "short"};
+  return d.toLocaleString(undefined, opts);
+}
+
+// ---- categories: one colour table, served from the same place the calendar
+// reads it, so a swatch here is the colour the event actually gets.
+let CATS = {};
+const DAYNAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+function swatch(key) {
+  const c = CATS[key];
+  if (!c) return "";
+  return `<span class="swatch" style="background:${esc(c.hex)}" title="${esc(c.label)}"></span>`;
+}
+
+function catSelect(noteId, key) {
+  const opts = Object.values(CATS).map(c =>
+    `<option value="${esc(c.key)}" ${c.key === key ? "selected" : ""}>${esc(c.emoji)} ${esc(c.label)}</option>`
+  ).join("");
+  return `<select class="cat" data-cat-note="${esc(noteId)}"><option value="">auto</option>${opts}</select>`;
+}
+
+// A due date is always a real picker — the OS calendar, not a typed string.
+// Amber while it is only a guess; plain once approved. Clearing it is allowed:
+// no deadline is a legitimate answer, and a better one than a wrong date.
+function duePicker(noteId, p) {
+  const guess = p.deadline && !p.deadline_confirmed;
+  return `<input type="date" class="${guess ? "guess" : ""}" value="${esc(p.deadline || "")}"
+            data-due-note="${esc(noteId)}"
+            title="${guess ? "Guessed" + (p.deadline_phrase ? " from “" + esc(p.deadline_phrase) + "”" : "") + " — not confirmed" : "Due date"}">`;
+}
+
+function renderDates(items) {
+  const box = $("#datesbox");
+  if (!items || !items.length) { box.classList.add("hide"); return; }
+  box.classList.remove("hide");
+  $("#dateslist").innerHTML = items.map(d => `
+    <div class="daterow">
+      ${swatch(d.category)}
+      <strong>${esc(d.title)}</strong>
+      <span class="why">${esc(d.why)}</span>
+      <span class="spacer"></span>
+      ${duePill(d.deadline)}
+      <input type="date" value="${esc(d.deadline)}" data-fix-note="${esc(d.note_id)}">
+      <button data-ok-note="${esc(d.note_id)}">Looks right</button>
+    </div>`).join("");
+}
+
+function renderReviews(items) {
+  const box = $("#reviewbox");
+  if (!items || !items.length) { box.classList.add("hide"); return; }
+  box.classList.remove("hide");
+  $("#reviewlist").innerHTML = items.map(r => `
+    <div class="revrow">
+      ${swatch(r.category)}
+      <strong>${esc(r.title)}</strong>
+      <span class="when">filed ${fmtWhen(r.filed)}${r.last ? " · last kept " + fmtWhen(r.last) : ""}${
+        r.overdue_days > 0 ? " · asked " + r.overdue_days + "d ago" : ""}</span>
+      ${r.cards ? `<span class="pill">${r.cards} flashcard${r.cards === 1 ? "" : "s"}</span>` : ""}
+      <span class="spacer"></span>
+      <span class="revacts">
+        <button data-review="keep" data-note="${esc(r.note_id)}">Still need it</button>
+        <button data-review="snooze" data-note="${esc(r.note_id)}">Ask later</button>
+        <button data-review="archive" data-note="${esc(r.note_id)}">Archive</button>
+      </span>
+    </div>`).join("");
+}
+
+function renderArchive(arc) {
+  const box = $("#archivebox");
+  if (!arc || !arc.items || !arc.items.length) { box.classList.add("hide"); return; }
+  box.classList.remove("hide");
+  const more = arc.total > arc.items.length
+    ? `<p class="hint" style="margin:9px 0 0">Showing ${arc.items.length} of ${arc.total}.</p>` : "";
+  $("#archivelist").innerHTML = arc.items.map(a => `
+    <div class="arcrow">
+      ${swatch(a.category)}
+      <span class="t" title="${esc(a.title)}">${esc(a.title)}</span>
+      <button data-review="restore" data-note="${esc(a.note_id)}">Restore</button>
+    </div>`).join("") + more;
+}
+
+function renderTasks(items) {
+  $("#tasks").innerHTML = items.length ? items.map(t => `
+    <li>
+      ${swatch(t.category)}
+      <div class="t-body">
+        <div class="t-title">${esc(t.title)}</div>
+        <div>${fmtWhen(t.due)}${t.percent ? " · " + t.percent + "%" : ""}</div>
+      </div>
+      ${duePill(t.due)}
+    </li>`).join("") : `<li class="empty">Nothing due.</li>`;
+}
+
+function renderAreas(list) {
+  const el = $("#arealist");
+  if (!list.length) { el.innerHTML = `<p class="empty">No areas yet. Capture one above.</p>`; return; }
+  el.innerHTML = list.map(a => {
+    const s = a.schedule || {};
+    const weekly = a.cadence === "weekly";
+    const days = weekly ? `
+      <div class="days">${DAYNAMES.map((n, i) => `
+        <button data-area="${esc(a.id)}" data-day="${i}" class="${a.days.includes(i) ? "on" : ""}">${n[0]}${n[1]}</button>`).join("")}
+      </div>` : `<span class="hint">${esc(a.cadence)}</span>`;
+    return `
+      <div class="area ${s.enabled === false ? "paused" : ""}">
+        <div class="area-head">
+          ${swatch(a.category)}
+          <strong>${esc(a.title)}</strong>
+          <span class="pill">${a.target_count}× / ${esc(a.cadence)}</span>
+          ${s.enabled === false ? `<span class="pill over">paused</span>` : ""}
+          ${catSelect(a.id, a.category)}
+        </div>
+        <div class="meta">${a.next ? "next " + fmtWhen(a.next) : "not scheduled"}</div>
+        <div class="area-ctl">
+          <input type="time" value="${esc(s.time || "18:00")}" data-area-time="${esc(a.id)}">
+          <input type="number" min="5" max="720" step="5" value="${s.duration_minutes ?? 30}" data-area-min="${esc(a.id)}">
+          <span class="hint">min</span>
+          ${days}
+          <span class="spacer"></span>
+          <button data-area-toggle="${esc(a.id)}">${s.enabled === false ? "Resume" : "Pause"}</button>
+        </div>
+        <div class="area-ctl">
+          <span class="hint">Target</span>
+          <span class="target">
+            <button data-target="${esc(a.id)}" data-delta="-1" ${a.target_count <= 1 ? "disabled" : ""}>−</button>
+            <span>${a.target_count}×</span>
+            <button data-target="${esc(a.id)}" data-delta="1" ${a.target_count >= 7 ? "disabled" : ""}>+</button>
+          </span>
+          <select data-cadence="${esc(a.id)}">
+            ${Object.entries({daily: "per day", weekly: "per week", monthly: "per month"}).map(
+              ([c, label]) => `<option value="${c}" ${c === a.cadence ? "selected" : ""}>${label}</option>`).join("")}
+          </select>
+          <span class="hint">${a.pinned
+            ? "days are pinned — the target no longer moves them"
+            : "unpinned, so changing this re-spreads the days"}</span>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+function renderProjects(list) {
+  const el = $("#projects");
+  if (!list.length) { el.innerHTML = `<p class="empty">No active projects. Capture one above.</p>`; return; }
+  el.innerHTML = list.map(n => {
+    const p = n.project || {};
+    const steps = (p.steps || []).map(s => `
+      <li>
+        <input type="checkbox" ${s.done ? "checked" : ""} data-note="${esc(n.id)}" data-step="${esc(s.id)}">
+        <span class="${s.done ? "done" : ""}">${esc(s.text)} <span class="when">${s.minutes}m${s.scheduled && !s.done ? " · " + fmtWhen(s.scheduled) : ""}</span></span>
+      </li>`).join("");
+    return `
+      <div class="project">
+        <div class="ptitle">
+          ${swatch(n.category)}
+          <strong>${esc(n.title)}</strong>
+          ${duePicker(n.id, p)}
+          ${duePill(p.deadline)}
+          <span class="pill">L${p.level ?? "?"}</span>
+          ${p.learning ? `<span class="pill">learning</span>` : ""}
+          ${catSelect(n.id, n.category)}
+        </div>
+        <div class="meta">
+          <span>${Math.round((p.progress ?? 0) * 100)}% · ~${p.estimate_minutes ?? 0} min</span>
+          ${p.ideal_end ? `<span>· ${esc(p.ideal_end)}</span>` : ""}
+        </div>
+        <div class="bar"><i style="width:${Math.round((p.progress ?? 0) * 100)}%"></i></div>
+        <ul class="steps">${steps || `<li class="empty">No steps parsed.</li>`}</ul>
+        <div class="rowacts">
+          <button data-act="reparse" data-note="${esc(n.id)}">Re-parse</button>
+          <button data-act="replan"  data-note="${esc(n.id)}">Re-plan</button>
+          <button data-act="graduate" data-note="${esc(n.id)}">→ Resource</button>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+function renderQueue(items) {
+  $("#queue").innerHTML = items.length ? items.map(a => `
+    <li>
+      <span class="urg">${Math.round(a.urgency * 100)}</span>${esc(a.step.text)}
+      <div class="q-title">${esc(a.note_title)}${a.step.scheduled ? " · " + fmtWhen(a.step.scheduled) : ""}</div>
+    </li>`).join("") : `<li class="empty">Nothing queued.</li>`;
+}
+
+function renderUpcoming(items) {
+  $("#upcoming").innerHTML = items.length ? items.slice(0, 12).map(i => `
+    <li>
+      ${i.kind === "due" ? "🎯 " : "▸ "}${esc(i.title)}
+      <div class="q-title ${i.overdue ? "" : ""}">${fmtWhen(i.when)}${i.overdue ? " · overdue" : ""}</div>
+    </li>`).join("") : `<li class="empty">Clear.</li>`;
+}
+
+function renderStudy(s) {
+  const el = $("#studybody");
+  if (!s || !s.decks) {
+    el.innerHTML = `<p class="empty">No flashcards yet. <a href="/study">Make some</a> from a project or resource.</p>`;
+    $("#duebadge").textContent = "";
+    return;
+  }
+  const grad = (s.graduation || []).map(g => `
+    <li style="border-top:1px solid var(--line);padding-top:9px">
+      <strong>${esc(g.title)}</strong> looks learned — ${Math.round(g.mastery * 100)}% mastered.
+      <div class="q-title" style="margin-top:5px">
+        <button data-grad="${esc(g.note_id)}" style="padding:3px 9px;font-size:12px">Move to Resources</button>
+      </div>
+    </li>`).join("");
+  el.innerHTML = `
+    <ul class="queue">
+      <li><a href="/study">${s.due_today} due today</a>${s.new_waiting ? ` · ${s.new_waiting} new waiting` : ""}
+        <div class="q-title">${s.reviewed_today} reviewed today · ${s.decks} deck${s.decks === 1 ? "" : "s"}</div></li>
+      ${s.drafts ? `<li><a href="/study">${s.drafts} draft cards</a> waiting for your approval</li>` : ""}
+      ${grad}
+    </ul>`;
+  $("#duebadge").textContent = s.due_today ? ` · ${s.due_today}` : "";
+}
+
+function renderCounts(counts) {
+  $("#counts").innerHTML = Object.entries(counts)
+    .map(([k, v]) => `<li>${esc(k)}<span style="float:right;color:var(--muted)">${v}</span></li>`).join("");
+}
+
+async function load() {
+  try {
+    const d = await api("/api/dashboard");
+    $("#vaultpath").textContent = d.vault;
+    CATS = Object.fromEntries((d.categories || []).map(c => [c.key, c]));
+    renderDates(d.pending_dates || []);
+    renderReviews(d.reviews || []);
+    renderArchive(d.archive);
+    renderProjects(d.projects);
+    renderAreas(d.areas || []);
+    renderTasks(d.tasks || []);
+    renderQueue(d.next_actions);
+    renderUpcoming(d.upcoming);
+    renderStudy(d.study);
+    renderCounts(d.counts);
+  } catch (e) { toast("Could not load dashboard", e.message, "err"); }
+  try {
+    const h = await api("/api/health");
+    const on = h.llm.available;
+    $("#footer").innerHTML =
+      `<span><i class="dot ${on ? "on" : "off"}"></i>${esc(h.llm.provider)} · ${esc(h.llm.model)} ${on ? "ready" : "offline (rule-based fallback)"}</span>` +
+      `<span><i class="dot on"></i>events: ${esc(h.calendar.sink)} · tasks: ${esc(h.calendar.task_sink)} · <a href="/calendar.ics">calendar.ics</a></span>`;
+  } catch (e) { /* footer is cosmetic */ }
+}
+
+async function capture(bucket) {
+  const box = $("#capturebox");
+  const text = box.value.trim();
+  if (!text) { box.focus(); return; }
+  document.querySelectorAll("[data-bucket]").forEach(b => b.disabled = true);
+  try {
+    const due = $("#duepick").value || null;
+    const r = await api("/api/capture", {method: "POST", body: JSON.stringify({text, bucket, due})});
+    box.value = "";
+    $("#duepick").value = "";
+    const p = r.note.project;
+    if (bucket === "project" && p) {
+      const bits = [];
+      if (p.deadline) bits.push("due " + p.deadline);
+      bits.push(`${(p.steps || []).length} steps`, `~${p.estimate_minutes}m`, `L${p.level}`);
+      toast(r.note.title, bits.join(" · ") + (r.plan ? " — " + r.plan.message : ""),
+            r.parser && r.parser.degraded ? "warn" : "");
+      if (r.parser && r.parser.degraded) setTimeout(() => toast("Rule-based parse", r.parser.note, "warn"), 5600);
+    } else {
+      toast("Filed as " + bucket, r.note.title);
+    }
+    load();
+  } catch (e) { toast("Capture failed", e.message, "err"); }
+  finally { document.querySelectorAll("[data-bucket]").forEach(b => b.disabled = false); }
+}
+
+document.querySelectorAll("[data-bucket]").forEach(b =>
+  b.addEventListener("click", () => capture(b.dataset.bucket)));
+
+$("#capturebox").addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); capture("project"); }
+});
+document.addEventListener("keydown", e => {
+  // 1/2/3 file a capture — but not while you are typing a date into a picker.
+  if (["TEXTAREA", "INPUT", "SELECT"].includes(document.activeElement.tagName)) return;
+  if (e.key === "1") capture("area");
+  if (e.key === "2") capture("project");
+  if (e.key === "3") capture("resource");
+  if (e.key === "c") { e.preventDefault(); $("#capturebox").focus(); }
+});
+
+async function setDeadline(id, patch, msg) {
+  try {
+    const r = await api(`/api/notes/${id}/deadline`, {method: "POST", body: JSON.stringify(patch)});
+    toast("Date set", msg + (r.message ? " — " + r.message : ""));
+    load();
+  } catch (err) { toast("Could not set the date", err.message, "err"); }
+}
+
+// The weekly check-in's actual question (§8): continue as-is, or change how
+// often. The endpoint wants both fields, so whichever half is not being
+// changed is sent back unchanged.
+async function setHabit(id, patch, msg) {
+  const row = [...document.querySelectorAll(".area")].find(r =>
+    r.querySelector(`[data-cadence="${id}"]`));
+  const body = Object.assign({
+    cadence: row ? row.querySelector("select[data-cadence]").value : "weekly",
+    target_count: row ? Number(row.querySelector(".target span").textContent.replace("×", "")) : 3,
+  }, patch);
+  try {
+    await api(`/api/notes/${id}/habit`, {method: "POST", body: JSON.stringify(body)});
+    toast("Habit updated", msg);
+    load();
+  } catch (err) { toast("Could not update the habit", err.message, "err"); }
+}
+
+async function setSchedule(id, patch, msg) {
+  try { await api(`/api/notes/${id}/schedule`, {method: "POST", body: JSON.stringify(patch)}); toast("Schedule updated", msg); load(); }
+  catch (err) { toast("Could not update schedule", err.message, "err"); }
+}
+
+document.addEventListener("change", async e => {
+  const cb = e.target.closest("input[type=checkbox][data-step]");
+  if (cb) {
+    try { await api(`/api/notes/${cb.dataset.note}/steps/${cb.dataset.step}/toggle`, {method: "POST"}); load(); }
+    catch (err) { toast("Could not update step", err.message, "err"); }
+    return;
+  }
+  const cat = e.target.closest("select[data-cat-note]");
+  if (cat) {
+    try {
+      await api(`/api/notes/${cat.dataset.catNote}/category`, {method: "POST", body: JSON.stringify({category: cat.value || null})});
+      toast("Colour set", cat.value ? CATS[cat.value].label : "back to auto-detect");
+      load();
+    } catch (err) { toast("Could not set colour", err.message, "err"); }
+    return;
+  }
+  const fix = e.target.closest("input[data-fix-note]");
+  if (fix) return setDeadline(fix.dataset.fixNote, {date: fix.value || null},
+                              fix.value ? "due " + fix.value : "deadline cleared");
+  const due = e.target.closest("input[data-due-note]");
+  if (due) return setDeadline(due.dataset.dueNote, {date: due.value || null},
+                              due.value ? "due " + due.value : "deadline cleared");
+
+  const cad = e.target.closest("select[data-cadence]");
+  if (cad) {
+    const row = cad.closest(".area");
+    const count = Number(row.querySelector(".target span").textContent.replace("×", ""));
+    return setHabit(cad.dataset.cadence, {cadence: cad.value, target_count: count},
+                    count + "× per " + cad.value);
+  }
+
+  const time = e.target.closest("input[data-area-time]");
+  if (time) return setSchedule(time.dataset.areaTime, {time: time.value}, "starts at " + time.value);
+  const mins = e.target.closest("input[data-area-min]");
+  if (mins) return setSchedule(mins.dataset.areaMin, {duration_minutes: Number(mins.value)}, mins.value + " min");
+});
+
+document.addEventListener("click", async e => {
+  const day = e.target.closest("button[data-day]");
+  if (day) {
+    // Toggling a day pins the series: the habit target no longer chooses for you.
+    const row = day.closest(".area");
+    const picked = [...row.querySelectorAll("button[data-day].on")].map(b => Number(b.dataset.day));
+    const i = Number(day.dataset.day);
+    const next = picked.includes(i) ? picked.filter(d => d !== i) : picked.concat(i).sort();
+    if (!next.length) { toast("Pick at least one day", "An area needs somewhere to land.", "warn"); return; }
+    return setSchedule(day.dataset.area, {days: next}, next.map(d => DAYNAMES[d]).join(", "));
+  }
+  const tgt = e.target.closest("button[data-target]");
+  if (tgt) {
+    const row = tgt.closest(".area");
+    const current = Number(row.querySelector(".target span").textContent.replace("×", ""));
+    const next = Math.max(1, Math.min(7, current + Number(tgt.dataset.delta)));
+    if (next === current) return;
+    return setHabit(tgt.dataset.target, {target_count: next},
+                    next + "× per " + row.querySelector("select[data-cadence]").value);
+  }
+
+  const pause = e.target.closest("button[data-area-toggle]");
+  if (pause) {
+    const on = pause.textContent.trim() === "Resume";
+    return setSchedule(pause.dataset.areaToggle, {enabled: on}, on ? "back on the calendar" : "paused, not deleted");
+  }
+
+  const rev = e.target.closest("button[data-review]");
+  if (rev) {
+    const action = rev.dataset.review;
+    rev.disabled = true;
+    try {
+      const r = await api(`/api/notes/${rev.dataset.note}/review`,
+        {method: "POST", body: JSON.stringify({action})});
+      toast({
+        keep: "Kept",
+        snooze: "Asked again later",
+        archive: "Archived",
+        restore: "Restored",
+      }[action], {
+        keep: "Next check " + (r.next || ""),
+        snooze: "Back on " + (r.next || ""),
+        archive: "Moved to Archive — nothing was deleted.",
+        restore: "Back in Resources. Next check " + (r.next || ""),
+      }[action]);
+      load();
+    } catch (err) { toast("Could not update", err.message, "err"); rev.disabled = false; }
+    return;
+  }
+
+  const okd = e.target.closest("button[data-ok-note]");
+  if (okd) return setDeadline(okd.dataset.okNote, {confirm: true}, "confirmed");
+
+  const grad = e.target.closest("button[data-grad]");
+  if (grad) {
+    try {
+      await api(`/api/notes/${grad.dataset.grad}/move`, {method: "POST", body: JSON.stringify({bucket: "resource"})});
+      toast("Graduated", "Filed under Resources. Its flashcards came along.");
+      load();
+    } catch (err) { toast("Could not graduate", err.message, "err"); }
+    return;
+  }
+
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  const id = b.dataset.note;
+  b.disabled = true;
+  try {
+    if (b.dataset.act === "reparse") { const r = await api(`/api/notes/${id}/reparse`, {method: "POST"}); toast("Re-parsed", r.plan.message); }
+    if (b.dataset.act === "replan")  { const r = await api(`/api/notes/${id}/replan`,  {method: "POST"}); toast("Re-planned", r.message); }
+    if (b.dataset.act === "graduate"){ await api(`/api/notes/${id}/move`, {method: "POST", body: JSON.stringify({bucket: "resource"})}); toast("Graduated", "Moved to Resources."); }
+    load();
+  } catch (err) { toast("Action failed", err.message, "err"); }
+  finally { b.disabled = false; }
+});
+
+$("#studybtn").addEventListener("click", () => (location.href = "/study"));
+$("#refresh").addEventListener("click", load);
+$("#syncal").addEventListener("click", async () => {
+  try { const r = await api("/api/calendar/sync", {method: "POST"}); toast("Calendar synced", JSON.stringify(r.result)); }
+  catch (e) { toast("Calendar sync failed", e.message, "err"); }
+});
+
+load();
+setInterval(load, 120000);
+</script>
+</body>
+</html>
