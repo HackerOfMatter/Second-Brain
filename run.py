@@ -3,7 +3,7 @@
 
     python run.py                 start the server (default)
     python run.py init            create the vault structure and templates
-    python run.py doctor          check vault, Ollama and calendar wiring
+    python run.py doctor [--write]  check vault, Ollama and calendar wiring
     python run.py capture "..." --bucket project
     python run.py intake          file whatever is in the Drop folder
     python run.py next            print the execution queue
@@ -74,128 +74,252 @@ def cmd_init(args) -> int:
 
 
 def cmd_doctor(args) -> int:
+    """The wiring check — and, since Sprint 3, an audited one.
+
+    Every line here is a claim, and `doctor` is the one output in this system
+    that is *trusted without being checked*: nobody re-verifies a line that
+    says OK. Sprint 2 caught three lines whose claim outran their evidence in
+    a single day, so the rule this function is now held to is one sentence —
+    **a marker states what was proved, not what was hoped.**
+
+      * ``OK`` — something was checked and it passed. Never a config echo.
+      * ``!!`` — something was checked and it failed, or could not be read.
+      * ``  `` (blank) — nothing is wrong and nothing was proved either: a
+        counter at zero, a feature that has not been triggered yet, a state
+        that is neither good nor bad. This marker is the fix for most of what
+        was wrong: "0 decks" and "index not built" were both wearing an OK.
+
+    `--write` saves the same text to `_system/logs/doctor-YYYYMMDD.txt` so the
+    weekly review can say when the check last ran (story J2).
+    """
     cfg = load(args.config)
     engine = Engine(cfg)
     h = engine.health(progress=True)
+    lines: list[str] = []
+
+    def out(text: str = "") -> None:
+        lines.append(text)
+        print(text)
+
     ok = "OK "
     bad = "!! "
-    print(f"{ok if h['vault_ok'] else bad}vault      {h['vault']}")
+    meh = "   "  # checked, nothing proved either way
+
+    # -- what is broken right now ------------------------------------------
+    # First, because a banner lj has not looked at today is exactly what this
+    # command exists to surface. See sb/incidents.py.
+    problems = h.get("problems") or []
+    if problems:
+        out(f"{bad}problems   {len(problems)} open")
+        for prob in problems:
+            out(f"           · {prob.get('message', '')}")
+            out(f"             since {prob.get('since', '')}"
+                + (f" · x{prob['count']}" if int(prob.get("count") or 1) > 1 else ""))
+            if prob.get("hint"):
+                out(f"             {prob['hint']}")
+        out()
+
+    # -- vault --------------------------------------------------------------
+    # `vault_ok` is exists AND holds at least one readable note: a wrong path
+    # that resolves to some empty directory still "exists". Sprint 2's fix,
+    # kept and now stated.
+    out(f"{ok if h['vault_ok'] else bad}vault      {h['vault']}")
     if h.get("vault_note"):
-        print(f"           {h['vault_note']}")
-    print(f"           notes: " + ", ".join(f"{k}={v}" for k, v in h["counts"].items()))
+        out(f"           {h['vault_note']}")
+    if not h["vault_ok"]:
+        out("           " + ("path does not exist" if not h["vault_exists"]
+                             else "the path exists but no note in it could be read"))
+    out("           notes: " + ", ".join(f"{k}={v}" for k, v in h["counts"].items()))
+
+    # -- models -------------------------------------------------------------
     llm = h["llm"]
-    print(f"{ok if llm['available'] else bad}llm        {llm['provider']} · {llm['model']}")
-    if llm["available"] and llm["installed_models"]:
-        print(f"           installed: {', '.join(llm['installed_models'][:8])}")
-        if llm["model"] not in llm["installed_models"]:
-            print(f"{bad}           configured model not pulled — run: ollama pull {llm['model']}")
+    installed = llm.get("installed_models") or []
+    # Reachable is not the same as usable. A server that answers /api/tags
+    # while the configured tag is not among them will fail every real call,
+    # so the headline marker has to fail with it rather than print OK and
+    # bury the problem in a sub-line.
+    fast_lane = (llm.get("lanes") or {}).get("fast") or {}
+    model_ready = bool(llm["available"]) and (
+        # `lane_report` matches tags the way Ollama reports them (`phi4` is
+        # pulled as `phi4:latest`), so prefer its answer; `None` there means
+        # the tag list came back empty and nothing was proved either way.
+        fast_lane["pulled"] if fast_lane.get("pulled") is not None
+        else (not installed or llm["model"] in installed)
+    )
+    out(f"{ok if model_ready else bad}llm        {llm['provider']} · {llm['model']}"
+        + ("" if llm["available"] else "  (unreachable)"))
+    if llm["available"] and installed:
+        out(f"           installed: {', '.join(installed[:8])}")
+        if not model_ready:
+            out(f"           configured model is not pulled — run: ollama pull {llm['model']}")
     elif not llm["available"]:
-        print("           start it with `ollama serve`, or captures use the rule-based parser")
+        out("           start it with `ollama serve`, or captures use the rule-based parser")
     lanes = llm.get("lanes")
     if lanes:
         study = lanes.get("study")
         if study:
-            mark = ok if study["pulled"] else bad
-            print(f"{mark}study llm  {study['model']} · flashcards, marking, explain, ask")
+            # `pulled` is None when the tag list came back empty (Ollama down),
+            # which is "could not tell", not "missing".
+            mark = ok if study["pulled"] else (meh if study["pulled"] is None else bad)
+            out(f"{mark}study llm  {study['model']} · flashcards, marking, explain, ask")
             if study.get("warning"):
-                print(f"           {study['warning']}")
-            print(f"           everything else: {lanes['fast']['model']}")
+                out(f"           {study['warning']}")
+            out(f"           everything else: {lanes['fast']['model']}")
         else:
-            print(f"{ok}study llm  not set — {lanes['fast']['model']} does every job")
-    print(
-        f"{ok}calendar   events={h['calendar']['sink']}  "
-        f"tasks={h['calendar']['task_sink']}  "
-        f"{h['calendar']['categories']} colours  {h['calendar']['ics']}"
-    )
+            out(f"{meh}study llm  not set — {lanes['fast']['model']} does every job")
+
+    # -- calendar -----------------------------------------------------------
+    # This line used to be an unconditional OK over four values read straight
+    # back out of config.yaml. Naming a sink is not evidence that anything was
+    # ever written to it; the .ics file on disk is.
+    cal = h["calendar"]
+    writes_ics = cal["sink"] in ("ics", "both") or cal["task_sink"] in ("ics", "both")
+    cal_mark = ok if (cal.get("ics_exists") or not writes_ics) else bad
+    out(f"{cal_mark}calendar   events={cal['sink']}  tasks={cal['task_sink']}  "
+        f"{cal['categories']} colours")
+    if writes_ics:
+        out(f"           {cal['ics']}"
+            + (f"  · written {cal['ics_written']}" if cal.get("ics_written")
+               else "  · never written — run `python run.py sync`"))
+
+    # -- drop folder --------------------------------------------------------
     drop = h.get("drop") or {}
     if drop:
-        waiting = drop["waiting"]
-        print(
-            f"{ok}drop       "
-            + (f"{waiting} file(s) waiting to be filed" if waiting else "empty")
-            + f" · auto-files above {drop['auto_floor']:.2f}"
-            + ("  · watching" if drop["watch"] else "  · watch off")
-        )
-        print(f"           {drop['path']}")
+        # `intake.candidates()` returns [] for a folder that is not there, so
+        # "0 waiting" was printed as OK over a Drop folder lj had deleted.
+        # A count of zero is only good news once the thing counted exists.
+        if not drop.get("exists"):
+            out(f"{bad}drop       folder is missing — nothing dropped there can be filed")
+        else:
+            waiting = drop["waiting"]
+            out(
+                f"{ok if drop['watch'] else meh}drop       "
+                + (f"{waiting} file(s) waiting to be filed" if waiting else "empty")
+                + f" · auto-files above {drop['auto_floor']:.2f}"
+                + ("  · watching" if drop["watch"]
+                   else "  · watch off — files sit until you press the button")
+            )
+        out(f"           {drop['path']}")
+
+    # -- index --------------------------------------------------------------
     ix = h.get("index") or {}
     if ix.get("built"):
-        mode = "semantic" if ix.get("semantic") else "keyword only — no embeddings"
-        print(f"{ok}index      {ix['chunks']} passages from {ix['notes']} notes · {mode}")
+        if ix.get("semantic"):
+            out(f"{ok}index      {ix['chunks']} passages from {ix['notes']} notes · semantic")
+        elif ix.get("dim"):
+            # The vector file did not line up with the chunk file, so `load()`
+            # dropped it. That is a broken index falling back, not a vault
+            # that never had embeddings — and they are not the same news.
+            out(f"{bad}index      {ix['chunks']} passages · embeddings were built but "
+                "discarded as inconsistent — `python run.py` then rebuild the index")
+        else:
+            out(f"{meh}index      {ix['chunks']} passages from {ix['notes']} notes · "
+                "keyword only — no embeddings")
     else:
-        print(f"{ok}index      not built — ask a question and it builds itself")
+        out(f"{meh}index      not built — ask a question and it builds itself")
+
+    # -- tutor --------------------------------------------------------------
+    # Zero decks is not a passing check, and `DeckStore.all()` skips a deck
+    # file it cannot parse — so a corrupted deck used to vanish from this
+    # count without a word.
     st = h.get("study") or {}
-    print(
-        f"{ok}tutor      {st.get('decks', 0)} deck(s)  "
+    unreadable = int(st.get("unreadable") or 0)
+    decks = int(st.get("decks") or 0)
+    out(f"{bad if unreadable else (ok if decks else meh)}tutor      "
+        f"{decks} deck(s)  "
         f"retention target {int(float(st.get('retention', 0.9)) * 100)}%  "
-        f"{st.get('path', '')}"
-    )
+        f"{st.get('path', '')}")
+    if unreadable:
+        out(f"           {unreadable} deck file(s) could not be read and are not counted")
+    queued = int(h.get("queued_cards") or 0)
+    if queued:
+        out(f"{meh}           {queued} note(s) queued for card generation, "
+            "waiting on a model")
+
     # Everything that measures itself, and how far off it still is. A feature
     # that unlocks on a trigger looks broken rather than pending unless the
     # distance is stated.
     pr = h.get("progress") or {}
     if pr:
-        print()
+        out()
         fsrs_p = pr["fsrs"]
         if fsrs_p["using_fitted"]:
-            print(f"{ok}fsrs       using weights fitted from your own {fsrs_p['have']} reviews")
+            out(f"{ok}fsrs       using weights fitted from your own {fsrs_p['have']} reviews")
         elif fsrs_p["have"] >= fsrs_p["need"]:
-            print(f"{ok}fsrs       {fsrs_p['have']} reviews — ready to fit: `python run.py fit --write`")
+            out(f"{ok}fsrs       {fsrs_p['have']} reviews — ready to fit: `python run.py fit --write`")
         else:
-            print(f"   fsrs       {fsrs_p['have']}/{fsrs_p['need']} reviews before personal weights mean anything")
+            out(f"{meh}fsrs       {fsrs_p['have']}/{fsrs_p['need']} reviews before personal weights mean anything")
 
-        cal = pr["calibration"]
-        print(f"   calibration {cal['have']}/{cal['need']} predictions"
-              + ("" if cal["have"] >= cal["need"] else " — tap j/k/l before revealing an answer"))
+        cal_p = pr["calibration"]
+        out(f"{meh}calibration {cal_p['have']}/{cal_p['need']} predictions"
+            + ("" if cal_p["have"] >= cal_p["need"] else " — tap j/k/l before revealing an answer"))
 
         th = pr["thresholds"]
-        print(f"   thresholds  intake {th['intake']}/{th['need']} · "
-              f"connect {th['connect']}/{th['need']} labelled examples")
+        out(f"{meh}thresholds  intake {th['intake']}/{th['need']} · "
+            f"connect {th['connect']}/{th['need']} labelled examples")
 
         es = pr["estimates"]
-        line = f"   estimates   {es['have']}/{es['need']} timed steps"
+        line = f"{meh}estimates   {es['have']}/{es['need']} timed steps"
         if es["untimed"]:
             line += f" · {es['untimed']} finished without a clock"
-        print(line)
+        out(line)
 
         hb = pr["habits"]
         if hb["areas"]:
             if hb["without_plan"]:
-                print(f"{bad}habits     {hb['without_plan']} of {hb['areas']} areas have no "
-                      "\u201cwhen X, I will Y at Z\u201d — the biggest lever there is")
+                out(f"{bad}habits     {hb['without_plan']} of {hb['areas']} areas have no "
+                    "\u201cwhen X, I will Y at Z\u201d — the biggest lever there is")
             else:
-                print(f"{ok}habits     all {hb['areas']} areas carry an implementation intention")
+                out(f"{ok}habits     all {hb['areas']} areas carry an implementation intention")
 
         smells = pr["atomicity"]
         if smells:
-            print("   notes       " + ", ".join(f"{v} {k}" for k, v in sorted(smells.items()))
-                  + "  (`python run.py lint`)")
+            out(f"{meh}notes       " + ", ".join(f"{v} {k}" for k, v in sorted(smells.items()))
+                + "  (`python run.py lint`)")
 
         np_p = pr["numpy"]
         if np_p["accelerated"]:
-            print(f"{ok}index math  numpy ({np_p['chunks']} chunks)")
+            out(f"{ok}index math  numpy ({np_p['chunks']} chunks)")
         elif np_p["chunks"] and np_p["at"] and np_p["chunks"] >= np_p["at"]:
-            print(f"{bad}index math  {np_p['chunks']} chunks and numpy is not installed — "
-                  "`pip install numpy` would speed searches up")
+            out(f"{bad}index math  {np_p['chunks']} chunks and numpy is not installed — "
+                "`pip install numpy` would speed searches up")
         else:
-            print(f"   index math  pure python ({np_p['chunks']} chunks; "
-                  f"numpy engages at {np_p['at']})")
+            out(f"{meh}index math  pure python ({np_p['chunks']} chunks; "
+                f"numpy engages at {np_p['at']})")
 
-        if pr.get("plugin_enabled"):
-            print("OK  obsidian   capture plugin enabled")
-        elif pr["plugin"]:
-            print("!!  obsidian   capture plugin installed but not enabled "
-                  "-- turn it on in Settings -> Community plugins")
+        # Three states, not two. "I could not read Obsidian's plugin list" was
+        # being printed as "the plugin is not enabled", which sent lj to turn
+        # on a plugin that was already on. See Engine._obsidian_plugin_status.
+        if not pr["plugin"]:
+            out(f"{meh}obsidian   capture plugin not present")
+        elif not pr.get("plugin_enabled_known", True):
+            out(f"{meh}obsidian   capture plugin installed; could not read "
+                ".obsidian/community-plugins.json, so whether it is enabled is unknown")
+        elif pr.get("plugin_enabled"):
+            out(f"{ok}obsidian   capture plugin enabled")
         else:
-            print("    obsidian   capture plugin not present")
-        print()
+            out(f"{bad}obsidian   capture plugin installed but not enabled "
+                "-- turn it on in Settings -> Community plugins")
+        out()
 
+    # -- google -------------------------------------------------------------
     g = h["calendar"].get("google")
     if g:
-        mark = "OK " if g["ready"] else "!! "
-        state = "authorised" if g["ready"] else (g["reason"] or "not authorised")
-        print(f"{mark}google     {state}")
+        # File inspection only — `_google_auth.status()` never touches the
+        # network, so this line cannot claim Google accepts the token. It
+        # claims exactly what it checked.
+        mark = ok if g["ready"] else bad
+        state = ("token on disk looks usable (not checked against Google)"
+                 if g["ready"] else (g["reason"] or "not authorised"))
+        out(f"{mark}google     {state}")
         if not g["ready"]:
-            print("           run `python run.py sync` — a browser will open once")
+            out("           run `python run.py sync` — a browser will open once")
+
+    if getattr(args, "write", False):
+        path = engine.write_doctor_report("\n".join(lines))
+        print()
+        print(f"written to {path}")
+        print(f"keeping the last {Engine.DOCTOR_REPORTS_KEPT} reports")
     return 0
 
 
@@ -295,6 +419,13 @@ def cmd_review(args) -> int:
     print(f"\n{d['estimates']['message']}")
     print(d["calibration"]["message"])
     print(d["atomicity"]["message"])
+    # The health check is part of the week too — a `doctor` that was supposed
+    # to run weekly and has not run in a month is its own finding (story J2).
+    doc = d.get("doctor") or {}
+    if doc.get("message"):
+        print(("!! " if doc.get("stale") else "   ") + doc["message"])
+    for prob in d.get("problems") or []:
+        print(f"!! {prob.get('message', '')}  (since {prob.get('since', '')})")
     return 0
 
 
@@ -356,7 +487,10 @@ def main() -> int:
     s.set_defaults(func=cmd_serve)
 
     sub.add_parser("init", help="create vault folders and templates").set_defaults(func=cmd_init)
-    sub.add_parser("doctor", help="check the wiring").set_defaults(func=cmd_doctor)
+    d = sub.add_parser("doctor", help="check the wiring")
+    d.add_argument("--write", action="store_true",
+                   help="also save the report to _system/logs/doctor-YYYYMMDD.txt")
+    d.set_defaults(func=cmd_doctor)
     sub.add_parser("next", help="print the execution queue").set_defaults(func=cmd_next)
 
     t = sub.add_parser("today", help="what is going on today (F3')")

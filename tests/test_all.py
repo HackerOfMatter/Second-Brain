@@ -7,10 +7,13 @@ working-hours arithmetic, and the .ics wire format.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import io
 import json
 import re
 import sys
+import types
 import zlib
 import tempfile
 import traceback
@@ -4986,6 +4989,463 @@ def test_intake_api():
             check("and that nothing is left waiting", h["drop"]["waiting"] == 0, h["drop"])
 
 
+# --------------------------------------------------------------------------
+# Sprint 3, lane J — background failures, the weekly report, and honest
+# degradation. See sb/incidents.py, sb/jobqueue.py, and the docstring on
+# `run.cmd_doctor` for the rule these tests hold the health check to.
+# --------------------------------------------------------------------------
+
+
+def _doctor_text(cfg):
+    """Run `run.py doctor` against `cfg` and capture what it printed.
+
+    The J4 audit is about *rendered claims* — which marker goes in front of
+    which line — so the assertions have to read the real output. Patching
+    `run.load` is how the CLI is pointed at a temporary vault; it is the only
+    thing between `cmd_doctor` and the config file on disk.
+    """
+    import run as cli
+
+    original = cli.load
+    cli.load = lambda path=None: cfg
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_doctor(types.SimpleNamespace(config=None, write=False))
+    finally:
+        cli.load = original
+    return buf.getvalue()
+
+
+def test_incident_store():
+    """A problem is a standing condition, not an event."""
+    section("incidents — the problem store")
+    from sb import incidents as inc
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = inc.IncidentStore(Path(tmp) / "logs")
+        check("an empty store has no problems", store.open() == [])
+
+        first = store.record("ollama", "Ollama is not answering", hint="ollama serve")
+        check("recording files one", len(store.open()) == 1)
+        check("with the message", store.open()[0]["message"] == "Ollama is not answering")
+        check("and the fix", store.open()[0]["hint"] == "ollama serve")
+
+        again = store.record("ollama", "Ollama is not answering", hint="ollama serve")
+        check("the same condition twice is still one problem", len(store.open()) == 1)
+        check("but it is counted", again["count"] == 2)
+        check("and `since` does not move — that is how long it has been broken",
+              again["since"] == first["since"], (first["since"], again["since"]))
+
+        store.record("calendar", "Calendar sync failed", key="sync")
+        check("a different kind is a different problem", len(store.open()) == 2)
+        check("keyed kinds get their own identity",
+              {i["id"] for i in store.open()} == {"ollama", "calendar/sync"},
+              [i["id"] for i in store.open()])
+
+        check("clearing one retires it", store.clear("ollama") is True)
+        check("and leaves the other", [i["id"] for i in store.open()] == ["calendar/sync"])
+        check("clearing nothing reports nothing, and writes nothing",
+              store.clear("ollama") is False)
+        check("a retired problem is still on record",
+              any(i["id"] == "ollama" and i["resolved_at"] for i in store.all()))
+
+        # `bump=False` is what lets `health()` observe a standing condition on
+        # an endpoint the dashboard polls without a disk write every time.
+        store.record("calendar", "Calendar sync failed", key="sync", bump=False)
+        check("an unchanged observation does not inflate the count",
+              store.open()[0]["count"] == 1, store.open()[0])
+
+        check("clear_all retires the rest", store.clear_all() == 1 and store.open() == [])
+
+        # A torn line is one lost incident, never a crash on every read after.
+        store.path.write_text('{"id":"x","kind":"x"}\n{not json\n', encoding="utf-8")
+        check("a corrupt line is skipped rather than fatal",
+              [i["id"] for i in store.open()] == ["x"])
+
+
+def test_problems_reach_the_dashboard():
+    """J1 — a background failure is visible without opening a log file."""
+    section("problems: health, api and banner")
+    from sb import incidents as inc
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+
+        check("a healthy system reports no problems", engine.health()["problems"] == [])
+        engine.incidents.record(
+            inc.DROP, "The Drop folder watcher is failing (OSError).",
+            hint="Check the folder is reachable.",
+        )
+        problems = engine.health()["problems"]
+        check("a filed problem shows up in health", len(problems) == 1, problems)
+        check("with everything the banner needs",
+              set(problems[0]) >= {"id", "kind", "message", "since", "hint"},
+              sorted(problems[0]))
+
+        # A calendar token that has gone stale is a standing condition, so it
+        # is filed by the read path rather than waiting for a sync to fail.
+        engine.incidents.clear_all()
+        engine._reconcile_calendar_auth({"ready": False, "reason": "token has no refresh token"})
+        auth = [p for p in engine.health()["problems"] if p["kind"] == "calendar"]
+        check("expired calendar auth files itself", len(auth) == 1, auth)
+        check("and says what to do about it", "run.py sync" in auth[0]["hint"])
+        engine._reconcile_calendar_auth({"ready": True, "reason": None})
+        check("re-authorising clears it",
+              not [p for p in engine.health()["problems"] if p["kind"] == "calendar"])
+
+    try:
+        from starlette.testclient import TestClient
+    except ImportError:
+        print("  skip (no starlette testclient)")
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(vault=Path(tmp) / "v")
+            cfg.llm.provider = "heuristic"
+            cfg.calendar.sink = "ics"
+            cfg.intake.watch = False
+            from sb.api import build_app
+
+            client = TestClient(build_app(cfg))
+            engine = client.app.state.engine
+            check("/api/problems is empty on a healthy system",
+                  client.get("/api/problems").json() == {"problems": [], "count": 0})
+            engine.incidents.record("drop", "The Drop watcher is failing.", hint="check it")
+            body = client.get("/api/problems").json()
+            check("and carries the problem once one is filed", body["count"] == 1, body)
+            check("health carries the same list",
+                  len(client.get("/api/health").json()["problems"]) == 1)
+            cleared = client.post("/api/problems/clear", json={"id": "drop"}).json()
+            check("dismissing one clears it", cleared["problems"] == [], cleared)
+
+            # And a problem health can prove is over does not need dismissing:
+            # this config has a reachable provider, so the model incident is
+            # retired by the very next read. Record and clear must pair.
+            engine.incidents.record("ollama", "No model answered.", hint="ollama serve")
+            check("a problem that is no longer true retires itself on the next read",
+                  client.get("/api/health").json()["problems"] == [])
+
+    # The AC is that it shows on the dashboard, so the banner has to be there.
+    page = (Path(__file__).resolve().parent.parent / "sb" / "web" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    check("the dashboard has a banner to render into", 'id="problems"' in page)
+    check("fed by the health poll that already runs", "renderProblems(h.problems" in page)
+    check("and each problem says how long it has been true", "since ${esc(when)}" in page)
+
+
+def test_doctor_writes_a_dated_report():
+    """J2 — the weekly health check leaves a trail, and its absence is news."""
+    section("doctor --write, and the weekly review")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+
+        review = engine.weekly_review()
+        check("a system that has never run doctor says so",
+              review["doctor"]["stale"] and "never" in review["doctor"]["message"],
+              review["doctor"])
+
+        path = engine.write_doctor_report("OK vault      somewhere\n")
+        check("the report lands on the dated path the AC names",
+              path.name == f"doctor-{dt.date.today():%Y%m%d}.txt", path.name)
+        check("under _system/logs", path.parent.name == "logs")
+        text = path.read_text(encoding="utf-8")
+        check("it carries the run's own output", "OK vault" in text)
+        check("and says which vault it is about", str(cfg.vault) in text)
+
+        fresh = engine.weekly_review()["doctor"]
+        check("the weekly review picks it up", fresh["stale"] is False, fresh)
+        check("and names the file", path.name in fresh["message"])
+        check("with its age in days", fresh["age_days"] == 0)
+
+        # A weekly task that stopped firing is exactly what this must catch.
+        old = engine.write_doctor_report("stale", on=dt.date.today() - dt.timedelta(days=30))
+        for other in engine.doctor_reports():
+            if other != old:
+                other.unlink()
+        stale = engine.weekly_review()["doctor"]
+        check("a month-old report is reported as stale, not as a pass",
+              stale["stale"] and stale["age_days"] == 30, stale)
+        check("and says the task has not fired", "has not fired" in stale["message"])
+
+        # Rolling window: a log folder lj never opens must not grow forever.
+        for leftover in engine.doctor_reports():
+            leftover.unlink()
+        for n in range(14):
+            engine.write_doctor_report(f"run {n}", on=dt.date(2026, 1, 1) + dt.timedelta(days=n))
+        kept = engine.doctor_reports()
+        check("only a rolling window of reports is kept",
+              len(kept) == Engine.DOCTOR_REPORTS_KEPT, len(kept))
+        check("and it is the newest ones that survive",
+              kept[-1].name == "doctor-20260114.txt", [q.name for q in kept])
+        check("the oldest are the ones dropped",
+              kept[0].name == "doctor-20260107.txt", [q.name for q in kept])
+
+        check("`doctor --write` writes one end to end",
+              "written to" in _doctor_text_writing(cfg))
+
+    root = Path(__file__).resolve().parent.parent
+    installer = root / "install-doctor-task.bat"
+    check("the Windows scheduled task ships", installer.exists())
+    check("with an uninstaller", (root / "uninstall-doctor-task.bat").exists())
+    check("and the unattended runner it points at", (root / "doctor-weekly.bat").exists())
+    if installer.exists():
+        bat = installer.read_text(encoding="utf-8", errors="replace")
+        check("it schedules weekly, not daily", "/SC WEEKLY" in bat)
+        check("idempotent, like the backup task", "/F" in bat)
+        check("and falls back when it cannot run as SYSTEM", "Retrying as your own account" in bat)
+    if (root / "doctor-weekly.bat").exists():
+        runner = (root / "doctor-weekly.bat").read_text(encoding="utf-8", errors="replace")
+        check("the runner asks for the report", "doctor --write" in runner)
+        check("and never blocks on a prompt nobody is there to answer",
+              "pause" not in runner.lower())
+
+
+def _doctor_text_writing(cfg):
+    import run as cli
+
+    original = cli.load
+    cli.load = lambda path=None: cfg
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_doctor(types.SimpleNamespace(config=None, write=True))
+    finally:
+        cli.load = original
+    return buf.getvalue()
+
+
+def test_degradation_is_honest():
+    """J3 — what actually happens when Ollama is not running.
+
+    Traced rather than assumed, path by path. The rule the whole lane is held
+    to: every degraded path says so in its own response, and files the one
+    incident that makes a week of quietly worse answers visible.
+    """
+    section("Ollama is down")
+    from sb import connect as connectmod, generate as genmod, llm as llmmod, tutor as tutormod
+
+    class ModelIsBack:
+        name, is_llm, model = "ollama", True, "fake"
+
+        def available(self):
+            return True
+
+        def complete_json(self, prompt, system=None, schema_hint=None):
+            return {"cards": [{"q": "Where is the energy stored?", "a": "As glucose",
+                               "why": "chemical energy stored as glucose"}]}
+
+        def complete_text(self, prompt, system=None):
+            return "an answer"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "ollama"
+        cfg.llm.ollama_url = "http://127.0.0.1:9"  # nothing is listening
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+
+        # -- capture still files. Verified, not assumed: this is the promise
+        #    the whole offline story rests on.
+        captured = engine.capture("Learn Rust generics by next Friday, ~4h", "project")
+        check("a capture still lands as a file", Path(captured["path"]).exists())
+        check("with its bucket", captured["note"]["bucket"] == "project")
+        check("the rule-based parser did it", captured["parser"]["provider"] == "heuristic")
+        check("and the response says so rather than pretending",
+              captured["parser"]["degraded"] and "rule-based" in captured["parser"]["note"])
+        check("a degraded capture files a problem",
+              any(p["kind"] == "ollama" for p in engine.health()["problems"]),
+              engine.health()["problems"])
+
+        # -- card generation queues rather than quietly making worse cards.
+        nid = engine.capture(
+            "Photosynthesis is the process by which plants convert light energy into "
+            "chemical energy stored as glucose. It happens in the chloroplasts.",
+            "resource",
+        )["note"]["id"]
+        first = engine.generate_cards(nid)
+        check("nothing is generated without a model", first["generated"] == 0)
+        check("the request is queued instead", first["queued"] is True)
+        check("and the response says exactly that",
+              "Queued" in first["note"] and "Ollama" in first["note"], first["note"])
+        check("the queue is durable, not in memory",
+              (Path(cfg.system_dir) / "queue" / "cards.jsonl").exists())
+        check("with the note on it", engine.card_queue.has(nid))
+        check("a queued job carries its own incident",
+              any(p["id"] == "ollama/cards" for p in engine.health()["problems"]))
+        engine.generate_cards(nid)
+        check("pressing generate again does not queue it twice",
+              engine.card_queue.count() == 1)
+
+        waiting = engine.drain_card_queue()
+        check("draining while still down changes nothing", waiting["waiting"] is True)
+        check("and keeps the request", waiting["pending"] == 1)
+
+        # -- the other model-dependent paths, each in its own words.
+        answer = engine.ask("what is photosynthesis")
+        check("ask degrades to the passages themselves", answer["degraded"] is True)
+        check("and says why", "start Ollama" in answer["note"], answer["note"])
+
+        marked = tutormod.grade_recall("Q?", "the thylakoid membrane",
+                                       "thylakoid membrane", cfg)
+        check("marking falls back to word overlap", marked.graded_by == "rule")
+        check("and the feedback admits it", "offline" in marked.feedback.lower())
+
+        linked = connectmod.judge(
+            engine.note(nid), [connectmod.Link(title="Other", why="x")], cfg
+        )
+        check("connect drops the uncertain band rather than guessing",
+              linked.degraded and not linked.links)
+        check("and says it kept only the confident links",
+              "confident" in linked.note, linked.note)
+
+        # -- and it all drains itself when the model comes back.
+        real_get, real_resolve = llmmod.get_provider, genmod.resolve_provider
+        llmmod.get_provider = lambda c, role="": ModelIsBack()
+        genmod.resolve_provider = lambda c, role="": ModelIsBack()
+        try:
+            drained = engine.drain_card_queue()
+            check("the queue replays when a model answers", drained["drained"] == 1, drained)
+            check("the note now has real cards", len(engine.deck(nid).cards) >= 1)
+            check("and nothing is left waiting", engine.card_queue.count() == 0)
+            check("the queue's own problem is retired",
+                  not any(p["id"] == "ollama/cards" for p in engine.incidents.open()))
+            check("and reading health retires the rest",
+                  engine.health()["problems"] == [], engine.health()["problems"])
+        finally:
+            llmmod.get_provider, genmod.resolve_provider = real_get, real_resolve
+
+    # A machine with no model configured is a decision, not an outage: the
+    # rule-based paths are the product there and must file nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+        nid = engine.capture(
+            "Photosynthesis is the process by which plants convert light energy into "
+            "chemical energy stored as glucose.", "resource",
+        )["note"]["id"]
+        made = engine.generate_cards(nid)
+        check("configured with no model, generation still runs offline",
+              made["queued"] is False and made["generated"] >= 1, made["note"])
+        check("nothing is queued", engine.card_queue.count() == 0)
+        check("and no problem is filed for a choice lj made",
+              engine.health()["problems"] == [], engine.health()["problems"])
+
+
+def test_doctor_lines_match_their_evidence():
+    """J4 — every marker states what was proved, not what was hoped.
+
+    Sprint 2 found three `doctor` lines lying in one day: an OK over an
+    unreadable vault, a zero reported as healthy, and "needs enabling" over a
+    plugin that was enabled. This is the audit of the rest of them, written as
+    the thing that would have caught all three.
+    """
+    section("doctor: claims vs evidence")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+        engine.capture("Photosynthesis, in one note", "resource")
+        # A capture resyncs the calendar, which is the whole point — so undo
+        # it to reach the state this line is about: a sink named in config and
+        # nothing ever written to it.
+        Path(cfg.ics_path).unlink(missing_ok=True)
+
+        text = _doctor_text(cfg)
+
+        # A counter at zero is not a passing check. Both of these wore an OK.
+        check("zero decks is not reported as healthy",
+              "   tutor      0 deck(s)" in text,
+              [l for l in text.splitlines() if "tutor" in l])
+        check("an index that was never built is not reported as healthy",
+              "   index      not built" in text,
+              [l for l in text.splitlines() if "index" in l])
+        # `sink: ics` with no .ics on disk is a calendar that has never synced.
+        check("naming a calendar sink is not evidence one was written",
+              "!! calendar" in text and "never written" in text,
+              [l for l in text.splitlines() if "calendar" in l])
+        # A watcher that is off is not a watcher that is working.
+        check("a Drop folder nothing is watching is not an OK",
+              "   drop       " in text and "watch off" in text,
+              [l for l in text.splitlines() if "drop" in l])
+
+        engine.sync_calendar()
+        after = _doctor_text(cfg)
+        check("once the file is actually on disk, the claim is earned",
+              "OK calendar" in after and "written 20" in after,
+              [l for l in after.splitlines() if "calendar" in l])
+
+        # `intake.candidates()` answers [] for a folder that is not there, so
+        # "0 waiting" used to be printed as OK over a deleted Drop folder.
+        import shutil
+
+        shutil.rmtree(cfg.drop_dir)
+        check("a missing Drop folder is not an empty one",
+              engine.health()["drop"]["exists"] is False)
+
+        # `DeckStore.all()` skips a deck file it cannot parse, so a corrupted
+        # deck vanished from the count without a word.
+        deck_dir = Path(cfg.deck_dir)
+        deck_dir.mkdir(parents=True, exist_ok=True)
+        (deck_dir / "broken.md").write_bytes(b"\xff\xfe\x00 not a deck")
+        health = engine.health()
+        check("a deck file that cannot be read is counted, not dropped",
+              health["study"]["unreadable"] == 1, health["study"])
+        check("and doctor says so out loud",
+              "could not be read" in _doctor_text(cfg))
+
+        # Three states, not two: "I could not read the answer" was being
+        # rendered as "the answer is no", which sent lj to fix a working thing.
+        plugin_dir = Path(cfg.vault) / ".obsidian" / "plugins" / "second-brain-capture"
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+        (plugin_dir / "main.js").write_text("// stub", encoding="utf-8")
+        listing = Path(cfg.vault) / ".obsidian" / "community-plugins.json"
+
+        status = engine._obsidian_plugin_status()
+        check("no plugin list at all is a real 'off' — nothing was ever enabled",
+              status == {"installed": True, "enabled": False, "known": True}, status)
+
+        listing.write_text("[]", encoding="utf-8")
+        check("a list that omits us is 'off'",
+              engine._obsidian_plugin_status()["enabled"] is False)
+        check("and doctor sends lj to Settings",
+              "not enabled" in _doctor_text(cfg))
+
+        listing.write_text('["second-brain-capture"]', encoding="utf-8")
+        check("a list that names us is 'on'",
+              engine._obsidian_plugin_status()["enabled"] is True)
+        check("and doctor says enabled", "OK obsidian" in _doctor_text(cfg))
+
+        listing.write_bytes(b"\xff\xfe{ not json")
+        unreadable = engine._obsidian_plugin_status()
+        check("an unreadable list is neither on nor off",
+              unreadable["known"] is False, unreadable)
+        rendered = _doctor_text(cfg)
+        check("so doctor says it cannot tell, rather than 'not enabled'",
+              "unknown" in rendered and "installed but not enabled" not in rendered,
+              [l for l in rendered.splitlines() if "obsidian" in l])
+
+    # Google auth is checked by reading a file, never over the network — so
+    # the line may not claim Google accepts the token.
+    from sb.calsync import _google_auth
+
+    check("the google check never touches the network",
+          "no network" in (_google_auth.usable_token.__doc__ or "").lower())
+    doctor_src = (Path(__file__).resolve().parent.parent / "run.py").read_text(encoding="utf-8")
+    check("so the line claims only what it read",
+          "not checked against Google" in doctor_src)
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -5029,6 +5489,10 @@ def main():
         # -- the drop folder
         test_intake_classification, test_intake_reads_files,
         test_intake_files_the_folder, test_intake_confirmation, test_intake_api,
+        # -- sprint 3, lane J: it says when something broke
+        test_incident_store, test_problems_reach_the_dashboard,
+        test_doctor_writes_a_dated_report, test_degradation_is_honest,
+        test_doctor_lines_match_their_evidence,
     ]:
         try:
             fn()

@@ -513,6 +513,48 @@ def build_app(cfg: Config | None = None) -> Starlette:
         ))
 
     @guard
+    async def problems(request: Request):
+        """What is broken right now, for the banner.
+
+        Its own endpoint as well as a key inside `/api/health` because the two
+        have different costs and different callers: the dashboard already
+        fetches health and should read the key it is given, while anything
+        that only wants the banner — a future status bar, a poll on a page
+        that has no other reason to touch health — should not pay for a vault
+        walk to get it. See sb/incidents.py.
+        """
+        items = await run_in_threadpool(engine.incidents.open)
+        return ok({"problems": items, "count": len(items)})
+
+    @guard
+    async def problems_clear(request: Request):
+        """Dismiss one problem by id, or all of them.
+
+        Dismissing is not fixing, and the store knows it: anything still true
+        is filed again by the job that hits it, and `health()` re-files a
+        standing calendar-auth failure on the very next poll. So this is an
+        "I have read that" button, not an override.
+        """
+        body = await body_of(request)
+        ident = str(body.get("id") or "")
+        if ident:
+            kind, _, key = ident.partition("/")
+            cleared = int(await run_in_threadpool(engine.incidents.clear, kind, key))
+        else:
+            cleared = await run_in_threadpool(engine.incidents.clear_all)
+        return ok({"cleared": cleared, "problems": engine.incidents.open()})
+
+    @guard
+    async def queue_status(request: Request):
+        return ok({
+            "cards": await run_in_threadpool(engine.card_queue.pending),
+        })
+
+    @guard
+    async def queue_drain(request: Request):
+        return ok(await run_in_threadpool(engine.drain_card_queue))
+
+    @guard
     async def calendar_sync(request: Request):
         return ok(await run_in_threadpool(engine.sync_calendar))
 
@@ -532,6 +574,10 @@ def build_app(cfg: Config | None = None) -> Starlette:
     routes = [
         Route("/", index),
         Route("/api/health", health),
+        Route("/api/problems", problems),
+        Route("/api/problems/clear", problems_clear, methods=["POST"]),
+        Route("/api/queue", queue_status),
+        Route("/api/queue/drain", queue_drain, methods=["POST"]),
         Route("/api/dashboard", dashboard),
         Route("/api/capture", capture, methods=["POST"]),
         Route("/api/notes", list_notes),
@@ -635,8 +681,38 @@ def start_drop_watcher(engine: Engine) -> None:
                         f"watch: {result['filed']} filed, {result['asking']} asked",
                     )
             except Exception as exc:  # never take the server down with it
+                # ...but never swallow it either. A watcher that has been
+                # failing every twenty seconds since 2am looks exactly like a
+                # watcher with nothing to do, and looked like one for a whole
+                # sprint. See sb/incidents.py.
                 try:
                     engine.vault.log_line("intake", f"watch failed: {exc!r}")
+                except Exception:
+                    pass
+                try:
+                    engine.incidents.record(
+                        "drop",
+                        f"The Drop folder watcher is failing ({type(exc).__name__}).",
+                        hint=f"Check {cfg.drop_dir} is reachable, then press "
+                             "“File dropped notes”.",
+                        detail=str(exc)[:400],
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    engine.incidents.clear("drop")
+                except Exception:
+                    pass
+            # The same tick is the natural place to notice the model came back:
+            # card generation queued during an outage drains itself rather than
+            # waiting for lj to remember which notes were waiting.
+            try:
+                if engine.card_queue.count():
+                    engine.drain_card_queue()
+            except Exception as exc:
+                try:
+                    engine.vault.log_line("study", f"queue drain failed: {exc!r}")
                 except Exception:
                     pass
 

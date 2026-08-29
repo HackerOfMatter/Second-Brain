@@ -25,7 +25,9 @@ from . import (
     forecasting,
     generate,
     habits as habitsmod,
+    incidents as incidentsmod,
     intake as intakemod,
+    jobqueue,
     lint,
     parser,
     quality,
@@ -73,6 +75,12 @@ class Engine:
         #: two notes, so the second caller is told the first is already on it
         #: rather than made to wait for a duplicate.
         self._intake_lock = threading.Lock()
+        #: Problems that happened on a background thread, so the dashboard can
+        #: say so instead of leaving them in a log file. See sb/incidents.py.
+        self.incidents = incidentsmod.IncidentStore(cfg.system_dir / "logs")
+        #: Card generation requests made while no model was reachable.
+        #: See sb/jobqueue.py.
+        self.card_queue = jobqueue.CardQueue(cfg.system_dir)
         self.ensure_drop_folder()
 
     # -- capture ------------------------------------------------------------
@@ -128,6 +136,12 @@ class Engine:
                 "degraded": result.degraded,
                 "note": result.note,
             }
+            if result.degraded:
+                # The capture still lands — that is the point of the fallback,
+                # and it is verified in `test_degradation_is_honest`. But a
+                # week of thinner plans because Ollama has been closed since
+                # Tuesday is worth one banner.
+                self._note_degradation("planning this project", result.note)
             info["forecast"] = self._apply_outside_view(note, snapshot)
             picked = _as_date(due)
             if picked and note.project:
@@ -508,6 +522,13 @@ class Engine:
             "estimates": forecasting.summary(notes),
             "calibration": calibration.curve(self.decks.reviews()).as_dict(),
             "atomicity": lint.check(notes).as_dict(),
+            # The week is also where a health check that stopped running gets
+            # noticed. `doctor --write` leaves a dated report; this says when
+            # the last one landed, or that none ever did.
+            "doctor": self.latest_doctor_report(),
+            # And what broke while nobody was looking. The banner shows these
+            # live; the review is where they get read on purpose.
+            "problems": self.incidents.open(),
         }
 
     def _week_closed(
@@ -753,6 +774,8 @@ class Engine:
             note, self.cfg.planner, busy=self._busy(note.id, snapshot)
         )
         note.body = _project_body(note)
+        if result.degraded:
+            self._note_degradation("re-parsing this project", result.note)
         self.vault.save(note)
         self._sync_calendar_quiet(self._replacing(snapshot, note))
         return {
@@ -1433,14 +1456,119 @@ class Engine:
 
     def _sync_calendar_quiet(self, snapshot: Optional[List[Note]] = None) -> None:
         """Best-effort resync after a mutation; never fails a write because a
-        calendar was unreachable."""
+        calendar was unreachable.
+
+        Swallowing the exception is right -- losing a captured note because
+        Google was down would be far worse -- but swallowing it *silently* is
+        how a calendar stops syncing in March and is noticed in June. The log
+        line stays for the detail; the incident is what makes it visible
+        without opening a log.
+        """
         try:
             self.sync_calendar(snapshot)
         except Exception as exc:
             self.vault.log_line("calendar", f"sync failed: {type(exc).__name__}: {exc}")
+            try:
+                self.incidents.record(
+                    incidentsmod.CALENDAR,
+                    f"Calendar sync failed ({type(exc).__name__}).",
+                    hint="Run `python run.py sync` to see the whole error.",
+                    key="sync",
+                    detail=str(exc)[:400],
+                )
+            except Exception:  # an incident must never become the failure
+                pass
+        else:
+            try:
+                self.incidents.clear(incidentsmod.CALENDAR, key="sync")
+            except Exception:
+                pass
 
     def ics_path(self) -> Path:
         return self.cfg.ics_path
+
+    # -- doctor reports -----------------------------------------------------
+
+    #: How many dated `doctor` reports to keep. A weekly task and a two-month
+    #: window: long enough to see "this started in July", short enough that a
+    #: log folder lj never opens does not grow forever.
+    DOCTOR_REPORTS_KEPT = 8
+
+    def doctor_report_path(self, on: Optional[dt.date] = None) -> Path:
+        on = on or dt.date.today()
+        return self.cfg.system_dir / "logs" / f"doctor-{on.strftime('%Y%m%d')}.txt"
+
+    def doctor_reports(self) -> List[Path]:
+        """Dated reports on disk, newest last. The filename carries the date,
+        so sorting the names sorts by date."""
+        d = self.cfg.system_dir / "logs"
+        if not d.is_dir():
+            return []
+        return sorted(d.glob("doctor-*.txt"))
+
+    def write_doctor_report(
+        self, text: str, *, on: Optional[dt.date] = None, keep: Optional[int] = None
+    ) -> Path:
+        """Save a `doctor` run under today's date and prune the old ones.
+
+        One file per day, overwritten if `doctor --write` runs twice in a day:
+        the point of the dated report is a weekly trail of what the system
+        looked like, not an archive of every invocation.
+        """
+        path = self.doctor_report_path(on)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        path.write_text(
+            f"second-brain doctor  ·  {stamp}\n"
+            f"vault: {self.cfg.vault}\n"
+            + "-" * 68 + "\n"
+            + (text or "").rstrip() + "\n",
+            encoding="utf-8",
+        )
+        limit = self.DOCTOR_REPORTS_KEPT if keep is None else keep
+        on_disk = self.doctor_reports()
+        for stale in on_disk[: max(0, len(on_disk) - limit)]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        return path
+
+    def latest_doctor_report(self, *, stale_after_days: int = 8) -> Dict[str, Any]:
+        """What the weekly review says about the health check itself.
+
+        A check that is supposed to run weekly and has not run in a month is
+        its own finding, so the absence is reported as loudly as the presence.
+        """
+        reports = self.doctor_reports()
+        if not reports:
+            return {
+                "path": "", "date": "", "age_days": None, "stale": True,
+                "kept": 0,
+                "message": "doctor has never written a report — "
+                           "run `python run.py doctor --write` "
+                           "(install-doctor-task.bat schedules it weekly)",
+            }
+        newest = reports[-1]
+        try:
+            on = dt.datetime.strptime(newest.stem.split("-", 1)[1], "%Y%m%d").date()
+        except (ValueError, IndexError):
+            on = dt.date.fromtimestamp(newest.stat().st_mtime)
+        age = (dt.date.today() - on).days
+        stale = age >= stale_after_days
+        return {
+            "path": str(newest),
+            "date": on.isoformat(),
+            "age_days": age,
+            "stale": stale,
+            "kept": len(reports),
+            "message": (
+                f"doctor last ran {age} day(s) ago ({on.isoformat()}) — "
+                "the weekly task has not fired"
+                if stale
+                else f"doctor ran {on.isoformat()} ({age} day(s) ago) — {newest}"
+            ),
+        }
 
     def _progress_report(self) -> Dict[str, Any]:
         """How close each self-measuring part is to having something to say.
@@ -1507,23 +1635,44 @@ class Engine:
             },
             "plugin": plugin_status["installed"],
             "plugin_enabled": plugin_status["enabled"],
+            #: False when the enabled/disabled answer could not be read at
+            #: all. `doctor` says "cannot tell" rather than "not enabled".
+            "plugin_enabled_known": plugin_status["known"],
         }
 
     def _obsidian_plugin_status(self) -> Dict[str, bool]:
         """Installed: the plugin's main.js is on disk. Enabled: Obsidian's
         own community-plugins.json (the list it writes when a plugin is
         toggled on in Settings) names it. `doctor` needs both -- a plugin
-        that is present but never turned on captures nothing."""
+        that is present but never turned on captures nothing.
+
+        Three states, not two. The first version of this collapsed "the file
+        says it is off" and "I could not read the file" into `enabled=False`,
+        and `doctor` printed "installed but not enabled -- turn it on in
+        Settings" at lj over a plugin that was enabled the whole time. An
+        unreadable answer is not a negative answer, and a check that reports
+        it as one sends you to fix something that is not broken. `known` is
+        the flag that keeps those apart.
+        """
         obsidian_dir = self.cfg.vault / ".obsidian"
         installed = (obsidian_dir / "plugins" / "second-brain-capture" / "main.js").exists()
         enabled = False
+        known = True
         if installed:
+            listing = obsidian_dir / "community-plugins.json"
             try:
-                raw = (obsidian_dir / "community-plugins.json").read_text(encoding="utf-8")
-                enabled = "second-brain-capture" in json.loads(raw)
-            except Exception:
+                enabled = "second-brain-capture" in json.loads(
+                    listing.read_text(encoding="utf-8")
+                )
+            except FileNotFoundError:
+                # Obsidian writes this file the first time any community
+                # plugin is enabled. Absent means none ever was, which is a
+                # real "off" -- the vault has been opened and nothing is on.
                 enabled = False
-        return {"installed": installed, "enabled": enabled}
+            except Exception:
+                # Unreadable, malformed, or locked by Obsidian mid-write.
+                known = False
+        return {"installed": installed, "enabled": enabled, "known": known}
 
     def _google_status(self) -> Optional[Dict[str, Any]]:
         """Why Google sync will or won't work, without opening a browser or
@@ -1646,6 +1795,48 @@ class Engine:
         deck.bucket = note.bucket.value
         deck.category = taxonomy.categorize(note, self.cfg)
 
+        outage = self._model_outage("generate")
+        if outage:
+            # Queue rather than quietly hand back cloze deletions. A card is
+            # permanent and spaced repetition will drill whatever it says into
+            # you, so the offline generator is a stopgap and not something to
+            # accumulate twenty of; the honest move is to keep the *request*
+            # and replay it against a real model. See sb/jobqueue.py.
+            entry = self.card_queue.add(
+                note_id,
+                title=note.title,
+                max_cards=max_cards,
+                source=source,
+                reason=outage,
+            )
+            self.incidents.record(
+                incidentsmod.OLLAMA,
+                f"Card generation is waiting on a model — {outage}.",
+                hint="Start Ollama (`ollama serve`). Queued notes generate "
+                     "themselves as soon as it answers.",
+                key="cards",
+            )
+            self.vault.log_line(
+                "study", f"queued card generation for {note.id} ({outage})"
+            )
+            return {
+                "deck": self._deck_payload(deck),
+                "generated": 0,
+                "rejected": 0,
+                "repaired": 0,
+                "rejections": {},
+                "passages": 0,
+                "provider": "",
+                "degraded": True,
+                "queued": True,
+                "queued_at": entry["queued_at"],
+                "pending": self.card_queue.count(),
+                "note": (
+                    "Queued, waiting on Ollama — nothing was generated. "
+                    f"{outage}. This note will generate itself when a model answers."
+                ),
+            }
+
         material = (source or "").strip() or note.body
         material = generate.expand_links(material, self._link_resolver())
         result = generate.add_to_deck(
@@ -1658,6 +1849,9 @@ class Engine:
         self.vault.log_line(
             "study", f"generated {len(result.cards)} cards for {note.id} ({result.provider})"
         )
+        # It answered, so whatever was queued on its absence is no longer true.
+        self.card_queue.remove(note_id)
+        self.incidents.clear(incidentsmod.OLLAMA, key="cards")
         self._sync_calendar_quiet()
         return {
             "deck": self._deck_payload(deck),
@@ -1668,7 +1862,118 @@ class Engine:
             "passages": result.chunks,
             "provider": result.provider,
             "degraded": result.degraded,
+            "queued": False,
+            "pending": self.card_queue.count(),
             "note": result.note,
+        }
+
+    def _model_outage(self, role: str = "") -> str:
+        """Empty when a model is reachable, otherwise one clause saying why not.
+
+        Two different things look identical from inside `resolve_provider` and
+        must not be confused here. `llm.provider: heuristic` is a *decision* —
+        this machine has no model and the rule-based paths are the product, so
+        nothing is wrong and nothing should be queued or reported. A configured
+        Ollama that does not answer is an *outage*. Only the second one is a
+        problem, and only the second one gets an incident.
+        """
+        from .llm import get_provider
+
+        provider = get_provider(self.cfg.llm, role)
+        if not getattr(provider, "is_llm", False):
+            return ""
+        if provider.available():
+            return ""
+        where = getattr(self.cfg.llm, "ollama_url", "") if provider.name == "ollama" else ""
+        return f"{provider.name} is not answering" + (f" at {where}" if where else "")
+
+    def _note_degradation(self, what: str, detail: str = "") -> None:
+        """File the one incident that means "a model was needed and there was
+        none, so you got the smaller answer".
+
+        Deliberately unkeyed. Six degraded paths must not become six banners;
+        `since` says how long this has been going on, `count` says how many
+        times it has bitten, and the message names the most recent thing that
+        had to go without. `health()` retires it the moment the model answers.
+
+        Separate from the `ollama/cards` incident because the two ask for
+        different things. This one is information — that answer was worse than
+        it should have been, and re-running it later will improve it. That one
+        is a promise: nothing was produced, and it will run by itself when the
+        model comes back.
+
+        Silent when `llm.provider` is heuristic: a machine with no model is a
+        configuration, not an outage, and the rule-based paths are the product
+        there rather than a fallback.
+        """
+        if (self.cfg.llm.provider or "").lower() in ("heuristic", "none", "off"):
+            return
+        try:
+            self.incidents.record(
+                incidentsmod.OLLAMA,
+                f"No model answered — {what} used its offline fallback.",
+                hint="Start Ollama (`ollama serve`). Nothing was lost; the "
+                     "offline path gives a smaller answer, not a missing one.",
+                detail=detail,
+            )
+        except Exception:  # an incident must never become the failure
+            pass
+
+    def drain_card_queue(self, limit: int = 0) -> Dict[str, Any]:
+        """Run the generation requests that were made while the model was down.
+
+        Called from the Drop watcher's tick and from `/api/queue/drain`, which
+        between them mean a queued note generates itself without lj having to
+        remember it was queued. Each entry is taken off the queue *before* it
+        runs, so a request that now fails for an unrelated reason — the note
+        was deleted in the meantime — cannot wedge the queue in a retry loop.
+        """
+        pending = self.card_queue.pending()
+        if not pending:
+            return {"waiting": False, "drained": 0, "pending": 0, "results": [],
+                    "note": "nothing queued"}
+        outage = self._model_outage("generate")
+        if outage:
+            return {
+                "waiting": True,
+                "drained": 0,
+                "pending": len(pending),
+                "results": [],
+                "note": f"still waiting on a model — {outage}",
+            }
+
+        results: List[Dict[str, Any]] = []
+        for entry in (pending[:limit] if limit else pending):
+            note_id = entry["note_id"]
+            self.card_queue.take(note_id)
+            try:
+                made = self.generate_cards(
+                    note_id,
+                    max_cards=entry.get("max_cards"),
+                    source=entry.get("source") or "",
+                )
+            except Exception as exc:
+                results.append({
+                    "note_id": note_id,
+                    "title": entry.get("title", ""),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                self.vault.log_line("study", f"queued generation failed for {note_id}: {exc!r}")
+                continue
+            results.append({
+                "note_id": note_id,
+                "title": entry.get("title", ""),
+                "generated": made.get("generated", 0),
+                "queued_at": entry.get("queued_at", ""),
+            })
+        self.incidents.clear(incidentsmod.OLLAMA, key="cards")
+        return {
+            "waiting": False,
+            "drained": sum(1 for r in results if "error" not in r),
+            "failed": sum(1 for r in results if "error" in r),
+            "pending": self.card_queue.count(),
+            "results": results,
+            "note": f"{len(results)} queued request(s) replayed",
         }
 
     def add_card(self, note_id: str, front: str, back: str, **fields: Any) -> Dict[str, Any]:
@@ -1898,6 +2203,12 @@ class Engine:
             grade = grading.grade
         if grade is None:
             raise ValueError("no grade given")
+        if grading is not None and grading.graded_by == "rule" and (typed or "").strip():
+            # Word overlap cannot recognise a right answer phrased differently,
+            # so a session marked this way is a session marked harshly. The
+            # response already carries `graded_by`; this is so it is visible
+            # without reading a field.
+            self._note_degradation("marking your typed answer", grading.feedback)
 
         result = tutor.answer(
             self.decks,
@@ -1966,7 +2277,18 @@ class Engine:
         deck = self.deck(note_id)
         card = deck.card(card_id)
         note = self.note(note_id)
-        return {"answer": tutor.explain(card, note.body, question, self.cfg)}
+        # `tutor.explain` says so in its prose when there is no model, which
+        # the reader sees but the caller cannot branch on. One reachability
+        # check on a button press buys a flag the UI can act on, and an
+        # incident so a whole evening of "there is nothing to ask" is visible.
+        outage = self._model_outage("explain")
+        if outage:
+            self._note_degradation("explaining a card", outage)
+        return {
+            "answer": tutor.explain(card, note.body, question, self.cfg),
+            "degraded": bool(outage),
+            "note": outage,
+        }
 
     def study_self_explain(self, note_id: str, card_id: str, said: str) -> Dict[str, Any]:
         """lj explains first; the model marks it; nothing is scheduled.
@@ -2061,9 +2383,12 @@ class Engine:
         self.vault.log_line(
             "ask", f"{question[:120]!r} -> {len(answer.sources)} sources"
         )
+        if answer.degraded:
+            self._note_degradation("answering a question", answer.note)
         return {
             "question": question,
             "answer": answer.text,
+            "degraded": answer.degraded,
             "sources": answer.sources,
             "used": answer.used,
             "semantic": answer.semantic,
@@ -2121,6 +2446,11 @@ class Engine:
             self.vault.log_line(
                 "connect", f"{note.id}  {len(result.links)} links  {note.title}"
             )
+        if result.degraded:
+            # The uncertain band was dropped rather than guessed — the right
+            # call, and a silent one: the note simply comes back with fewer
+            # links and nothing says which ones were never judged.
+            self._note_degradation("judging the uncertain links", result.note)
         return result.as_dict
 
     def connect_all(
@@ -2164,7 +2494,7 @@ class Engine:
         state = connectmod.ConnectState(self.cfg)
         seen = state.load() if changed_only else {}
 
-        results, changed, skipped, model_calls = [], 0, 0, 0
+        results, changed, skipped, model_calls, degraded = [], 0, 0, 0, 0
         for note in targets:
             mark = connectmod.fingerprint(note)
             if changed_only and seen.get(note.id) == mark:
@@ -2189,6 +2519,8 @@ class Engine:
                 allow_model=allow_model,
             )
             model_calls += 1 if result.used_model else 0
+            if result.degraded:
+                degraded += 1
             if write and result.changed:
                 self.vault.save(note)
                 changed += 1
@@ -2204,10 +2536,16 @@ class Engine:
             f"pass over {len(targets)} notes: {changed} changed, "
             f"{skipped} skipped, {model_calls} model calls",
         )
+        if degraded:
+            self._note_degradation(
+                f"judging the uncertain links on {degraded} note(s)",
+                "the confident tiers still ran; only the model-judged band was skipped",
+            )
         return {
             "scanned": len(targets),
             "changed": changed,
             "skipped": skipped,
+            "degraded": degraded,
             "model_calls": model_calls,
             "linked": sum(len(r["links"]) for r in results),
             "by_source": _link_sources(results),
@@ -2228,7 +2566,22 @@ class Engine:
         if repaired:
             self.vault.log_line("vault", f"renamed {len(repaired)}: {'; '.join(repaired)}")
 
-        stats = self.index.build(self.notes(), force=force)
+        try:
+            stats = self.index.build(self.notes(), force=force)
+        except Exception as exc:
+            # The index rebuilds itself the first time a question is asked, on
+            # whatever thread asked it. A build that dies there used to leave
+            # nothing but a traceback in a terminal lj had closed.
+            self.vault.log_line("index", f"build failed: {type(exc).__name__}: {exc}")
+            self.incidents.record(
+                incidentsmod.INDEX,
+                f"Rebuilding the search index failed ({type(exc).__name__}).",
+                hint="Run `python run.py doctor` — and `_system/index/` can be "
+                     "deleted safely, it rebuilds from the notes.",
+                detail=str(exc)[:400],
+            )
+            raise
+        self.incidents.clear(incidentsmod.INDEX)
         self.vault.log_line("index", str(stats))
         return {**stats, "renamed": repaired, "status": self.index.status()}
 
@@ -2358,6 +2711,20 @@ class Engine:
         lanes = lane_report(self.cfg.llm) if available else None
         vault_exists = self.cfg.vault.exists()
         counts = self.vault.counts()
+
+        # Reading is where a stale problem gets retired. A model that answers
+        # again is the only evidence an outage is over, and this is the call
+        # that has it — see sb/incidents.py on why record and clear must pair.
+        # `clear` writes nothing when there was nothing open, so the normal
+        # dashboard poll still touches no files.
+        if available:
+            self.incidents.clear(incidentsmod.OLLAMA)
+        google = self._google_status()
+        if google is not None:
+            self._reconcile_calendar_auth(google)
+
+        ics = self.cfg.ics_path
+        decks = self.decks.all()
         return {
             "vault": str(self.cfg.vault),
             "vault_exists": vault_exists,
@@ -2384,6 +2751,11 @@ class Engine:
             "index": self.index.status(),
             "drop": {
                 "path": str(self.cfg.drop_dir),
+                # `intake.candidates` answers "[]" for a folder that is not
+                # there, which read as "OK drop empty" over a folder that had
+                # been deleted. A count of zero is only good news once the
+                # thing being counted exists.
+                "exists": self.cfg.drop_dir.is_dir(),
                 "waiting": len(
                     intakemod.candidates(self.cfg.drop_dir, 0.0)
                 ),
@@ -2391,10 +2763,20 @@ class Engine:
                 "auto_floor": self.cfg.intake.auto_floor,
             },
             "study": {
-                "decks": len(self.decks.all()),
+                "decks": len(decks),
+                # `DeckStore.all()` skips a deck file it cannot parse, which
+                # makes a corrupted deck disappear from the count in silence —
+                # the one number here that must not quietly shrink. Files on
+                # disk minus decks read is exactly how many did that.
+                "deck_files": self._deck_file_count(),
+                "unreadable": max(0, self._deck_file_count() - len(decks)),
                 "retention": self.cfg.study.desired_retention,
                 "path": str(self.cfg.deck_dir),
             },
+            # Problems background jobs hit while nobody was watching. Cheap:
+            # one small file, empty in the normal case. See sb/incidents.py.
+            "problems": self.incidents.open(),
+            "queued_cards": self.card_queue.count(),
             # Everything that measures itself, and how far off it still is.
             # A feature that unlocks on a trigger is invisible until it fires,
             # which makes it feel broken rather than pending — so `doctor`
@@ -2403,16 +2785,63 @@ class Engine:
             "calendar": {
                 "sink": self.cfg.calendar.sink,
                 "task_sink": self.cfg.resolved_task_sink(),
-                "ics": str(self.cfg.ics_path),
+                "ics": str(ics),
+                # The sink names and the colour count are read back out of
+                # config; they are not evidence that a calendar was ever
+                # written. Whether the .ics file is on disk, and when, is.
+                "ics_exists": ics.exists(),
+                "ics_written": _mtime_iso(ics),
                 "categories": len(taxonomy.table(self.cfg)),
-                "google": self._google_status(),
+                "google": google,
             },
         }
+
+    def _deck_file_count(self) -> int:
+        """Deck files on disk, counted the same way `DeckStore.all()` selects
+        them — so the difference between the two is only ever a parse failure."""
+        root = self.cfg.deck_dir
+        if not root.is_dir():
+            return 0
+        return sum(
+            1
+            for p in root.glob("*.md")
+            if not p.name.startswith("_") and p.name != "README.md"
+        )
+
+    def _reconcile_calendar_auth(self, google: Dict[str, Any]) -> None:
+        """Google auth is a standing condition, so it belongs in the incident
+        store rather than only in a `doctor` line lj has to go and run.
+
+        `bump=False`: this runs from `health()`, which the dashboard polls.
+        An unchanged condition must not cost a disk write every two minutes.
+        """
+        if google.get("ready"):
+            self.incidents.clear(incidentsmod.CALENDAR, key="auth")
+            return
+        self.incidents.record(
+            incidentsmod.CALENDAR,
+            f"Google Calendar sync is not authorised — {google.get('reason') or 'no token'}.",
+            hint="Run `python run.py sync` once; a browser will open to re-authorise.",
+            key="auth",
+            bump=False,
+        )
 
 
 # --------------------------------------------------------------------------
 # note body rendering — the human-readable half of the file
 # --------------------------------------------------------------------------
+
+
+def _mtime_iso(path: Path) -> str:
+    """When a file was last written, or "" if it is not there. Used wherever a
+    `doctor` line would otherwise claim a produced artifact exists on the
+    strength of the config that names it."""
+    try:
+        return dt.datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(
+            timespec="seconds"
+        )
+    except OSError:
+        return ""
 
 
 def _as_date(value: Any) -> Optional[dt.date]:

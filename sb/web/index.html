@@ -232,6 +232,19 @@
   .dot.off { background: var(--warn); }
   a { color: var(--accent); }
   .hide { display: none !important; }
+  /* Story J1 — background jobs fail where nobody is looking. This is the
+     minimum surface that makes them visible; the endpoint behind it
+     (/api/problems, and health.problems) is the part meant to be built on. */
+  #problems { margin: 0 0 14px; display: grid; gap: 8px; }
+  .problem {
+    background: var(--panel); border: 1px solid var(--danger);
+    border-left-width: 4px; border-radius: 8px; padding: 10px 12px;
+    display: flex; gap: 10px; align-items: flex-start;
+  }
+  .problem .body { flex: 1; min-width: 0; }
+  .problem .msg { font-weight: 600; color: var(--danger); }
+  .problem .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .problem button { flex: none; }
 </style>
 </head>
 <body>
@@ -247,6 +260,8 @@
     <button id="connectbtn" title="Find related notes and link them. Cheap tiers first — the model is only asked about links nothing else could find.">Link notes</button>
     <button id="intakebtn" title="Read the Drop folder and file what's in it. Runs by itself too, while this is open.">File dropped notes<span id="dropbadge"></span></button>
   </header>
+
+  <div id="problems" class="hide"></div>
 
   <div class="capture">
     <textarea id="capturebox" placeholder="Capture anything — “learn Rust generics by next Friday, ~4h, start with the Book ch.10”"></textarea>
@@ -763,6 +778,32 @@ function renderCounts(counts) {
     .map(([k, v]) => `<li>${esc(k)}<span style="float:right;color:var(--muted)">${v}</span></li>`).join("");
 }
 
+// Story J1. Everything a background job could not finish, said out loud.
+// `since` rather than "just now": a watcher that has been failing since 2am
+// and one that failed once are not the same news.
+function renderProblems(problems) {
+  const box = $("#problems");
+  box.classList.toggle("hide", !problems.length);
+  box.innerHTML = problems.map(p => {
+    const when = (p.since || "").replace("T", " ").slice(0, 16);
+    const times = (p.count || 1) > 1 ? ` · seen ${p.count}×` : "";
+    return `<div class="problem">
+      <div class="body">
+        <div class="msg">${esc(p.message || "Something failed in the background.")}</div>
+        <div class="meta">since ${esc(when)}${times}${p.hint ? " — " + esc(p.hint) : ""}</div>
+      </div>
+      <button data-problem="${esc(p.id || "")}" title="Dismiss. If it is still true, the next run files it again.">Dismiss</button>
+    </div>`;
+  }).join("");
+  box.querySelectorAll("[data-problem]").forEach(b => b.addEventListener("click", async e => {
+    const id = e.currentTarget.getAttribute("data-problem");
+    try {
+      const r = await api("/api/problems/clear", {method: "POST", body: JSON.stringify({id})});
+      renderProblems(r.problems || []);
+    } catch (err) { toast("Could not dismiss", err.message, "err"); }
+  }));
+}
+
 async function load() {
   try {
     const d = await api("/api/dashboard");
@@ -787,6 +828,7 @@ async function load() {
     // cannot show anywhere else — it isn't a note yet.
     const waiting = (h.drop && h.drop.waiting) || 0;
     $("#dropbadge").textContent = waiting ? ` · ${waiting}` : "";
+    renderProblems(h.problems || []);
     $("#footer").innerHTML =
       `<span><i class="dot ${on ? "on" : "off"}"></i>${esc(h.llm.provider)} · ${esc(h.llm.model)} ${on ? "ready" : "offline (rule-based fallback)"}</span>` +
       `<span><i class="dot on"></i>events: ${esc(h.calendar.sink)} · tasks: ${esc(h.calendar.task_sink)} · <a href="/calendar.ics">calendar.ics</a></span>` +

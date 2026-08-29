@@ -58,6 +58,11 @@ class Answer:
     searched_archive: bool = False
     provider: str = ""
     note: str = ""
+    #: True when the answer is smaller than it should have been because no
+    #: model was reachable — the passages instead of prose written from them.
+    #: `note` already says so in words; callers need a field to branch on so
+    #: the degradation can be surfaced and filed rather than merely read.
+    degraded: bool = False
 
     @property
     def grounded(self) -> bool:
@@ -106,6 +111,7 @@ def ask(
             "than an answer written from them."
         )
         answer.note = "excerpts only — start Ollama for a written answer"
+        answer.degraded = True
         return answer
 
     try:
@@ -115,6 +121,7 @@ def ask(
     except Exception as exc:
         answer.text = ""
         answer.note = f"Could not reach the model ({type(exc).__name__}) — excerpts below."
+        answer.degraded = True
         return answer
 
     answer.used = _cited(answer.text, len(hits))
