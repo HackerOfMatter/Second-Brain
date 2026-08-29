@@ -1,6 +1,6 @@
 """Second Brain -- global capture hotkey (Story F1).
 
-Ctrl+Alt+N, anywhere in Windows, opens a one-line capture box. Enter
+Ctrl+Alt+Z, anywhere in Windows, opens a one-line capture box. Enter
 files it; Escape throws it away. This process is the whole point of the
 story: it must be resident (started once, at login) rather than launched
 fresh on every keypress, because a cold Python + tkinter start is commonly
@@ -54,12 +54,23 @@ from pathlib import Path
 #    can go wrong. -----------------------------------------------------------
 
 def _open_log():
-    base = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "secondbrain"
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-        return open(base / "capture-hotkey.log", "a", buffering=1, encoding="utf-8")
-    except Exception:
-        return open(os.devnull, "w")
+    """Log beside the rest of the system's logs, not off in LOCALAPPDATA.
+
+    A capture tool that fails silently is indistinguishable from a broken
+    one, and the first question is always "is it even running?". Keeping
+    the log in _system/logs puts the answer where doctor and anyone
+    debugging the vault will actually look. Falls back to LOCALAPPDATA if
+    the vault is read-only for some reason."""
+    for base in (
+        Path(__file__).resolve().parent / "_system" / "logs",
+        Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "secondbrain",
+    ):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            return open(base / "capture-hotkey.log", "a", buffering=1, encoding="utf-8")
+        except Exception:
+            continue
+    return open(os.devnull, "w")
 
 
 _LOG = _open_log()
@@ -245,10 +256,10 @@ def parse_hotkey(spec):
 # whichever it is gets logged and shown once at startup, because a capture
 # box on an unknown key is the same as no capture box.
 HOTKEY_CANDIDATES = [
+    ("Ctrl+Alt+Z", MOD_CONTROL | MOD_ALT, ord("Z")),
     ("Ctrl+Alt+N", MOD_CONTROL | MOD_ALT, ord("N")),
-    ("Ctrl+Alt+J", MOD_CONTROL | MOD_ALT, ord("J")),
     ("Ctrl+Shift+F9", MOD_CONTROL | MOD_SHIFT, 0x78),
-    ("Win+Alt+N", MOD_WIN | MOD_ALT, ord("N")),
+    ("Win+Alt+Z", MOD_WIN | MOD_ALT, ord("Z")),
 ]
 
 user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
