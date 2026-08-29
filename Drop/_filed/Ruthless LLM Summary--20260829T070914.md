@@ -1,0 +1,11 @@
+To actually live out the teachings from _The Ruthless Elimination of Hurry_, we have to recognize that hurry is the great enemy of our spiritual lives, and the only way to combat it is by adopting a "rule of life" based on the actual, daily rhythms of Jesus.
+
+**Silence and Solitude** You cannot connect with your own soul or hear anything profound if you are constantly drowning in the noise of digital Babylon. Carve out daily, intentional time away from your phone, your responsibilities, and the demands of other people. Start with fifteen minutes of quiet breathing and centering prayer before you even look at a screen in the morning to ground your identity outside of your productivity.
+
+**Sabbath** This is not merely a day off to run errands, catch up on laundry, or binge-watch television, but a fiercely protected twenty-four-hour rhythm of stopping, resting, delighting, and worshipping. Pick a specific window—like sundown Friday to sundown Saturday—power down your devices, and engage only in activities that restore your soul. Feast with friends, spend time in nature, and completely disconnect from the economy of doing.
+
+**Simplicity** The endless, cultural pursuit of more directly fuels our chronic exhaustion and anxiety. Audit your life and ruthlessly purge the excess material possessions, unnecessary commitments, and digital clutter that demand your ongoing emotional energy. Buy less, give more away, and curate a physical environment that is intentional rather than overwhelming, so your internal environment actually has the space to breathe.
+
+**Slowing** Force your mind and nervous system to break their addiction to speed by deliberately choosing the slower path in everyday, mundane moments. Drive the actual speed limit, intentionally get into the longest checkout line at the grocery store, turn off your push notifications, and practice single-tasking. When you take a walk, just walk without filling the silence with a podcast; when you eat a meal, sit at a table and actually taste your food.
+
+The ultimate goal is never just to slow down for the sake of being slow, but to create enough margin in your day to actually love the people in front of you and remain present to the life you are living.
