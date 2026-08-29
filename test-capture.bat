@@ -13,14 +13,16 @@ if not exist ".venv\Scripts\python.exe" (
 )
 echo [ok] found .venv\Scripts\python.exe
 
-".venv\Scripts\python.exe" -c "import tkinter" 2>nul
+REM `import tkinter` passing proves nothing -- it imports fine without the
+REM Tcl runtime. Only creating a window exercises what actually failed here.
+".venv\Scripts\python.exe" -c "import tkinter as t; r=t.Tk(); r.destroy()" 2>nul
 if errorlevel 1 (
-  echo [X] tkinter is NOT available in this Python. The capture box cannot draw.
-  echo     Reinstall Python from python.org with the 'tcl/tk and IDLE' option ticked.
-  pause
-  exit /b 1
+  echo [!] tkinter cannot open a window on its own settings.
+  echo     capture_hotkey.pyw sets TCL_LIBRARY/TK_LIBRARY itself, so this
+  echo     may still work. Watch the log line below.
+) else (
+  echo [ok] tkinter opens a window
 )
-echo [ok] tkinter imports
 
 echo.
 echo Starting capture tool in the foreground.
