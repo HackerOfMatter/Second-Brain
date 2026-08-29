@@ -9,6 +9,7 @@
     python run.py next            print the execution queue
     python run.py sync            regenerate the calendar
     python run.py review          the week: what closed, slipped, is next
+    python run.py today [--format text|long]   what's going on today (F3')
     python run.py estimates       how long things really take vs the plan
     python run.py lint            notes holding more than one idea
     python run.py thresholds      are the auto-accept floors set right?
@@ -78,7 +79,9 @@ def cmd_doctor(args) -> int:
     h = engine.health(progress=True)
     ok = "OK "
     bad = "!! "
-    print(f"{ok if h['vault_exists'] else bad}vault      {h['vault']}")
+    print(f"{ok if h['vault_ok'] else bad}vault      {h['vault']}")
+    if h.get("vault_note"):
+        print(f"           {h['vault_note']}")
     print(f"           notes: " + ", ".join(f"{k}={v}" for k, v in h["counts"].items()))
     llm = h["llm"]
     print(f"{ok if llm['available'] else bad}llm        {llm['provider']} · {llm['model']}")
@@ -177,10 +180,13 @@ def cmd_doctor(args) -> int:
             print(f"   index math  pure python ({np_p['chunks']} chunks; "
                   f"numpy engages at {np_p['at']})")
 
-        print(("OK " if pr["plugin"] else "   ")
-              + "obsidian   capture plugin "
-              + ("installed — enable it in Settings \u2192 Community plugins"
-                 if pr["plugin"] else "not present"))
+        if pr.get("plugin_enabled"):
+            print("OK  obsidian   capture plugin enabled")
+        elif pr["plugin"]:
+            print("!!  obsidian   capture plugin installed but not enabled "
+                  "-- turn it on in Settings -> Community plugins")
+        else:
+            print("    obsidian   capture plugin not present")
         print()
 
     g = h["calendar"].get("google")
@@ -246,6 +252,17 @@ def cmd_next(args) -> int:
         due = f"  (due {a['deadline']})" if a["deadline"] else ""
         print(f"[{int(a['urgency'] * 100):3d}] {a['step']['text']}")
         print(f"      {a['note_title']}{due}")
+    return 0
+
+
+def cmd_today(args) -> int:
+    """F3' spike: "what's going on today" — for SMS/push, or read at the
+    terminal. Same payload as GET /api/today."""
+    from sb.digest import render_long, render_text
+
+    cfg = load(args.config)
+    d = Engine(cfg).today_digest()
+    print(render_text(d) if args.format == "text" else render_long(d))
     return 0
 
 
@@ -341,6 +358,10 @@ def main() -> int:
     sub.add_parser("init", help="create vault folders and templates").set_defaults(func=cmd_init)
     sub.add_parser("doctor", help="check the wiring").set_defaults(func=cmd_doctor)
     sub.add_parser("next", help="print the execution queue").set_defaults(func=cmd_next)
+
+    t = sub.add_parser("today", help="what is going on today (F3')")
+    t.add_argument("--format", choices=["long", "text"], default="long")
+    t.set_defaults(func=cmd_today)
     sub.add_parser("sync", help="regenerate the calendar").set_defaults(func=cmd_sync)
     sub.add_parser("estimates", help="estimated vs actual, and your multiplier").set_defaults(func=cmd_estimates)
     sub.add_parser("lint", help="notes holding more than one idea").set_defaults(func=cmd_lint)

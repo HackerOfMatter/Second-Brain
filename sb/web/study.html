@@ -444,8 +444,10 @@ async function loadOverview() {
   renderProgress(d.stats, d.decks);
   renderGraduation(d.graduation);
   const s = d.stats;
+  // Never miss twice, never a streak (sb/habits.py) -- the subline reports
+  // volume, not a number a missed day could break.
   $("#subline").textContent =
-    `${s.cards.due_today} due · ${s.cards.active} cards · ${s.streak}-day streak`;
+    `${s.cards.due_today} due · ${s.cards.active} cards · ${s.reviews_total} reviews all time`;
 }
 
 // Folder scoping. The server decides what a session contains; this only has
@@ -1073,12 +1075,13 @@ $("#answer").addEventListener("click", e => {
 
 // ------------------------------------------------------------------ progress
 function renderProgress(s, decks) {
+  // No streak tile here on purpose (sb/habits.py's "never miss twice": a
+  // streak counter turns the first missed day into the loss of a whole
+  // number, at exactly the moment nothing has actually gone wrong).
   $("#kpis").innerHTML = [
-    [s.streak, "day streak"],
     [s.today, "today"],
     [s.reviews_total, "reviews all time"],
     [s.days_studied, "days studied"],
-    [s.longest_streak, "longest streak"],
     [s.accuracy_30d == null ? "—" : Math.round(s.accuracy_30d * 100) + "%", "recalled, 30d"],
     [s.predicted_retention == null ? "—" : Math.round(s.predicted_retention * 100) + "%", "known right now"],
     [s.cards.mature + "/" + s.cards.active, "mature cards"],

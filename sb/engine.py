@@ -9,6 +9,7 @@ that will drive habit check-ins and Resource reviews.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 import threading
 from pathlib import Path
@@ -18,6 +19,7 @@ from . import (
     ask as askmod,
     calibration,
     connect as connectmod,
+    digest,
     extract,
     fit as fitmod,
     forecasting,
@@ -627,6 +629,37 @@ class Engine:
             "resource_reviews": due_reviews,
             "habit_checkins": checkins,
         }
+
+    # -- the daily digest (F3': "what's going on today") --------------------
+
+    def today_digest(self, on: Optional[dt.date] = None) -> Dict[str, Any]:
+        """Everything the system knows about today, in one payload.
+
+        Sprint 2 story F3' replaced "phone capture" with the opposite
+        direction: lj texts (or is texted) "what's going on today" and gets
+        one answer back. The transport is undecided — see the spike's
+        decision doc — so this only builds the part that is useful
+        regardless of it. Two renderers sit over the same payload in
+        sb/digest.py: `render_text` for an SMS body, `render_long` for email
+        or a dashboard panel.
+        """
+        all_notes = self.notes()
+        active = [
+            n for n in all_notes
+            if n.bucket == Bucket.PROJECT and n.project
+            and n.project.status != ProjectStatus.DONE
+        ]
+        inbox_count = sum(1 for n in all_notes if n.bucket == Bucket.INBOX)
+        pending = len(self._pending_dates(active))
+        return digest.build(
+            all_notes,
+            active,
+            self.decks.all(),
+            self.cfg,
+            inbox_count=inbox_count,
+            pending_dates=pending,
+            on=on,
+        ).as_dict()
 
     def retention_dial(self) -> Dict[str, Any]:
         """What the current retention target costs, and what it would cost
@@ -1441,6 +1474,7 @@ class Engine:
             for s in n.project.steps
             if s.done and not s.actual_minutes
         )
+        plugin_status = self._obsidian_plugin_status()
         return {
             "fsrs": {
                 "have": len(fitmod.samples(reviews)),
@@ -1471,9 +1505,25 @@ class Engine:
                 "available": index.get("numpy_available", False),
                 "accelerated": index.get("accelerated", False),
             },
-            "plugin": (self.cfg.vault / ".obsidian" / "plugins"
-                       / "second-brain-capture" / "main.js").exists(),
+            "plugin": plugin_status["installed"],
+            "plugin_enabled": plugin_status["enabled"],
         }
+
+    def _obsidian_plugin_status(self) -> Dict[str, bool]:
+        """Installed: the plugin's main.js is on disk. Enabled: Obsidian's
+        own community-plugins.json (the list it writes when a plugin is
+        toggled on in Settings) names it. `doctor` needs both -- a plugin
+        that is present but never turned on captures nothing."""
+        obsidian_dir = self.cfg.vault / ".obsidian"
+        installed = (obsidian_dir / "plugins" / "second-brain-capture" / "main.js").exists()
+        enabled = False
+        if installed:
+            try:
+                raw = (obsidian_dir / "community-plugins.json").read_text(encoding="utf-8")
+                enabled = "second-brain-capture" in json.loads(raw)
+            except Exception:
+                enabled = False
+        return {"installed": installed, "enabled": enabled}
 
     def _google_status(self) -> Optional[Dict[str, Any]]:
         """Why Google sync will or won't work, without opening a browser or
@@ -2306,10 +2356,19 @@ class Engine:
         available = provider.available()
         models = provider.models() if available and hasattr(provider, "models") else []
         lanes = lane_report(self.cfg.llm) if available else None
+        vault_exists = self.cfg.vault.exists()
+        counts = self.vault.counts()
         return {
             "vault": str(self.cfg.vault),
-            "vault_exists": self.cfg.vault.exists(),
-            "counts": self.vault.counts(),
+            "vault_exists": vault_exists,
+            # `vault_exists` alone lies: a wrong path that happens to resolve
+            # to *some* directory (a relative Windows path re-read on Linux,
+            # an empty scratch folder) still "exists" while holding nothing.
+            # `doctor` renders on this instead — a vault only counts as OK
+            # once it is both present and has a note in it somewhere.
+            "vault_ok": vault_exists and any(counts.values()),
+            "vault_note": self.cfg.vault_note,
+            "counts": counts,
             "llm": {
                 "provider": provider.name,
                 "model": self.cfg.llm.model if getattr(provider, "is_llm", False) else "rule-based",

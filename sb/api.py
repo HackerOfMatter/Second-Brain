@@ -27,6 +27,7 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from . import digest as digestmod
 from .config import Config, load
 from .engine import Engine
 
@@ -162,6 +163,22 @@ def build_app(cfg: Config | None = None) -> Starlette:
     async def weekly_review(request: Request):
         days = int(request.query_params.get("days", 7))
         return ok(await run_in_threadpool(engine.weekly_review, days))
+
+    @guard
+    async def today_digest(request: Request):
+        """F3' spike: what's going on today.
+
+        Default is the full JSON payload — the dashboard panel reads this.
+        `?format=text` returns the SMS body (<=320 chars); `?format=long`
+        returns the same long form `python run.py today` prints.
+        """
+        payload = await run_in_threadpool(engine.today_digest)
+        fmt = request.query_params.get("format")
+        if fmt == "text":
+            return PlainTextResponse(digestmod.render_text(payload))
+        if fmt == "long":
+            return PlainTextResponse(digestmod.render_long(payload))
+        return ok(payload)
 
     @guard
     async def retention_dial(request: Request):
@@ -523,6 +540,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/notes/{note_id}/steps/{step_id}/start", start_step, methods=["POST"]),
         Route("/api/estimates", estimates),
         Route("/api/review/weekly", weekly_review),
+        Route("/api/today", today_digest),
         Route("/api/study/retention", retention_dial),
         Route("/api/atomicity", atomicity),
         Route("/api/thresholds", thresholds),

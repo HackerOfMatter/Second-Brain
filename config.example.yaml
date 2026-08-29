@@ -3,9 +3,14 @@
 # config.yaml is valid — you only need the ones you want to change.
 
 # ---------------------------------------------------------------- vault ----
-# Where your Obsidian vault lives. This is the only setting most people change.
+# Where your Obsidian vault lives. Leave this unset (or blank) and it
+# defaults to the folder this config.yaml sits in — the right answer on
+# every machine, since the app normally lives inside the vault it manages,
+# and it needs no per-machine editing when the repo moves or is opened from
+# a different OS. Set it explicitly only if you keep the app and the vault
+# in separate places.
 # Windows: use forward slashes or double backslashes.
-vault: C:/Users/lj/Obsidian/SecondBrain
+# vault: C:/Users/lj/Obsidian/SecondBrain
 
 host: 127.0.0.1        # localhost only. Do not expose this to a network.
 port: 8787

@@ -272,6 +272,12 @@ class ConnectConfig(BaseModel):
 
 class Config(BaseModel):
     vault: Path = Path.home() / "Obsidian" / "SecondBrain"
+    #: Set by `load()` when an explicit `vault:` did not exist on this
+    #: machine and the config file's own directory was used instead — see
+    #: `load()`. Empty when no fallback happened. Not itself config; carried
+    #: on the instance so `doctor` can say what it did instead of silently
+    #: reporting on an empty vault.
+    vault_note: str = ""
     host: str = "127.0.0.1"
     port: int = 8787
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -344,12 +350,47 @@ def _apply_env(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _looks_like_vault(path: Path) -> bool:
+    """The PARA skeleton, present even if lj never set `vault:` — the common
+    case, since the app usually lives inside the vault it manages."""
+    markers = ("00-Inbox", "10-Areas", "20-Projects", "30-Resources")
+    return path.is_dir() and all((path / m).is_dir() for m in markers)
+
+
 def load(path: Optional[Path] = None) -> Config:
     path = Path(path) if path else REPO_ROOT / "config.yaml"
+    # Resolve before taking `.parent`: a relative --config would otherwise
+    # anchor the fallback vault to the current working directory instead of
+    # to where config.yaml actually is.
+    config_dir = path.resolve().parent
     data: Dict[str, Any] = {}
     if path.exists():
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     data = _apply_env(data)
+
+    raw_vault = str(data.get("vault") or "").strip()
+    if not raw_vault:
+        # No `vault:` anywhere (config.yaml omits it, or the key is blank).
+        # The portable default is "wherever config.yaml lives" — right on
+        # every machine, Windows or this Linux bridge, with no per-machine
+        # setting to keep in sync. Pydantic's own class default
+        # (~/Obsidian/SecondBrain) only exists so a bare `Config()` still
+        # works for callers who build one directly, e.g. tests.
+        data["vault"] = str(config_dir)
+
     cfg = Config(**data)
     cfg.vault = Path(os.path.expandvars(str(cfg.vault))).expanduser()
+
+    if raw_vault and not cfg.vault.exists() and _looks_like_vault(config_dir):
+        # An explicit path was given and it does not exist here — a Windows
+        # drive-letter path read from a Linux bridge, a laptop this vault
+        # never lived on, whatever. The folder config.yaml sits in looks
+        # like the vault, so use it instead of quietly reporting on an
+        # empty directory (see `doctor`'s vault_ok check in sb/engine.py).
+        cfg.vault_note = (
+            f"vault \"{raw_vault}\" not found on this machine — using "
+            f"{config_dir} (where config.yaml lives), which looks like the vault"
+        )
+        cfg.vault = config_dir
+
     return cfg

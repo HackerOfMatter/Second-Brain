@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sb import (  # noqa: E402
     ask as askmod,
     cards as cardsmod,
+    digest,
     extract,
     frontmatter,
     fsrs,
@@ -35,7 +36,7 @@ from sb import (  # noqa: E402
 from sb.calsync import events as calevents  # noqa: E402
 from sb.calsync.ics import render  # noqa: E402
 from sb.calsync import gtasks  # noqa: E402
-from sb.config import Config, PlannerConfig  # noqa: E402
+from sb.config import Config, PlannerConfig, load  # noqa: E402
 from sb.engine import Engine  # noqa: E402
 from sb.models import (  # noqa: E402
     AreaSchedule,
@@ -276,6 +277,66 @@ def test_ics():
     check("auto follows google sink", auto.resolved_task_sink() == "google")
     auto.calendar.task_sink = "ics"
     check("explicit task sink overrides auto", auto.resolved_task_sink() == "ics")
+
+
+def test_vault_path_portable():
+    """S2-0. `vault:` must not be a per-machine landmine.
+
+    The app normally lives inside the vault it manages, so the one true
+    portable default is "wherever config.yaml is" -- right on Windows, right
+    on the Linux bridge these sessions run from, no editing required when the
+    repo moves. An explicit `vault:` still wins whenever it actually exists
+    (that is the real Windows machine's case, since the configured path is
+    real there); it is only ignored when it does not exist *and* the config
+    directory itself is unmistakably a vault, so a stale or foreign-OS path
+    does not leave `doctor` reporting on an empty directory forever.
+    """
+    section("vault path portability")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        # A vault-shaped config directory: PARA folders alongside config.yaml.
+        vault_dir = tmp / "app-and-vault"
+        for d in ["00-Inbox", "10-Areas", "20-Projects", "30-Resources"]:
+            (vault_dir / d).mkdir(parents=True)
+        cfg_path = vault_dir / "config.yaml"
+
+        # An explicit path that does not exist here (e.g. read on the wrong
+        # OS) falls back to the directory config.yaml is in.
+        cfg_path.write_text("vault: C:/Users/someone/elsewhere\n", encoding="utf-8")
+        cfg = load(cfg_path)
+        check("missing explicit vault falls back to the config directory",
+              cfg.vault == vault_dir.resolve(), cfg.vault)
+        check("and the fallback is not silent",
+              "C:/Users/someone/elsewhere" in cfg.vault_note, cfg.vault_note)
+
+        # No `vault:` key at all defaults the same way, with nothing to note.
+        cfg_path.write_text("host: 127.0.0.1\n", encoding="utf-8")
+        unset = load(cfg_path)
+        check("unset vault also defaults to the config directory",
+              unset.vault == vault_dir.resolve(), unset.vault)
+        check("no fallback note when nothing was overridden", unset.vault_note == "")
+
+        # An explicit path that exists always wins -- the real Windows case --
+        # and no fallback note is written.
+        real = tmp / "real-vault"
+        for d in ["00-Inbox", "10-Areas", "20-Projects", "30-Resources"]:
+            (real / d).mkdir(parents=True)
+        cfg_path2 = tmp / "config-explicit.yaml"
+        cfg_path2.write_text(f"vault: {real}\n", encoding="utf-8")
+        explicit = load(cfg_path2)
+        check("an explicit vault that exists is never overridden",
+              explicit.vault == real and explicit.vault_note == "", explicit.vault)
+
+        # A missing explicit path with nothing vault-shaped nearby is left
+        # exactly as given -- guessing wrong would be worse than saying so.
+        bare = tmp / "not-a-vault"
+        bare.mkdir()
+        cfg_path3 = bare / "config.yaml"
+        cfg_path3.write_text("vault: /definitely/does/not/exist\n", encoding="utf-8")
+        left = load(cfg_path3)
+        check("a missing path with no vault-shaped fallback is left alone",
+              left.vault == Path("/definitely/does/not/exist"), left.vault)
 
 
 def test_taxonomy():
@@ -3454,6 +3515,49 @@ def test_habits_rewritten():
     check("and comes back as dates", old.dates == [dt.date(2026, 8, 1), dt.date(2026, 8, 3)])
 
 
+def test_habit_anchor_friction_and_stability_thresholds():
+    """Sprint 2 E2 -- anchor + friction fields exist, and the context-stability
+    line renders (or doesn't) at the thresholds the dashboard actually checks:
+    0 occurrences, 1 (not enough), and 6+ (enough). No real vault has 6 real
+    occurrences yet -- this is exactly the synthetic case the story asks for."""
+    from sb import habits
+    from sb.models import HabitEvent, HabitMeta
+
+    section("habits: anchor + friction fields exist on the schema")
+    blank = HabitMeta()
+    check("anchor defaults to a blank string, not missing", blank.anchor == "")
+    check("easier (friction, made easier) defaults blank", blank.easier == "")
+    check("harder (friction, made harder) defaults blank", blank.harder == "")
+    filled = HabitMeta(anchor="I finish breakfast", easier="shoes by the door", harder="phone in another room")
+    rpt = habits.report(filled, title="Strength training")
+    check("the check-in report carries the anchor through", rpt["anchor"] == "I finish breakfast")
+    check("and both friction fields", rpt["easier"] == "shoes by the door" and rpt["harder"] == "phone in another room")
+
+    section("habits: context stability renders at the thresholds the dashboard checks")
+    today = dt.date(2026, 8, 29)
+
+    zero = habits.stability(HabitMeta())
+    check("0 occurrences: not enough, and says so plainly",
+          not zero.enough and zero.message == "No occurrences logged yet.", zero.message)
+
+    one = habits.stability(HabitMeta(log=[HabitEvent(on=today, at="07:00", place="church")]))
+    check("1 occurrence: still not enough -- one data point is not a pattern",
+          not one.enough, one.n)
+    check("but it names the count instead of pretending to have an answer",
+          one.message.startswith("1 logged"), one.message)
+
+    six = habits.stability(HabitMeta(log=[
+        HabitEvent(on=today - dt.timedelta(weeks=i), at="10:00", place="church") for i in range(6)
+    ]))
+    check("6 occurrences: enough -- this is the AC's own threshold", six.enough, six.n)
+    check("and the line actually renders something readable",
+          "%" in six.message and "10:00" in six.message, six.message)
+    # This is exactly the boolean the dashboard template gates the line on
+    # (`${stab.enough ? ... : ""}` in sb/web/index.html) -- proving `enough`
+    # is true at 6 proves the line renders, without needing a browser.
+    check("dashboard would render it (stab.enough is the template's gate)", six.as_dict()["enough"] is True)
+
+
 def _raises(fn):
     try:
         fn()
@@ -3572,6 +3676,123 @@ def test_weekly_review():
               all(k in review for k in ("estimates", "calibration", "atomicity")))
         check("it changes nothing by being read",
               engine.note(nid).project.status != ProjectStatus.DONE)
+
+
+def test_today_digest():
+    """F3' spike: "what's going on today" — cards due, the next step of
+    every active Project, habits due today, the inbox, and the calendar, in
+    one payload, with the two renderers over it."""
+    section("the daily digest")
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+
+        empty = engine.today_digest()
+        check("nothing due reads as empty, not a page of zero headers", empty["is_empty"])
+        text0 = digest.render_text(empty)
+        check("empty text says so in plain words", "nothing" in text0.lower(), text0)
+        check("empty text is nowhere near the cap",
+              len(text0) <= digest.TEXT_CHAR_LIMIT, len(text0))
+        long0 = digest.render_long(empty)
+        check("empty long form says so too",
+              "Nothing on the calendar" in long0, long0)
+
+        now = dt.datetime.now().astimezone()
+
+        pid1 = engine.capture(
+            "Ship the quarterly report\n"
+            "- draft the executive summary and circulate it for comment before Friday's review",
+            "project",
+        )["note"]["id"]
+        n1 = engine.note(pid1)
+        n1.project.deadline = dt.date.today() + dt.timedelta(days=2)
+        n1.project.steps[0].scheduled = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        engine.vault.save(n1)
+
+        pid2 = engine.capture(
+            "Refactor the onboarding flow\n- rewrite step two of signup", "project"
+        )["note"]["id"]
+        n2 = engine.note(pid2)
+        n2.project.deadline = dt.date.today() + dt.timedelta(days=20)
+        n2.project.steps[0].scheduled = now + dt.timedelta(days=1)
+        engine.vault.save(n2)
+
+        pid3 = engine.capture("Plan the offsite\n- book the venue", "project")["note"]["id"]
+        n3 = engine.note(pid3)
+        n3.project.deadline = dt.date.today() + dt.timedelta(days=1)  # most urgent
+        n3.project.steps[0].scheduled = now.replace(hour=14, minute=30, second=0, microsecond=0)
+        engine.vault.save(n3)
+
+        aid1 = engine.capture("Read every evening", "area")["note"]["id"]
+        engine.set_habit(aid1, "daily", 1, cue="after dinner",
+                          behaviour="read for 30 minutes", place="the kitchen table")
+        aid2 = engine.capture("Stretch", "area")["note"]["id"]
+        engine.set_habit(aid2, "daily", 1)  # no implementation intention written
+
+        for i in range(4):
+            engine.decks.save(_deck_with(f"deck-{i}", f"Subject {i}", 10, due_offset=0))
+
+        engine.capture("a random idea worth keeping", "inbox")
+
+        d = engine.today_digest()
+        check("three active projects", d["projects_active"] == 3, d["projects_active"])
+        check("40 cards due across 4 decks",
+              d["cards"]["due_today"] == 40 and d["cards"]["decks"] == 4, d["cards"])
+        check("the most urgent project's step leads the queue",
+              d["next_steps"][0]["note_title"] == "Plan the offsite", d["next_steps"][0])
+        check("both habits land on today (daily cadence)", len(d["habits"]) == 2, d["habits"])
+        check("the habit with a real plan carries its sentence",
+              any("kitchen table" in h["intention"] for h in d["habits"]), d["habits"])
+        check("the other says plainly that it has none",
+              any(h["intention"] == "" for h in d["habits"]), d["habits"])
+        check("the dropped note shows up in the inbox count", d["inbox"]["count"] >= 1, d["inbox"])
+        check("today's two scheduled project blocks are on the calendar",
+              sum(1 for c in d["calendar"] if c["kind"] == "block") == 2, d["calendar"])
+        check("plus both habit blocks",
+              sum(1 for c in d["calendar"] if c["kind"] == "habit") == 2, d["calendar"])
+        check("calendar is time-ordered",
+              [c["time"] for c in d["calendar"]] == sorted(c["time"] for c in d["calendar"]),
+              d["calendar"])
+
+        text = digest.render_text(d)
+        check("the busy-day text still fits two SMS segments",
+              len(text) <= digest.TEXT_CHAR_LIMIT, (len(text), text))
+        check("it leads with how much is on the calendar",
+              f"{len(d['calendar'])} on the calendar" in text, text)
+        check("the single top action survives the cut", "Plan the offsite" in text, text)
+        check("40 cards collapse to one count, not a list", "40 card" in text, text)
+        check("it never mentions a second project's step",
+              "Ship the quarterly" not in text and "Refactor the onboarding" not in text, text)
+
+        long_form = digest.render_long(d)
+        check("long form lists every deck", all(f"Subject {i}" in long_form for i in range(4)),
+              long_form)
+        check("long form names both habits",
+              "Read every evening" in long_form and "Stretch" in long_form, long_form)
+        check("long form spells out the missing intention",
+              "no implementation intention written yet" in long_form, long_form)
+        check("long form carries every next step, not just the top one",
+              sum(1 for a in d["next_steps"] if a["note_title"] in long_form) == 3, long_form)
+
+        section("the cap holds even for a payload designed to blow it")
+        pathological = {
+            "date": dt.date.today().isoformat(),
+            "is_empty": False,
+            "calendar": [{"time": f"{h:02d}:00", "kind": "block", "title": "x", "minutes": 30}
+                         for h in range(9)],
+            "next_steps": [{
+                "note_id": "z", "note_title": "Z" * 300,
+                "step": {"text": "Y" * 300, "scheduled": None},
+                "urgency": 0.9, "deadline": None,
+            }],
+            "cards": {"due_today": 999, "new_waiting": 0, "decks": 5, "by_deck": []},
+            "habits": [{"note_id": "h", "title": "H", "time": "07:00", "minutes": 30,
+                        "intention": ""} for _ in range(5)],
+            "inbox": {"count": 999, "pending_dates": 3},
+            "projects_active": 1,
+        }
+        forced = digest.render_text(pathological)
+        check("the cap holds even for a payload designed to blow it",
+              len(forced) <= digest.TEXT_CHAR_LIMIT, len(forced))
 
 
 def test_atomicity_lint():
@@ -4768,7 +4989,8 @@ def test_intake_api():
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
-        test_planner, test_urgency_and_queue, test_ics, test_taxonomy,
+        test_planner, test_urgency_and_queue, test_ics, test_vault_path_portable,
+        test_taxonomy,
         test_areas_recur, test_google_token_validation, test_google_sync_logic,
         test_gtasks_sync_logic, test_task_shape, test_llm_path,
         test_vault_and_engine, test_api,
@@ -4786,7 +5008,8 @@ def main():
         test_graduation_prompt,
         # -- the learning-science tier
         test_calibration, test_self_explanation, test_habits_rewritten,
-        test_forecasting, test_weekly_review, test_atomicity_lint,
+        test_habit_anchor_friction_and_stability_thresholds,
+        test_forecasting, test_weekly_review, test_today_digest, test_atomicity_lint,
         test_retention_dial, test_interleaving_and_worked_examples,
         test_threshold_calibration,
         # -- deferred work, on its triggers
