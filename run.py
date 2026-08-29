@@ -391,8 +391,48 @@ def cmd_today(args) -> int:
 
 
 def cmd_sync(args) -> int:
+    """Push the vault out, after reading ticks back in.
+
+    The read-back gets its own line rather than being left inside the result
+    dict. It is the half of the round trip nobody can see from the outside —
+    a push that failed shows up as a calendar that stopped changing, while a
+    read that failed looks exactly like "lj did not tick anything" — so the
+    hand-verification runbook in docs/google-round-trip.md keys on this line
+    at every step.
+    """
     cfg = load(args.config)
-    print(Engine(cfg).sync_calendar())
+    result = Engine(cfg).sync_calendar()
+    pulled = result.get("pulled") or {}
+    if pulled.get("error"):
+        print(f"read-back FAILED ({pulled['error']}) — ticks made on the phone "
+              f"did not reach the vault; see _system/logs/")
+    elif pulled.get("enabled"):
+        applied = pulled.get("applied", 0)
+        tail = (": " + ", ".join(pulled.get("notes") or [])) if applied else ""
+        print(f"read-back: {pulled.get('checked', 0)} ticked task(s) on Google, "
+              f"{applied} applied to the vault{tail}")
+    elif pulled.get("reason") == "off":
+        print("read-back: off (calendar.read_back_completions: false)")
+    else:
+        print("read-back: not applicable (due-date tasks are not going to Google)")
+    print(result)
+    return 0
+
+
+def cmd_study_reminder(args) -> int:
+    """What the desktop reminder would do right now, and why (story H3).
+
+    Purely a read: it never writes `fired_at`, so running this to check
+    cannot rob lj of tonight's notification.
+    """
+    cfg = load(args.config)
+    d = Engine(cfg).study_reminder()
+    verdict = "WOULD FIRE" if d["decision"]["fire"] else "quiet"
+    print(f"{verdict} — {d['decision']['reason']}")
+    print(f"  {d['cards_due']} card(s) due across {d['decks']} deck(s); "
+          f"{d['reviewed_today']} answered today; block starts {d['starts_at']}")
+    print(f"  last fired: {d['state']['fired_at'] or 'never'}    "
+          f"snoozed until: {d['state']['snoozed_until'] or '—'}")
     return 0
 
 
@@ -497,6 +537,9 @@ def main() -> int:
     t.add_argument("--format", choices=["long", "text"], default="long")
     t.set_defaults(func=cmd_today)
     sub.add_parser("sync", help="regenerate the calendar").set_defaults(func=cmd_sync)
+    sub.add_parser(
+        "study-reminder", help="would the study reminder fire right now, and why"
+    ).set_defaults(func=cmd_study_reminder)
     sub.add_parser("estimates", help="estimated vs actual, and your multiplier").set_defaults(func=cmd_estimates)
     sub.add_parser("lint", help="notes holding more than one idea").set_defaults(func=cmd_lint)
     sub.add_parser("thresholds", help="are the auto-accept floors set right?").set_defaults(func=cmd_thresholds)

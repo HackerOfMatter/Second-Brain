@@ -89,3 +89,7 @@ setup.
   **Re-plan** in the dashboard instead.
 - `sink: both` writes the `.ics` and pushes to Google. If Google fails, the
   `.ics` still updates and the error is logged to `_system/logs/calendar.log`.
+- Ticking a task on your phone marks the project's steps done in the vault on
+  the next sync. That inbound direction is the one thing no test can prove on
+  its own — see [google-round-trip.md](google-round-trip.md) for the
+  ten-minute hand check, and for what each side is allowed to win.

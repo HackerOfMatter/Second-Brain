@@ -90,8 +90,8 @@ class GoogleTasksSink:
 
         created = updated = deleted = 0
         for uid, task in wanted.items():
-            body = to_google(task)
             found = existing.get(uid)
+            body = to_google(task, new=found is None)
             if found:
                 svc.tasks().patch(
                     tasklist=list_id, task=found["id"], body=body
@@ -136,20 +136,47 @@ def ensure_tasklist(svc, cfg: Config) -> str:
     return made["id"]
 
 
-def to_google(task: CalTask) -> dict:
-    """The emoji is already in `summary`; it is the only colour a task gets."""
-    notes = task.description or ""
+def to_google(task: CalTask, *, new: bool = True) -> dict:
+    """The emoji is already in `summary`; it is the only colour a task gets.
+
+    `new` is the whole of the per-field merge rule, in one flag. `status` is
+    sent **only when the task is being created**, never on the patch that
+    keeps an existing one up to date.
+
+    That is not a micro-optimisation. Google's patch semantics leave an
+    omitted field alone, and the field this sink used to send unconditionally
+    was `status: needsAction` — so every push overwrote whatever lj had done
+    on their phone. A learning Project survives its own completion (its status
+    stays ACTIVE by design, see Engine._apply_remote_completion), which means
+    it is still `wanted` on the next sync, which means it was patched straight
+    back to un-ticked. The tick was read, applied to the vault, and then
+    silently undone in the place lj could see it — the exact failure the
+    module docstring above says is worse than not syncing at all.
+
+    The cue line leads the notes because Google Tasks shows the first line of
+    a note under the title in the list, so it is the part that gets read at a
+    glance; the marker stays last, where it is out of the way.
+    """
+    parts = []
+    if (task.cue or "").strip():
+        parts.append(task.cue.strip())
     if task.percent:
-        notes = f"{task.percent}% of steps done\n\n{notes}" if notes else f"{task.percent}% done"
-    return {
+        parts.append(f"{task.percent}% of steps done" if task.description
+                     else f"{task.percent}% done")
+    if task.description:
+        parts.append(task.description)
+    parts.append(f"[sb:{task.uid}]")
+    body = {
         "title": task.summary,
-        "notes": f"{notes}\n\n[sb:{task.uid}]".strip(),
+        "notes": "\n\n".join(parts).strip(),
         # Tasks stores a timestamp but only ever shows the date.
         "due": dt.datetime.combine(task.due, dt.time.min).strftime(
             "%Y-%m-%dT00:00:00.000Z"
         ),
-        "status": "needsAction",
     }
+    if new:
+        body["status"] = "needsAction"
+    return body
 
 
 def uid_of(item: dict) -> Optional[str]:

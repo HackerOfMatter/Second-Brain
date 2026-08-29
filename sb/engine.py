@@ -31,6 +31,7 @@ from . import (
     lint,
     parser,
     quality,
+    reminders as remindersmod,
     retention,
     threshold,
     taxonomy,
@@ -1407,7 +1408,28 @@ class Engine:
             ticked = gtasks.read_back(self.cfg)
         except Exception as exc:  # noqa: BLE001 — see the docstring
             self.vault.log_line("calendar", f"read-back failed: {type(exc).__name__}: {exc}")
+            # A push that fails is loud: nothing new appears on the phone. A
+            # *read* that fails is silent in exactly the wrong way — ticking
+            # keeps working, the vault simply stops hearing about it, and the
+            # first evidence is a project lj finished a fortnight ago still
+            # sitting open. So it files an incident like any other background
+            # failure, and clears it the moment a read succeeds.
+            try:
+                self.incidents.record(
+                    incidentsmod.CALENDAR,
+                    "Ticks made on the phone are not reaching the vault "
+                    f"({type(exc).__name__}).",
+                    hint="Run `python run.py sync` to see the whole error.",
+                    key="read-back",
+                    detail=str(exc)[:400],
+                )
+            except Exception:  # an incident must never become the failure
+                pass
             return dict(blank, enabled=True, error=type(exc).__name__)
+        try:
+            self.incidents.clear(incidentsmod.CALENDAR, key="read-back")
+        except Exception:
+            pass
 
         notes = self._snapshot() if snapshot is None else snapshot
         by_id = {n.id: n for n in notes}
@@ -1436,15 +1458,29 @@ class Engine:
         is finished, not that the material is known. So its steps close and
         its status stays ACTIVE, which is exactly what happens when the last
         step is ticked in the app.
+
+        Returns whether anything actually changed, and that answer is
+        load-bearing. A learning Project keeps status ACTIVE, so it is still
+        `wanted` by the task sink and its Google task keeps existing —
+        completed, now that the sink no longer patches `status` back (see
+        gtasks.to_google). Every subsequent sync therefore reads the same tick
+        back again. Returning True unconditionally made each of those a fresh
+        vault write and a fresh "completed on Google Tasks" history line,
+        forever, on a note nobody had touched. Nothing changed, so nothing is
+        saved and nothing is counted as applied.
         """
         project = note.project
         if project is None:
             return False
+        changed = False
         for step in project.steps:
             if not step.done:
                 step.done = True
                 step.done_at = _now()
+                changed = True
         if project.learning:
+            if not changed:
+                return False
             project.status = ProjectStatus.ACTIVE
             note.log("step", "completed on Google Tasks")
         else:
@@ -2324,6 +2360,43 @@ class Engine:
             # The tutor's own explanation, shown *after* theirs. Order is the
             # whole point: reading it first is the passive path this replaces.
             "answer": tutor.explain(card, note.body, "", self.cfg),
+        }
+
+    def study_reminder(self, at: Optional[dt.datetime] = None) -> Dict[str, Any]:
+        """The four facts a desktop reminder needs, plus the verdict.
+
+        Story H3. Deliberately much smaller than `study_overview()`: the
+        resident notifier polls this every minute, and overview walks the
+        vault for folder rollups, graduation candidates and deckable notes —
+        none of which anyone is going to read from a toast. This touches the
+        deck store and nothing else.
+
+        The verdict is computed here as well as in the notifier's offline
+        fallback, from the one function in sb/reminders.py, so "why did it not
+        fire?" has exactly one answer no matter which path produced it.
+        """
+        at = at or remindersmod.now()
+        decks = self.decks.all()
+        cards_due = sum(len(d.due(at.date())) for d in decks)
+        reviewed, _ = tutor.counted_today(self.decks, at.date())
+        state = remindersmod.read_state(remindersmod.state_path(self.cfg))
+        starts_at = remindersmod.study_time(self.cfg)
+        decision = remindersmod.decide(
+            at=at,
+            cards_due=cards_due,
+            reviewed_today=reviewed,
+            starts_at=starts_at,
+            state=state,
+        )
+        return {
+            "at": at.isoformat(),
+            "cards_due": cards_due,
+            "reviewed_today": reviewed,
+            "decks": len(decks),
+            "starts_at": starts_at.strftime("%H:%M"),
+            "state": state.as_dict(),
+            "decision": decision.as_dict(),
+            "url": f"http://{self.cfg.host}:{self.cfg.port}/study",
         }
 
     def fit_weights(self, write: bool = False) -> Dict[str, Any]:

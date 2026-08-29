@@ -81,7 +81,7 @@ def _render_event(ev: CalEvent, stamp: str, cfg: Config) -> List[str]:
     out += _colour_lines(ev.kind, ev.category, cfg)
     out.append(f"X-SB-NOTE-ID:{ev.note_id}")
     out.append("TRANSP:" + ("TRANSPARENT" if ev.all_day else "OPAQUE"))
-    out += _alarms(ev.reminders, ev.summary)
+    out += _alarms(ev.reminders, ev.summary, ev.cue)
     out.append("END:VEVENT")
     return out
 
@@ -110,7 +110,7 @@ def _render_todo(task: CalTask, stamp: str, cfg: Config) -> List[str]:
         out += [
             "BEGIN:VALARM",
             "ACTION:DISPLAY",
-            f"DESCRIPTION:{_esc('Due: ' + task.summary)}",
+            f"DESCRIPTION:{_esc(_alarm_text('Due: ' + task.summary, task.cue))}",
             f"TRIGGER;RELATED=END:-PT{max(0, int(minutes))}M",
             "END:VALARM",
         ]
@@ -130,13 +130,27 @@ def _colour_lines(kind: str, category: str, cfg: Config) -> List[str]:
     return out
 
 
-def _alarms(reminders: List[int], summary: str) -> List[str]:
+def _alarm_text(summary: str, cue: str = "") -> str:
+    """What the popup actually says.
+
+    The VALARM DESCRIPTION *is* the notification on most clients — the event
+    body is one tap further away, and a reminder that fires while lj is doing
+    something else is read once, in full, or not at all. So the implementation
+    intention rides in the alarm itself rather than only in the event it hangs
+    off. Empty cue leaves the old title-only text exactly as it was: there is
+    nothing to add, and a blank line is not information.
+    """
+    return f"{summary}\n{cue}" if (cue or "").strip() else summary
+
+
+def _alarms(reminders: List[int], summary: str, cue: str = "") -> List[str]:
+    text = _alarm_text(summary, cue)
     out: List[str] = []
     for minutes in reminders:
         out += [
             "BEGIN:VALARM",
             "ACTION:DISPLAY",
-            f"DESCRIPTION:{_esc(summary)}",
+            f"DESCRIPTION:{_esc(text)}",
             f"TRIGGER:-PT{max(0, int(minutes))}M",
             "END:VALARM",
         ]

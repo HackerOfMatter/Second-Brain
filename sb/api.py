@@ -333,6 +333,19 @@ def build_app(cfg: Config | None = None) -> Starlette:
         return ok(await run_in_threadpool(engine.study_stats))
 
     @guard
+    async def study_reminder(request: Request):
+        """What study_reminder.pyw asks when the app happens to be running.
+
+        Story H3. The notifier works with the app closed — it reads the deck
+        store itself — so this is an optimisation, not a dependency: when the
+        server is already up, one localhost call is cheaper than a second
+        process re-reading every deck file on the same disk. Read-only; the
+        notifier owns the state file, because it is the half that still works
+        when this endpoint does not.
+        """
+        return ok(await run_in_threadpool(engine.study_reminder))
+
+    @guard
     async def study_session(request: Request):
         body = await body_of(request)
         subjects = body.get("subjects") or None
@@ -611,6 +624,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/review", review_page),
         Route("/api/study/overview", study_overview),
         Route("/api/study/stats", study_stats),
+        Route("/api/study/reminder", study_reminder),
         Route("/api/study/session", study_session, methods=["GET", "POST"]),
         Route("/api/study/{note_id}/{card_id}/reveal", study_reveal),
         Route("/api/study/{note_id}/{card_id}/mark", study_mark, methods=["POST"]),

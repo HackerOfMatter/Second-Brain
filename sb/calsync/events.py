@@ -27,7 +27,7 @@ import datetime as dt
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from .. import taxonomy
+from .. import habits, taxonomy
 from ..config import Config
 from ..models import AreaSchedule, Bucket, Cadence, MaterialKind, Note, ProjectStatus
 
@@ -52,6 +52,14 @@ class CalEvent:
     note_id: str = ""
     category: str = taxonomy.FALLBACK
     rrule: str = ""  # RFC 5545 recurrence rule, without the "RRULE:" prefix
+    #: The implementation intention (or the anchor/cue it degrades to) for the
+    #: note behind this item, rendered by habits.reminder_line(). Carried as
+    #: its own field rather than left buried in `description` because a
+    #: reminder is not a description: an .ics VALARM and a Google Tasks note
+    #: each need this one sentence on its own, and neither can go digging for
+    #: it. Empty when nothing has been written — never a manufactured
+    #: sentence. See sb/habits.py.
+    cue: str = ""
 
     @property
     def end_or_default(self):
@@ -82,6 +90,7 @@ class CalTask:
     priority: int = 5      # RFC 5545: 1 highest, 9 lowest, 0 undefined
     percent: int = 0       # 0..100, from step progress
     overdue: bool = False
+    cue: str = ""          # see CalEvent.cue
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +153,7 @@ def tasks_for_note(note: Note, cfg: Config) -> List[CalTask]:
             priority=_priority(p.level, p.deadline),
             percent=int(round(p.progress * 100)),
             overdue=p.deadline < dt.date.today(),
+            cue=habits.reminder_line(note.habit, fallback=note.title),
         )
     ]
 
@@ -199,6 +209,7 @@ def events_for_note(note: Note, cfg: Config) -> List[CalEvent]:
                     kind="block",
                     note_id=note.id,
                     category=category,
+                    cue=habits.reminder_line(note.habit, fallback=note.title),
                 )
             )
 
@@ -254,6 +265,7 @@ def area_event(note: Note, cfg: Config, category: Optional[str] = None) -> Optio
         note_id=note.id,
         category=category,
         rrule=rrule_for(sched, cadence, note.habit),
+        cue=habits.reminder_line(note.habit, fallback=note.title),
     )
 
 
@@ -466,14 +478,15 @@ def _area_description(note: Note, sched, cadence, target: int) -> str:
     easier" line follow for the same reason — they are instructions for the
     next sixty seconds, not statistics.
     """
-    from .. import habits
-
     lines = ["Area — ongoing."]
-    intention = habits.intention_sentence(note.habit, fallback=note.title)
+    intention = habits.reminder_line(note.habit, fallback=note.title)
     if intention:
         lines.append(intention)
-    if note.habit and (note.habit.anchor or "").strip():
-        lines.append(f"Right after: {note.habit.anchor.strip()}")
+    anchor = (note.habit.anchor or "").strip() if note.habit else ""
+    # Only when the sentence above did not already fold the anchor in — which
+    # it does exactly when there was no full intention to lead with.
+    if anchor and habits.intention_sentence(note.habit, fallback=note.title):
+        lines.append(f"Right after: {anchor}")
     if note.habit and (note.habit.easier or "").strip():
         lines.append(f"Made easier: {note.habit.easier.strip()}")
     lines += [

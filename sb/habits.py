@@ -119,6 +119,48 @@ def intention_sentence(habit: Optional[HabitMeta], fallback: str = "") -> str:
     return f"When {cue}, I will {behaviour}{tail}."
 
 
+def reminder_line(habit: Optional[HabitMeta], fallback: str = "") -> str:
+    """The one sentence a *reminder* should carry, or "" if there is none.
+
+    Every channel this system speaks through — an .ics VALARM, a Google
+    Calendar event body, the notes on a Google Task, the `today` digest —
+    reaches lj at the moment the cue is supposed to fire, which is exactly
+    when Gollwitzer's if-then plan does its work. A reminder that says only
+    the Area's title has thrown that away and kept the weakest part.
+
+    Degradation is ordered by effect size, and it never invents:
+
+      1. the full implementation intention, when cue and behaviour exist;
+      2. the anchor alone ("Right after X: Y") — Fogg's prompt, which is the
+         next-strongest thing a reminder can carry;
+      3. the cue alone, when the behaviour was never written;
+      4. nothing at all.
+
+    Case 4 is a real answer, not a failure to handle: an Area with no cue and
+    no anchor has not had this written yet, and printing a manufactured
+    sentence would tell lj the strongest lever is in place when it is not.
+    `workout-m-f` is that Area today, and `doctor` flagging it is the correct
+    outcome — see run.py's habits line.
+    """
+    if habit is None:
+        return ""
+    full = intention_sentence(habit, fallback)
+    if full:
+        return full
+    behaviour = (habit.behaviour or fallback or "").strip().rstrip(".")
+    anchor = (habit.anchor or "").strip().rstrip(",.")
+    cue = (habit.cue or "").strip().rstrip(",.")
+    place = (habit.place or "").strip()
+    tail = f" at {place}" if place else ""
+    if anchor and behaviour:
+        return f"Right after {anchor}, I will {behaviour}{tail}."
+    if cue and not behaviour:
+        return f"When {cue} — this is the cue."
+    if anchor and not behaviour:
+        return f"Right after {anchor} — this is the cue."
+    return ""
+
+
 def intention_missing(habit: Optional[HabitMeta], fallback: str = "") -> List[str]:
     """Which halves of the strongest lever are still blank."""
     if habit is None:

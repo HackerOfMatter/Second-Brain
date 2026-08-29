@@ -175,6 +175,11 @@ def build(
                 "time": when.strftime("%H:%M"),
                 "minutes": minutes,
                 "intention": habitsmod.intention_sentence(note.habit, fallback=note.title),
+                # What a *reminder* should say: the full intention when it
+                # exists, the anchor or the bare cue when it does not, and
+                # nothing at all when neither has been written. See
+                # habits.reminder_line — it never manufactures a sentence.
+                "cue": habitsmod.reminder_line(note.habit, fallback=note.title),
             }
         )
     habits_today.sort(key=lambda h: h["time"])
@@ -205,6 +210,7 @@ def build(
                 "title": h["title"],
                 "time": h["time"],
                 "minutes": h["minutes"],
+                "cue": h["cue"],
             }
         )
     for note in all_notes:
@@ -358,6 +364,12 @@ def render_long(payload: Dict[str, Any]) -> str:
             if c["kind"] == "review" and c.get("overdue_days", 0) > 0:
                 tail = f"  ({c['overdue_days']}d overdue)"
             lines.append(f"  {when}  {c['title']}{tail}")
+            # The digest is a reminder like any other channel, so a scheduled
+            # habit block carries its if-then plan here too rather than only
+            # in the HABITS section further down — this is the line that is
+            # read at the time the block starts.
+            if c.get("cue"):
+                lines.append(f"         {c['cue']}")
     else:
         lines.append("ON THE CALENDAR: nothing scheduled.")
 
@@ -399,7 +411,7 @@ def render_long(payload: Dict[str, Any]) -> str:
     if habits:
         lines.append(f"HABITS DUE TODAY ({len(habits)})")
         for h in habits:
-            note = h["intention"] or "no implementation intention written yet"
+            note = h["cue"] or "no implementation intention written yet"
             lines.append(f"  {h['time']}  {h['title']} ({h['minutes']}m) — {note}")
     else:
         lines.append("HABITS DUE TODAY: none.")

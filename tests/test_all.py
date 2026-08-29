@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sb import (  # noqa: E402
     ask as askmod,
+    habits as habitsmod,
     cards as cardsmod,
     digest,
     extract,
@@ -5446,6 +5447,330 @@ def test_doctor_lines_match_their_evidence():
           "not checked against Google" in doctor_src)
 
 
+# --------------------------------------------------------------------------
+# sprint 3, lane H: the round trip, the cue, and the study reminder
+# --------------------------------------------------------------------------
+
+
+def _fake_tasks(store, lists):
+    """The Google Tasks API, small enough to reason about.
+
+    `patch` deliberately merges rather than replaces, because that is what
+    Google does: a field the body omits is left alone. The whole of the H1
+    completion bug lived in that one behaviour — the sink used to send
+    `status: needsAction` on every patch, so Google's merge dutifully undid
+    lj's tick — and a fake that replaced wholesale could not have shown it.
+    """
+    return lambda c, a, v: FakeTasksService(store, lists)
+
+
+def _project_note(engine, cfg, title, *, learning, days=5):
+    r = engine.capture(f"{title}\n- first thing\n- second thing", "project")
+    note_id = r["note"]["id"]
+    engine.set_deadline(note_id, (dt.date.today() + dt.timedelta(days=days)).isoformat())
+    note = engine.note(note_id)
+    note.project.learning = learning
+    Vault(cfg.vault).save(note)
+    return note_id
+
+
+def test_completion_round_trip():
+    section("google tasks round trip: a tick on the phone reaches the vault")
+    import sb.calsync.gtasks as tmod
+
+    check("push never sends a status, so it cannot un-tick",
+          "status" not in gtasks.to_google(
+              calevents.CalTask(uid="u", summary="s",
+                                due=dt.date.today() + dt.timedelta(days=1)),
+              new=False))
+    check("insert still says needsAction",
+          gtasks.to_google(
+              calevents.CalTask(uid="u", summary="s",
+                                due=dt.date.today() + dt.timedelta(days=1)),
+          )["status"] == "needsAction")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.task_sink = "google"
+        engine = Engine(cfg)
+
+        store, lists = {}, [{"id": "tl1", "title": "Second Brain"}]
+        real = tmod._google_service
+        tmod._google_service = _fake_tasks(store, lists)
+        try:
+            note_id = _project_note(engine, cfg, "Fix the bike brakes", learning=False)
+            engine.sync_calendar()
+
+            ours = [i for i in store.values() if gtasks.uid_of(i)]
+            check("the due date reached Google Tasks", len(ours) == 1, list(store))
+            uid = gtasks.uid_of(ours[0])
+            check("its uid maps back to the note", gtasks.note_id_of(uid) == note_id, uid)
+
+            # --- the phone. Ticking is the only edit that exists there.
+            ours[0]["status"] = "completed"
+
+            pulled = engine.sync_calendar()["pulled"]
+            check("the tick was read back before the push",
+                  pulled["checked"] == 1 and pulled["applied"] == 1, pulled)
+
+            # --- the acceptance criterion, read off the disk rather than
+            #     out of the engine that just wrote it.
+            path, reread = Vault(cfg.vault).get(note_id)
+            check("every step is marked done in the vault",
+                  reread.project.steps and all(s.done for s in reread.project.steps),
+                  [s.done for s in reread.project.steps])
+            check("each one carries when it closed",
+                  all(s.done_at for s in reread.project.steps))
+            check("the project is closed in the vault",
+                  reread.project.status == ProjectStatus.DONE, reread.project.status)
+            check("history says the tick came from Google Tasks",
+                  any("Google Tasks" in (h.detail or "") for h in reread.history),
+                  [h.detail for h in reread.history])
+            check("and it is in the frontmatter on disk, not just in memory",
+                  "done: true" in path.read_text(encoding="utf-8"))
+
+            check("the finished task is then removed from Google",
+                  not [i for i in store.values() if gtasks.uid_of(i)], list(store))
+            check("a task lj made by hand is never touched", not store)
+
+            before = len(engine.note(note_id).history)
+            check("nothing is applied a second time",
+                  engine.sync_calendar()["pulled"]["applied"] == 0)
+            check("and no second history line is written",
+                  len(engine.note(note_id).history) == before)
+        finally:
+            tmod._google_service = real
+
+
+def test_completion_is_not_pushed_back_out():
+    section("a tick on a learning project is not silently un-ticked")
+    import sb.calsync.gtasks as tmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.task_sink = "google"
+        engine = Engine(cfg)
+
+        store, lists = {}, [{"id": "tl1", "title": "Second Brain"}]
+        real = tmod._google_service
+        tmod._google_service = _fake_tasks(store, lists)
+        try:
+            note_id = _project_note(engine, cfg, "Learn Rust generics", learning=True)
+            engine.sync_calendar()
+            ours = [i for i in store.values() if gtasks.uid_of(i)][0]
+            ours["status"] = "completed"
+
+            pulled = engine.sync_calendar()["pulled"]
+            check("the tick is applied", pulled["applied"] == 1, pulled)
+            note = Vault(cfg.vault).get(note_id)[1]
+            check("its steps close", all(s.done for s in note.project.steps))
+            check("but a learning project is not graduated by a tick",
+                  note.project.status == ProjectStatus.ACTIVE, note.project.status)
+
+            # It is still `wanted`, so it is still patched — and that patch
+            # used to carry status: needsAction.
+            still = [i for i in store.values() if gtasks.uid_of(i)]
+            check("the task is still there", len(still) == 1, list(store))
+            check("and it is still ticked on the phone",
+                  still[0].get("status") == "completed", still[0].get("status"))
+
+            before = len(Vault(cfg.vault).get(note_id)[1].history)
+            engine.sync_calendar()
+            engine.sync_calendar()
+            check("re-reading the same tick writes nothing more",
+                  len(Vault(cfg.vault).get(note_id)[1].history) == before)
+        finally:
+            tmod._google_service = real
+
+
+def test_read_back_failure_is_visible():
+    section("a read-back that fails files an incident")
+    import sb.calsync.gtasks as tmod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.task_sink = "google"
+        engine = Engine(cfg)
+
+        def boom(cfg_):
+            raise RuntimeError("no network")
+
+        real = tmod.read_back
+        tmod.read_back = boom
+        try:
+            out = engine.pull_task_completions()
+            check("the sync does not raise", out["error"] == "RuntimeError", out)
+            problems = engine.incidents.open()
+            check("the failure reaches the banner",
+                  any(p["kind"] == "calendar" and p["key"] == "read-back"
+                      for p in problems), problems)
+            check("and it says what stopped working, not just that it failed",
+                  any("phone" in p["message"] for p in problems),
+                  [p["message"] for p in problems])
+            tmod.read_back = lambda cfg_: {}     # the phone is reachable again
+            engine.pull_task_completions()
+        finally:
+            tmod.read_back = real
+
+        check("a read that works again retires it",
+              not [p for p in engine.incidents.open() if p["key"] == "read-back"],
+              engine.incidents.open())
+
+
+def _area(title="Faith & Bible Study", **habit):
+    """An Area scheduled for today, so it lands in every channel at once."""
+    return Note(
+        id="a1", title=title, bucket=Bucket.AREA,
+        habit=HabitMeta(cadence=Cadence.WEEKLY, target_count=1, **habit),
+        schedule=AreaSchedule(time="18:00", duration_minutes=30,
+                              days=[dt.date.today().weekday()]),
+    )
+
+
+def test_reminders_carry_the_intention():
+    section("every reminder carries the intention, or honestly carries less")
+    cfg = Config(vault=Path("/tmp/x"))
+    full = dict(cue="the sermon starts", behaviour="take notes", place="church")
+    sentence = "When the sermon starts, I will take notes at church."
+
+    # -- the sentence itself, and how it degrades. It never invents.
+    check("full intention",
+          habitsmod.reminder_line(HabitMeta(**full)) == sentence,
+          habitsmod.reminder_line(HabitMeta(**full)))
+    check("anchor only falls back to the anchor",
+          habitsmod.reminder_line(HabitMeta(anchor="I close the laptop"),
+                                  fallback="Workout")
+          == "Right after I close the laptop, I will Workout.")
+    check("cue with nothing to do is still a cue",
+          habitsmod.reminder_line(HabitMeta(cue="the alarm goes"))
+          == "When the alarm goes — this is the cue.")
+    check("nothing written means nothing said — workout-m-f keeps its gap",
+          habitsmod.reminder_line(HabitMeta(cadence=Cadence.WEEKLY, target_count=3)) == "")
+    check("and doctor still sees that gap",
+          habitsmod.intention_missing(HabitMeta()) == ["cue", "behaviour", "place"])
+
+    # -- .ics: the event body (Sprint 2's claim) and the alarm popup.
+    text = render(calevents.events_for_vault([_area(**full)], cfg), cfg)
+    unfolded = text.replace("\r\n ", "")
+    check("the .ics event body still renders the sentence",
+          "DESCRIPTION:When the sermon starts\\, I will take notes at church." in unfolded
+          or sentence.replace(",", "\\,") in unfolded, unfolded[:400])
+    alarm = unfolded.split("BEGIN:VALARM")[1]
+    check("and so does the alarm that actually pops up",
+          sentence.replace(",", "\\,") in alarm, alarm[:300])
+
+    bare = render(calevents.events_for_vault([_area()], cfg), cfg).replace("\r\n ", "")
+    bare_alarm = bare.split("BEGIN:VALARM")[1].split("END:VALARM")[0]
+    check("an Area with no intention gets no invented one",
+          "When " not in bare_alarm and "Right after" not in bare_alarm, bare_alarm)
+
+    # -- Google Calendar takes the same description the .ics does.
+    ev = calevents.area_event(_area(**full), cfg)
+    from sb.calsync.google import _to_google
+    check("the Google Calendar body carries it", sentence in _to_google(ev, cfg)["description"])
+    check("the event carries the cue as its own field", ev.cue == sentence, ev.cue)
+
+    # -- Google Tasks notes: the cue leads, because Tasks shows line one.
+    project = Note(id="p1", title="Ship it", bucket=Bucket.PROJECT,
+                   habit=HabitMeta(**full),
+                   project=ProjectMeta(deadline=dt.date.today() + dt.timedelta(days=3)))
+    task = calevents.tasks_for_note(project, cfg)[0]
+    notes = gtasks.to_google(task)["notes"]
+    check("a Google Task note leads with the intention",
+          notes.startswith(sentence), notes[:120])
+    check("and still carries its marker", f"[sb:{task.uid}]" in notes)
+    plain = calevents.tasks_for_note(
+        Note(id="p2", title="Ship it", bucket=Bucket.PROJECT,
+             project=ProjectMeta(deadline=dt.date.today() + dt.timedelta(days=3))), cfg)[0]
+    check("a project with no habit gets no manufactured sentence",
+          "When " not in gtasks.to_google(plain)["notes"])
+
+    # -- the today digest.
+    payload = digest.build([_area(**full)], [], [], cfg, inbox_count=0, pending_dates=0)
+    long = digest.render_long(payload.as_dict())
+    check("the digest habit line carries it", sentence in long, long)
+    check("and so does the calendar line for the same block",
+          long.split("NEXT UP")[0].count(sentence) == 1, long.split("NEXT UP")[0])
+    bare_long = digest.render_long(
+        digest.build([_area()], [], [], cfg, inbox_count=0, pending_dates=0).as_dict())
+    check("with nothing written, the digest says so rather than inventing",
+          "no implementation intention written yet" in bare_long, bare_long)
+
+
+def test_study_reminder_fires_once():
+    section("study reminder: due, unstarted, once, snoozeable")
+    from sb import reminders
+
+    at = dt.datetime.combine(dt.date.today(), dt.time(20, 0)).astimezone()
+    start = dt.time(19, 30)
+    blank = reminders.ReminderState()
+
+    def decide(state=blank, cards=12, reviewed=0, when=at):
+        return reminders.decide(at=when, cards_due=cards, reviewed_today=reviewed,
+                                starts_at=start, state=state)
+
+    check("fires when due and unstarted", decide().fire is True, decide().reason)
+    check("silent when nothing is due", decide(cards=0).fire is False)
+    check("silent once a card has been answered", decide(reviewed=1).fire is False)
+    check("says why it was silent",
+          "already started" in decide(reviewed=3).reason, decide(reviewed=3).reason)
+    early = decide(when=dt.datetime.combine(dt.date.today(), dt.time(9, 0)).astimezone())
+    check("silent before the block starts", early.fire is False)
+    check("and calls it 'not yet', not 'missed'", "has not started yet" in early.reason)
+
+    fired = reminders.ReminderState(fired_at=at)
+    check("never twice in an hour",
+          decide(fired, when=at + dt.timedelta(minutes=40)).fire is False)
+    check("the hour is the stated reason",
+          "never twice in an hour" in decide(fired, when=at + dt.timedelta(minutes=40)).reason)
+    check("and not again the same day either",
+          decide(fired, when=at + dt.timedelta(hours=2)).fire is False)
+
+    snoozed = reminders.ReminderState(
+        fired_at=at, snoozed_until=at + dt.timedelta(minutes=30))
+    check("a snooze inside the hour is still held by the hour",
+          decide(snoozed, when=at + dt.timedelta(minutes=35)).fire is False)
+    check("but a snooze does re-arm it once the hour has passed",
+          decide(snoozed, when=at + dt.timedelta(minutes=70)).fire is True)
+
+    # -- durability: the process restarts at every logon, so the answer has
+    #    to come off the disk rather than out of memory.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "_system" / "study-reminder.json"
+        reminders.record_fired(path, at)
+        check("firing is written down", path.exists())
+        reread = reminders.read_state(path)
+        check("a fresh process reads back when it fired", reread.fired_at == at, reread)
+        check("so a restart cannot double-fire",
+              decide(reread, when=at + dt.timedelta(minutes=1)).fire is False)
+
+        reminders.snooze(path, 30, at)
+        check("a snooze survives a restart too",
+              reminders.read_state(path).snoozed_until == at + dt.timedelta(minutes=30))
+        reminders.dismiss(path, at)
+        check("dismiss clears the snooze rather than leaving it to fire later",
+              reminders.read_state(path).snoozed_until is None)
+
+        path.write_text("{ not json", encoding="utf-8")
+        check("a torn state file reads as blank, not as a crash",
+              reminders.read_state(path) == reminders.ReminderState())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.study.study_time = "19:30"
+        snap = Engine(cfg).study_reminder()
+        check("the engine reports the same four facts",
+              set(snap) >= {"cards_due", "reviewed_today", "starts_at", "decision"}, snap)
+        check("an empty vault is quiet, and says why",
+              snap["decision"]["fire"] is False
+              and snap["decision"]["reason"] == "nothing is due", snap["decision"])
+        check("it points at the study page", snap["url"].endswith("/study"), snap["url"])
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -5493,6 +5818,10 @@ def main():
         test_incident_store, test_problems_reach_the_dashboard,
         test_doctor_writes_a_dated_report, test_degradation_is_honest,
         test_doctor_lines_match_their_evidence,
+        # -- sprint 3, lane H: the round trip, the cue, the study reminder
+        test_completion_round_trip, test_completion_is_not_pushed_back_out,
+        test_read_back_failure_is_visible,
+        test_reminders_carry_the_intention, test_study_reminder_fires_once,
     ]:
         try:
             fn()
