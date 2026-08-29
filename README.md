@@ -313,3 +313,18 @@ rather than missing parts:
 - **numpy for the index**, if the vault ever passes a few hundred notes. Pure
   Python cosine is fine up to roughly 5,000 chunks and honest about it.
 - **Obsidian plugin** — a capture modal so you never leave the editor.
+
+## Working agreement
+
+Multiple sessions (human and agent) work in this repo. To keep history
+readable and the vault safe:
+
+- **Commit at the end of every working session.** Don't leave a session's
+  changes sitting uncommitted for the next session to untangle.
+- **Never commit `config.yaml`, anything under `_system/`, or vault content**
+  (`00-Inbox/`, `10-Areas/`, `20-Projects/`, `30-Resources/`, `40-Archive/`,
+  `_decks/`, `_labels/`). These hold credentials, tokens, and personal notes —
+  `.gitignore` excludes them; don't `git add -f` around it.
+- **Re-read the tree before writing.** Run `git status --porcelain` at the
+  start of a session — another session may have added or changed files since
+  the last survey. Don't assume the tree matches what you last saw.
