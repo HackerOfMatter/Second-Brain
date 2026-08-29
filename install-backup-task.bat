@@ -23,7 +23,7 @@ if not exist "%SCRIPT%" (
 schtasks /Create /SC DAILY /ST 02:00 /TN "%TASK%" /TR "\"%SCRIPT%\"" /RU SYSTEM /RL HIGHEST /F >nul 2>&1
 if errorlevel 1 (
   echo Could not register to run as SYSTEM - this needs an elevated
-  echo (Run as administrator) prompt. Retrying as your own account;
+  echo ^(Run as administrator^) prompt. Retrying as your own account;
   echo this copy will only run while you are logged on.
   schtasks /Create /SC DAILY /ST 02:00 /TN "%TASK%" /TR "\"%SCRIPT%\"" /F
 )
