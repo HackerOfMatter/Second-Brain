@@ -1,0 +1,1 @@
+Figure out how to use kindle (connect to second brain?)
