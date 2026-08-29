@@ -379,12 +379,23 @@ class Engine:
             # preference into a parameter (roadmap 1.2, and Manning et al.
             # ch.8). Recorded before the fields below are overwritten.
             try:
+                # A second answer about the same note — story G2's undo, then
+                # a re-file — is scored against what the *rules* originally
+                # guessed, not against the note's own rewritten metadata. See
+                # LabelStore.original_intake for why the note cannot be
+                # trusted for this by the time it is asked.
+                first = self.labels.original_intake(note.id)
                 self.labels.record_intake(
                     note.id,
-                    suggested=note.intake.suggested,
+                    suggested=str((first or {}).get("suggested") or note.intake.suggested),
                     chosen=target.value,
-                    confidence=note.intake.confidence,
-                    decided_by=note.intake.decided_by,
+                    confidence=float(
+                        (first or {}).get("confidence", note.intake.confidence) or 0.0
+                    ),
+                    decided_by=str(
+                        (first or {}).get("decided_by") or note.intake.decided_by
+                    ),
+                    corrected=bool(first),
                 )
             except OSError as exc:
                 self.vault.log_line("intake", f"label not recorded: {exc}")
@@ -397,17 +408,25 @@ class Engine:
         self._sync_calendar_quiet(self._replacing(snapshot, note))
         return {"note": _note_dict(note), "path": str(path), **info}
 
-    def _inbox(self, all_notes: List[Note]) -> List[Dict[str, Any]]:
+    def _inbox(
+        self, all_notes: List[Note], limit: Optional[int] = 25
+    ) -> List[Dict[str, Any]]:
         """What the Drop folder could not call, waiting for one click.
 
         Everything in the Inbox appears here, not only dropped files — an
         Inbox with something in it is a question either way, and the blueprint
         says it should stay near-empty.
+
+        `limit` is a panel concern, not a data one. The dashboard shows the
+        most recent 25 because it is one section among twelve; the triage
+        screen (story G2) passes `None`, because a list that stops at 25 is a
+        list you cannot reach the end of, and reaching the end is the whole
+        point of that screen.
         """
         items = [n for n in all_notes if n.bucket == Bucket.INBOX]
         items.sort(key=lambda n: n.created, reverse=True)
         out: List[Dict[str, Any]] = []
-        for note in items[:25]:
+        for note in (items[:limit] if limit else items):
             meta = note.intake
             out.append(
                 {
@@ -425,6 +444,17 @@ class Engine:
                 }
             )
         return out
+
+    def inbox(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """The whole Inbox, in the order it will be triaged (story G2).
+
+        One vault walk, the same rows the dashboard panel renders, and no cap.
+        It is a separate endpoint from `/api/dashboard` because the triage
+        screen wants only this — asking for the dashboard would build twelve
+        other panels the screen does not draw, on every reload after a filing.
+        """
+        rows = self._inbox(self.notes(), limit=limit)
+        return {"count": len(rows), "items": rows}
 
     # -- read ---------------------------------------------------------------
 

@@ -16,6 +16,7 @@ import sys
 import types
 import zlib
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -47,6 +48,7 @@ from sb.models import (  # noqa: E402
     Bucket,
     Cadence,
     HabitMeta,
+    IntakeMeta,
     Note,
     ProjectMeta,
     ProjectStatus,
@@ -5771,6 +5773,300 @@ def test_study_reminder_fires_once():
         check("it points at the study page", snap["url"].endswith("/study"), snap["url"])
 
 
+# --------------------------------------------------------------------------
+# Sprint 3, lane G — the daily surface. Three stories, three shapes of proof:
+# G1 is a budget (so it is timed, not asserted in prose), G2 is a throughput
+# claim about a loop lj drives (so the machine half is measured and the human
+# half is left to lj), and G3 is an absence (so what is checked is that the
+# thing the backlog rules out is not there, in any wording).
+# --------------------------------------------------------------------------
+
+WEB = Path(__file__).resolve().parent.parent / "sb" / "web"
+
+
+def _without_comments(markup: str) -> str:
+    """The page with its HTML and JavaScript comments removed.
+
+    Used by the G3 check, which is an assertion about what lj reads. This
+    codebase argues with itself in comments — at length, about streaks in
+    particular — and those arguments must not be able to fail a test about
+    the rendered page.
+    """
+    text = re.sub(r"<!--.*?-->", "", markup, flags=re.S)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("//")
+    )
+
+
+def _bulk_vault(engine, notes: int) -> None:
+    """A vault with a realistic number of files in it.
+
+    `today_digest` reads every note in the vault, so a budget measured against
+    an empty temp vault would measure nothing. lj's real vault is ~700 notes;
+    this builds enough of them to make the walk the dominant cost, written
+    straight through `Vault.save` because going via `capture` would spend the
+    time on parsing rather than on the thing being measured.
+    """
+    for i in range(notes):
+        note = Note.capture(
+            f"Reference note {i}\n\nSome body text that is long enough to be parsed "
+            f"and indexed like a real note would be, number {i}.",
+            Bucket.RESOURCE,
+        )
+        engine.vault.save(note)
+
+
+def test_today_screen():
+    """G1 — one page answers "what now?", and it is quick enough to open."""
+    section("the Today screen")
+    from starlette.testclient import TestClient
+
+    from sb.api import build_app
+
+    page = (WEB / "today.html").read_text(encoding="utf-8")
+    check("the four things the story names are all rendered",
+          all(fn in page for fn in
+              ("renderCards(", "renderNow(", "renderDay(", "renderCounts(")), )
+    check("and they come from the digest that already assembles them",
+          'api("/api/today")' in page)
+    check("the page does not also ask for the dashboard payload",
+          "/api/dashboard" not in page)
+    check("the problem banner from lane J is on the front door too",
+          'id="problems"' in page and "renderProblems(" in page)
+    check("no panel is left without an empty state",
+          all(word in page for word in ("No active projects", "Nothing on the calendar today",
+                                        "No decks yet", "inbox zero")))
+    check("the measured load time is on the page, not in a docstring",
+          "loaded in ${total.toFixed(0)} ms" in page)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        cfg.intake.watch = False
+        client = TestClient(build_app(cfg))
+        engine = client.app.state.engine
+
+        check("/ serves Today, not the workbench",
+              "Today<span>.</span>" in client.get("/").text)
+        check("/today is the same page", client.get("/today").status_code == 200)
+        check("and the dashboard keeps working at its own address",
+              "Second <span>Brain</span>" in client.get("/dashboard").text)
+
+        empty = client.get("/api/today").json()
+        check("an empty vault reads as a quiet day rather than four zeroes",
+              empty["is_empty"], empty)
+
+        engine.capture(
+            "Finish the statics problem set\n- work through chapter 4 questions", "project"
+        )
+        aid = engine.capture("Read every evening", "area")["note"]["id"]
+        engine.set_habit(aid, "daily", 1, cue="after dinner", behaviour="read",
+                         place="the kitchen table")
+        engine.capture("something to sort out later", "inbox")
+        engine.decks.save(_deck_with("d1", "Statics", 6, due_offset=0))
+
+        d = client.get("/api/today").json()
+        check("due cards are there", d["cards"]["due_today"] == 6, d["cards"])
+        check("the next project step is there", len(d["next_steps"]) == 1, d["next_steps"])
+        check("habits due today are there", len(d["habits"]) == 1, d["habits"])
+        check("and the inbox count", d["inbox"]["count"] == 1, d["inbox"])
+        check("the habit carries the lane-H cue, not just a title",
+              "after dinner" in (d["habits"][0]["cue"] or ""), d["habits"][0])
+
+        # The budget. Measured against a vault the size of a real one, on the
+        # same call the page makes -- and reported in milliseconds whether it
+        # passes or fails, because "under 500 ms" is only meaningful next to
+        # the number it actually took.
+        _bulk_vault(engine, 300)
+        client.get("/api/today")                      # warm the listing cache
+        runs = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            r = client.get("/api/today")
+            runs.append((time.perf_counter() - t0) * 1000)
+            assert r.status_code == 200, r.text
+        ms = min(runs)
+        notes = len(engine.notes())
+        check(f"/api/today is inside the 500 ms budget on a {notes}-note vault",
+              ms < 500, f"{ms:.0f} ms")
+        print(f"       measured: {ms:.0f} ms for /api/today over {notes} notes")
+
+        # The other three calls the page makes ride alongside it and must not
+        # add a second vault walk, or the budget is the sum rather than the max.
+        for path in ("/api/problems", "/api/study/stats", "/api/study/retention"):
+            t0 = time.perf_counter()
+            client.get(path)
+            side = (time.perf_counter() - t0) * 1000
+            check(f"{path} costs nothing next to it", side < ms + 50, f"{side:.0f} ms")
+
+
+def test_inbox_zero_flow():
+    """G2 — keyboard-only triage, and the round trip that has to fit in it."""
+    section("inbox zero: keys, throughput, and undo")
+    from starlette.testclient import TestClient
+
+    from sb.api import build_app
+
+    page = (WEB / "inbox.html").read_text(encoding="utf-8")
+    check("every bucket has a key, twice over",
+          'BUCKETS = {a: "area", p: "project", r: "resource", 1: "area", 2: "project", 3: "resource"}'
+          in page)
+    check("moving between items is keyed",
+          '"j" || k === "ArrowDown"' in page and '"k" || k === "ArrowUp"' in page)
+    check("the suggestion can be taken without choosing", 'k === "Enter"' in page)
+    check("undo is keyed", 'k === "u"' in page and "function undo()" in page)
+    check("and leaving is keyed", 'k === "Escape"' in page)
+    check("the queue is held in the page rather than refetched per item",
+          "S.queue.splice(S.at, 1)" in page and page.count('api("/api/inbox")') == 1)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        cfg.intake.watch = False
+        client = TestClient(build_app(cfg))
+
+        ids = []
+        for i in range(30):
+            ids.append(client.post("/api/capture", json={
+                "text": f"Inbox item {i}: notes about topic {i} that need a home",
+                "bucket": "inbox",
+            }).json()["note"]["id"])
+
+        listing = client.get("/api/inbox").json()
+        check("the triage list is not capped where the dashboard panel is",
+              listing["count"] == 30, listing["count"])
+        check("and the dashboard panel still is",
+              len(client.get("/api/dashboard").json()["inbox"]) == 25)
+        check("each row carries enough to decide on",
+              set(listing["items"][0]) >= {"note_id", "title", "excerpt", "suggested", "confidence"},
+              sorted(listing["items"][0]))
+
+        # The throughput claim. This is the machine's half of it: twenty
+        # classifications, one after another, exactly as the page issues them.
+        # It says nothing about how long lj takes to read twenty notes -- only
+        # that the system is not what would blow the three minutes.
+        buckets = ["resource", "project", "area"]
+        t0 = time.perf_counter()
+        for i, nid in enumerate(ids[:20]):
+            r = client.post(f"/api/notes/{nid}/classify", json={"bucket": buckets[i % 3]})
+            assert r.status_code == 200, r.text
+        total = time.perf_counter() - t0
+        per_item = total / 20 * 1000
+        check("20 items cost the server well under the 3-minute budget",
+              total < 180, f"{total:.2f}s")
+        check("so the per-item round trip leaves the time to the human",
+              per_item < 1000, f"{per_item:.0f} ms/item")
+        print(f"       measured: {total:.2f}s for 20 classifications "
+              f"({per_item:.0f} ms each), leaving {180 - total:.0f}s of the 3 minutes")
+
+        left = client.get("/api/inbox").json()
+        check("and they left the Inbox", left["count"] == 10, left["count"])
+
+        # Undo is a real reversal: the note comes back to 00-Inbox and back
+        # into the queue, so the next keystroke is about it again.
+        back = client.post(f"/api/notes/{ids[0]}/move", json={"bucket": "inbox"}).json()
+        check("undo puts the note back in the Inbox", back["bucket"] == "inbox", back["bucket"])
+        again = client.get("/api/inbox").json()
+        check("and back into the triage queue", again["count"] == 11, again["count"])
+
+        # A retracted answer must not go on counting. Only a note the Drop
+        # folder was unsure about produces a labelled example at all, so this
+        # one is given the intake metadata a dropped file would have carried.
+        # The log stays append-only -- both answers are on disk -- but only
+        # the last one is a label, or a keystroke lj took back would move a
+        # threshold. See sb/labels.py.
+        engine = client.app.state.engine
+        dropped = engine.note(ids[20])
+        dropped.intake = IntakeMeta(
+            file="topic20.md", suggested="area", confidence=0.51,
+            reason="looked recurring", decided_by="rules",
+        )
+        engine.vault.save(dropped)
+
+        client.post(f"/api/notes/{ids[20]}/classify", json={"bucket": "project"})
+        client.post(f"/api/notes/{ids[20]}/move", json={"bucket": "inbox"})
+        client.post(f"/api/notes/{ids[20]}/classify", json={"bucket": "area"})
+
+        lines = [l for l in (engine.labels.root / "intake.jsonl").read_text(
+            encoding="utf-8").splitlines() if ids[20] in l]
+        check("both answers are still written down", len(lines) == 2, len(lines))
+        pairs = engine.labels.intake_pairs()
+        check("but the note only counts once", len(pairs) == 1, len(pairs))
+        check("as the answer lj did not take back",
+              pairs[0][1] is True, pairs)
+        check("scored against what the rules actually guessed, not against "
+              "the note's own rewritten metadata",
+              abs(pairs[0][0] - 0.51) < 1e-6, pairs)
+
+
+def test_progress_panel_is_streak_free():
+    """G3 — reviews/day, minutes and calibration, with no chain to break."""
+    section("progress: workload, cost, calibration — and no streak")
+    page = (WEB / "study.html").read_text(encoding="utf-8")
+
+    # What the *reader* sees, which is the thing the backlog rules on. Source
+    # comments are stripped first: this file explains at length why there is
+    # no streak here, and a check that failed on the explanation would be
+    # checking the wrong text.
+    shown = _without_comments(page.split("<body")[1])
+    for banned in ("streak", "longest", "in a row", "days running", "chain",
+                   "don't break", "keep it up"):
+        check(f"nothing on the page says {banned!r}", banned not in shown.lower(), banned)
+    check("the 26-week contribution grid is gone with it",
+          'id="heat"' not in page and ".heat {" not in page)
+
+    check("reviews per day are drawn", 'id="daily"' in page and "d.reviews" in page)
+    check("with the minutes they took", "d.minutes" in page)
+    check("the projected daily minutes come from retention.py",
+          'api("/api/study/retention")' in page and "minutes_per_day" in page)
+    check("calibration has its own panel", "function renderCalibration(" in page)
+    check("and every one of them says something on an empty log",
+          "No reviews logged yet" in page and "nothing to average" in page)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+
+        stats = engine.study_stats()
+        check("a log with nothing in it still has 28 days in it",
+              len(stats["daily"]) == 28, len(stats["daily"]))
+        check("all of them zero, none of them missing",
+              all(d["reviews"] == 0 and d["minutes"] == 0 for d in stats["daily"]))
+        check("and calibration says what it is waiting for",
+              stats["calibration"]["n"] == 0
+              and "No predictions yet" in stats["calibration"]["message"],
+              stats["calibration"]["message"])
+        dial = engine.retention_dial()
+        check("the dial is honest about having nothing to project",
+              "Nothing scheduled" in dial["message"], dial["message"])
+
+        # Now give it a log to read, across two days, and check both halves
+        # of each bar come from it rather than from an average.
+        deck = _deck_with("n1", "Statics", 4)
+        engine.decks.save(deck)
+        today = dt.date.today()
+        for day, count, seconds in ((today - dt.timedelta(days=3), 5, 20.0), (today, 2, 45.0)):
+            for i in range(count):
+                engine.decks.log_review({
+                    "at": dt.datetime.combine(day, dt.time(9, 0)).isoformat(),
+                    "note_id": "n1", "card": f"c{i}", "grade": 3, "seconds": seconds,
+                })
+        stats = engine.study_stats()
+        by_date = {d["date"]: d for d in stats["daily"]}
+        check("the day that was studied carries its reviews",
+              by_date[today.isoformat()]["reviews"] == 2, by_date[today.isoformat()])
+        check("and the minutes those reviews took",
+              abs(by_date[today.isoformat()]["minutes"] - 1.5) < 0.05,
+              by_date[today.isoformat()])
+        check("a day with nothing on it is still a day",
+              by_date[(today - dt.timedelta(days=1)).isoformat()]["reviews"] == 0)
+        check("the earlier day is in the window too",
+              by_date[(today - dt.timedelta(days=3)).isoformat()]["reviews"] == 5)
+
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -5822,6 +6118,8 @@ def main():
         test_completion_round_trip, test_completion_is_not_pushed_back_out,
         test_read_back_failure_is_visible,
         test_reminders_carry_the_intention, test_study_reminder_fires_once,
+        # -- sprint 3, lane G: the daily surface
+        test_today_screen, test_inbox_zero_flow, test_progress_panel_is_streak_free,
     ]:
         try:
             fn()

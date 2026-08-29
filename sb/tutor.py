@@ -811,6 +811,7 @@ def stats(store: DeckStore, decks: Sequence[Deck], cfg: Config, days: int = 365)
     today = dt.date.today()
     since = today - dt.timedelta(days=days)
     per_day: Dict[str, int] = {}
+    per_day_minutes: Dict[str, float] = {}
     grades: List[int] = []
     minutes = 0.0
     recent_correct: List[bool] = []
@@ -824,7 +825,9 @@ def stats(store: DeckStore, decks: Sequence[Deck], cfg: Config, days: int = 365)
         per_day[day] = per_day.get(day, 0) + 1
         grade = int(rec.get("grade") or 0)
         grades.append(grade)
-        minutes += float(rec.get("seconds") or 0) / 60.0
+        seconds = float(rec.get("seconds") or 0)
+        minutes += seconds / 60.0
+        per_day_minutes[day] = per_day_minutes.get(day, 0.0) + seconds / 60.0
         try:
             when = dt.date.fromisoformat(day)
         except ValueError:
@@ -845,6 +848,12 @@ def stats(store: DeckStore, decks: Sequence[Deck], cfg: Config, days: int = 365)
         "minutes_total": round(minutes),
         "per_day": per_day,
         "heatmap": _heatmap(per_day, today, 182),
+        # Story G3. Reviews *and* minutes, day by day, over a window short
+        # enough to be about workload rather than about a chain: 28 days is
+        # four weeks of load, and a gap in it reads as a lighter week rather
+        # than as a broken run. The 182-day grid `heatmap` still returns is
+        # not drawn anywhere any more — see the note in `sb/web/study.html`.
+        "daily": _daily(per_day, per_day_minutes, today, 28),
         "accuracy_30d": (
             round(sum(recent_correct) / len(recent_correct), 3) if recent_correct else None
         ),
@@ -879,6 +888,33 @@ def _forecast(decks: Sequence[Deck], today: dt.date, days: int) -> List[Dict[str
             if when <= horizon:
                 counts[when.isoformat()] += 1
     return [{"date": k, "count": v} for k, v in sorted(counts.items())]
+
+
+def _daily(
+    per_day: Dict[str, int],
+    per_day_minutes: Dict[str, float],
+    today: dt.date,
+    days: int,
+) -> List[Dict[str, Any]]:
+    """The last `days` days, oldest first, with zeroes kept.
+
+    Zero days are kept rather than dropped because the shape of the workload
+    is the information: four heavy days and three empty ones is a different
+    week from seven even ones, and only one of those two is legible if the
+    empty days are missing.
+    """
+    start = today - dt.timedelta(days=days - 1)
+    out: List[Dict[str, Any]] = []
+    for i in range(days):
+        day = (start + dt.timedelta(days=i)).isoformat()
+        out.append(
+            {
+                "date": day,
+                "reviews": per_day.get(day, 0),
+                "minutes": round(per_day_minutes.get(day, 0.0), 1),
+            }
+        )
+    return out
 
 
 def _streak(per_day: Dict[str, int], today: dt.date) -> int:

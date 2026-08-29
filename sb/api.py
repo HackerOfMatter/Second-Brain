@@ -86,7 +86,29 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def index(request: Request):
+        """The front door is the Today screen, not the workbench.
+
+        Story G1. `run.py serve` opens `/` and nothing else, so whatever `/`
+        serves is the page lj actually looks at every morning. The dashboard
+        is a good workbench — twelve sections, every project's every step,
+        every Area's habit form — and a bad answer to "what now?", because
+        the answer is somewhere inside it. So Today owns `/`, and the
+        dashboard keeps every byte of its behaviour at `/dashboard`.
+        """
+        return FileResponse(WEB_DIR / "today.html")
+
+    @guard
+    async def today_page(request: Request):
+        return FileResponse(WEB_DIR / "today.html")
+
+    @guard
+    async def dashboard_page(request: Request):
         return FileResponse(WEB_DIR / "index.html")
+
+    @guard
+    async def inbox_page(request: Request):
+        """Story G2 — keyboard-only triage of 00-Inbox."""
+        return FileResponse(WEB_DIR / "inbox.html")
 
     @guard
     async def health(request: Request):
@@ -98,6 +120,18 @@ def build_app(cfg: Config | None = None) -> Starlette:
     @guard
     async def dashboard(request: Request):
         return ok(await run_in_threadpool(engine.dashboard))
+
+    @guard
+    async def inbox(request: Request):
+        """The whole Inbox, uncapped, for the triage screen.
+
+        `?limit=` is honoured for anything that wants the dashboard's cap;
+        the default is no cap, because inbox zero is the goal and a list that
+        stops short of the end cannot be finished.
+        """
+        raw = request.query_params.get("limit")
+        limit = int(raw) if raw and raw.isdigit() and int(raw) > 0 else None
+        return ok(await run_in_threadpool(engine.inbox, limit))
 
     @guard
     async def capture(request: Request):
@@ -586,12 +620,16 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     routes = [
         Route("/", index),
+        Route("/today", today_page),
+        Route("/dashboard", dashboard_page),
+        Route("/inbox", inbox_page),
         Route("/api/health", health),
         Route("/api/problems", problems),
         Route("/api/problems/clear", problems_clear, methods=["POST"]),
         Route("/api/queue", queue_status),
         Route("/api/queue/drain", queue_drain, methods=["POST"]),
         Route("/api/dashboard", dashboard),
+        Route("/api/inbox", inbox),
         Route("/api/capture", capture, methods=["POST"]),
         Route("/api/notes", list_notes),
         Route("/api/notes/{note_id}", get_note),

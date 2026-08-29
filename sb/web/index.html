@@ -253,6 +253,7 @@
     <h1>Second <span>Brain</span></h1>
     <span class="sub" id="vaultpath"></span>
     <span class="spacer"></span>
+    <button id="todaybtn" title="What now — due cards, the next step, habits, the inbox">Today</button>
     <button id="studybtn" title="Flashcards, spaced repetition, the tutor">Study<span id="duebadge"></span></button>
     <button id="reviewbtn" title="What closed, what slipped, what is next — the whole week in one place">Weekly review</button>
     <button id="refresh" title="Reload from vault">Refresh</button>
@@ -1121,6 +1122,7 @@ $("#connectall").addEventListener("click", e =>
 
 $("#intakebtn").addEventListener("click", e => runIntake(e.currentTarget));
 
+$("#todaybtn").addEventListener("click", () => (location.href = "/"));
 $("#studybtn").addEventListener("click", () => (location.href = "/study"));
 $("#reviewbtn").addEventListener("click", () => (location.href = "/review"));
 $("#refresh").addEventListener("click", load);

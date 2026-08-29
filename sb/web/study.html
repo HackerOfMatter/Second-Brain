@@ -159,8 +159,37 @@
   .kpi { background: var(--panel-2); border-radius: 8px; padding: 12px 14px; }
   .kpi b { display: block; font-size: 23px; font-weight: 600; letter-spacing: -0.02em; }
   .kpi span { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
-  .heat { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 11px); gap: 3px; overflow-x: auto; padding-bottom: 4px; }
-  .heat i { width: 11px; height: 11px; border-radius: 2px; background: var(--panel-2); display: block; }
+  /* Twenty-eight days of workload, not a chain. Reviews are the bar; the
+     minutes they took are the darker foot of it, so "a lot of cards" and "a
+     long session" stay distinguishable. A zero day is a faint baseline
+     rather than an absence, because a light week is information and a
+     missing square is an accusation. */
+  .days { display: flex; align-items: flex-end; gap: 3px; height: 104px; }
+  .days .d { flex: 1; min-width: 4px; position: relative; display: flex;
+             flex-direction: column; justify-content: flex-end; height: 100%; }
+  .days .d i { display: block; background: var(--accent-soft); border-top: 2px solid var(--accent);
+               border-radius: 2px 2px 0 0; min-height: 2px; }
+  .days .d.none i { background: var(--panel-2); border-top-color: var(--line); }
+  .days .d b { display: block; background: var(--accent); opacity: .55; }
+  .days .d span { position: absolute; bottom: -20px; left: 0; right: 0; text-align: center;
+                  font: 9px var(--mono); color: var(--faint); }
+  .dialgrid { display: grid; grid-template-columns: auto 1fr auto auto; gap: 4px 14px;
+              align-items: center; font-size: 13.5px; }
+  .dialgrid .r { font: 12.5px var(--mono); color: var(--muted); }
+  .dialgrid .track { background: var(--panel-2); border-radius: 3px; height: 9px; }
+  .dialgrid .track i { display: block; height: 100%; background: var(--accent); opacity: .35; border-radius: 3px; }
+  .dialgrid .row.now .r, .dialgrid .row.now .m { color: var(--ink); font-weight: 600; }
+  .dialgrid .row.now .track i { opacity: .85; }
+  .dialgrid .m { font: 12.5px var(--mono); text-align: right; }
+  .dialgrid .tag { font-size: 11px; color: var(--good); white-space: nowrap; }
+  .calrow { display: grid; grid-template-columns: 74px 1fr auto; gap: 12px; align-items: center;
+            font-size: 13px; padding: 3px 0; }
+  .calrow .lab { font: 12px var(--mono); color: var(--muted); }
+  .calrow .track { background: var(--panel-2); border-radius: 3px; height: 12px; position: relative; }
+  .calrow .track i { position: absolute; top: 0; bottom: 0; left: 0; background: var(--accent);
+                     opacity: .3; border-radius: 3px; }
+  .calrow .track u { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ink); }
+  .calrow .n { font: 11.5px var(--mono); color: var(--faint); }
   .forecast { display: flex; align-items: flex-end; gap: 4px; height: 90px; }
   .forecast div { flex: 1; background: var(--accent-soft); border-top: 2px solid var(--accent); border-radius: 2px 2px 0 0; min-height: 2px; position: relative; }
   .forecast div span { position: absolute; bottom: -18px; left: 0; right: 0; text-align: center; font: 9px var(--mono); color: var(--faint); }
@@ -184,7 +213,8 @@
     <h1>Study<span>.</span></h1>
     <span class="sub" id="subline"></span>
     <span class="spacer"></span>
-    <a href="/">← dashboard</a>
+    <a href="/">← today</a>
+    <a href="/dashboard" style="margin-left:12px">dashboard</a>
   </header>
 
   <nav class="tabs">
@@ -362,13 +392,32 @@
 
   <!-- ================= PROGRESS ================= -->
   <div id="tab-progress" class="hide">
+    <!--
+      Story G3. What this panel does NOT contain is the point of it: no
+      streak, no chain, no "longest" anything, and — new in Sprint 3 — no
+      26-week contribution grid either. Sprint 2 pulled the streak tiles out
+      and left the grid, but the grid is the same device drawn differently:
+      a wall of squares where a gap is a visible failure is exactly the
+      "habit tracking becomes self-judgment → quits" mechanism the backlog
+      rules out. What replaced it answers the questions a study log can
+      honestly answer — how much work there was, how much time it took, what
+      it will cost tomorrow, and whether your confidence is worth anything.
+    -->
     <section>
-      <h2>How often you study</h2>
+      <h2>Reviews and minutes — last 28 days</h2>
       <div class="kpis" id="kpis"></div>
-      <div style="margin-top:18px">
-        <div class="heat" id="heat"></div>
-        <p class="hint" style="margin-top:8px">Last 26 weeks. Each column is a week, each square a day.</p>
+      <div id="dailywrap" style="margin-top:22px">
+        <div class="days" id="daily"></div>
+        <p class="hint" id="dailynote" style="margin-top:24px"></p>
       </div>
+    </section>
+    <section>
+      <h2>What the retention target costs, in minutes a day</h2>
+      <div id="dial"><p class="empty">Loading…</p></div>
+    </section>
+    <section>
+      <h2>Calibration — how sure you were against how right you were</h2>
+      <div id="calib"><p class="empty">Loading…</p></div>
     </section>
     <section>
       <h2>Coming due — next 14 days</h2>
@@ -434,14 +483,25 @@ $$("nav.tabs button").forEach(b => b.addEventListener("click", () => {
 
 // ------------------------------------------------------------------ overview
 async function loadOverview() {
-  const d = await api("/api/study/overview");
+  // Three reads, issued together. `overview` walks the deck store; the other
+  // two read the same files again but cost microseconds, and asking for them
+  // here means the Progress tab is already right the first time it is opened
+  // rather than flashing empty. `stats` is `overview.stats` plus calibration;
+  // `retention` is the dial (sb/retention.py).
+  const [d, full, dial] = await Promise.all([
+    api("/api/study/overview"),
+    api("/api/study/stats").catch(() => null),
+    api("/api/study/retention").catch(() => null),
+  ]);
+  STATE.stats = full;
+  STATE.dial = dial;
   STATE.overview = d;
   CATS = Object.fromEntries((d.categories || []).map(c => [c.key, c]));
   renderFolders(d);
   renderSubjects(d);
   renderDecks(d);
   renderNotePicker(d);
-  renderProgress(d.stats, d.decks);
+  renderProgress(STATE.stats || d.stats, d.decks, STATE.dial);
   renderGraduation(d.graduation);
   const s = d.stats;
   // Never miss twice, never a streak (sb/habits.py) -- the subline reports
@@ -1074,25 +1134,73 @@ $("#answer").addEventListener("click", e => {
 });
 
 // ------------------------------------------------------------------ progress
-function renderProgress(s, decks) {
-  // No streak tile here on purpose (sb/habits.py's "never miss twice": a
-  // streak counter turns the first missed day into the loss of a whole
-  // number, at exactly the moment nothing has actually gone wrong).
+// Story G3. Three questions, in the order they are worth asking:
+//   how much have I actually done, what will tomorrow cost, and is my sense
+//   of what I know any good?
+// None of them is "how many days in a row", and there is no tile, grid or
+// sentence here from which a run of days could be read off. sb/habits.py has
+// the reasoning: a counter that resets to zero on the first missed day
+// punishes the moment nothing has actually gone wrong, and the backlog rules
+// the whole device out — "habit tracking becomes self-judgment → quits".
+//
+// Everything renders on an empty log, because an empty log is what lj has:
+// zero reviews at the time this was written. A panel that only makes sense
+// once it is full is a panel nobody ever sees the start of.
+
+function renderProgress(s, decks, dial) {
+  const daily = s.daily || [];
+  const reviews28 = daily.reduce((a, d) => a + d.reviews, 0);
+  const minutes28 = daily.reduce((a, d) => a + d.minutes, 0);
+  const active28 = daily.filter(d => d.reviews).length;
+  // Same rule as the Today panel: nothing scheduled projects nothing, and a
+  // real load under a minute says so rather than rounding down to zero.
+  const point = dial && dial.cards && dial.points
+    ? dial.points.find(p => p.is_current) : null;
+  const projected = point ? point.minutes_per_day : null;
+
   $("#kpis").innerHTML = [
-    [s.today, "today"],
-    [s.reviews_total, "reviews all time"],
-    [s.days_studied, "days studied"],
+    [s.today, "reviewed today"],
+    [reviews28, "reviews, 28d"],
+    [Math.round(minutes28) + "m", "minutes, 28d"],
+    [projected == null ? "—" : (projected < 1 ? "<1m" : Math.round(projected) + "m"),
+     "projected per day"],
     [s.accuracy_30d == null ? "—" : Math.round(s.accuracy_30d * 100) + "%", "recalled, 30d"],
     [s.predicted_retention == null ? "—" : Math.round(s.predicted_retention * 100) + "%", "known right now"],
     [s.cards.mature + "/" + s.cards.active, "mature cards"],
   ].map(([v, k]) => `<div class="kpi"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join("");
 
-  const max = Math.max(1, ...s.heatmap.map(h => h.count));
-  $("#heat").innerHTML = s.heatmap.map(h => {
-    const a = h.count ? (0.22 + 0.78 * Math.min(1, h.count / max)) : 0;
-    const bg = h.count ? `background:color-mix(in srgb, var(--accent) ${Math.round(a * 100)}%, var(--panel-2))` : "";
-    return `<i style="${bg}" title="${h.date}: ${h.count} reviews"></i>`;
-  }).join("");
+  if (!reviews28) {
+    $("#daily").innerHTML = "";
+    $("#dailynote").innerHTML = s.reviews_total
+      ? `Nothing in the last 28 days — ${s.reviews_total} review${s.reviews_total === 1 ? "" : "s"}
+         before that. Start a session on the Review tab and this fills back in.`
+      : `No reviews logged yet, so there is nothing to average. This chart is one bar per day
+         once you start: how many cards, and how long they took. Both come from the review log —
+         neither is estimated.`;
+  } else {
+    const maxR = Math.max(...daily.map(d => d.reviews));
+    const maxM = Math.max(1, ...daily.map(d => d.minutes));
+    $("#daily").innerHTML = daily.map((d, i) => {
+      const h = Math.round(d.reviews / maxR * 100);
+      // The minutes foot is scaled inside the bar it belongs to, so it can
+      // never claim more height than the reviews it is made of.
+      const foot = d.reviews ? Math.round(Math.min(1, d.minutes / maxM) * h * 0.55) : 0;
+      const label = i === daily.length - 1 ? "today" : (i % 7 === 0 ? d.date.slice(8) : "");
+      return `<div class="d ${d.reviews ? "" : "none"}"
+                title="${esc(d.date)}: ${d.reviews} review${d.reviews === 1 ? "" : "s"}, ${d.minutes} min">
+        <i style="height:${Math.max(2, h - foot)}%"></i>
+        ${foot ? `<b style="height:${foot}%"></b>` : ""}
+        <span>${esc(label)}</span></div>`;
+    }).join("");
+    const perActive = (reviews28 / active28).toFixed(1);
+    $("#dailynote").innerHTML =
+      `${reviews28} review${reviews28 === 1 ? "" : "s"} over ${active28} day${active28 === 1 ? "" : "s"},
+       ${Math.round(minutes28)} minutes in total — ${perActive} reviews on a day you studied.
+       The darker foot of each bar is the time those reviews took.`;
+  }
+
+  renderDial(dial);
+  renderCalibration(s.calibration, s.overconfident_cards);
 
   const fmax = Math.max(1, ...s.forecast.map(f => f.count));
   $("#forecast").innerHTML = s.forecast.map((f, i) => `
@@ -1108,6 +1216,79 @@ function renderProgress(s, decks) {
       </div>
       <div class="bar"><i style="width:${Math.round(x.mastery * 100)}%"></i></div>
     </div>`).join("") : `<p class="empty">Nothing studied yet.</p>`;
+}
+
+// The G3 acceptance criterion: projected daily minutes, from sb/retention.py.
+// The dial is shown whole rather than as a single number, because the number
+// on its own does not carry the argument — that the cost of the target rises
+// far faster than the knowledge does, and that the best target is usually
+// under the 0.9 the config defaults to.
+function renderDial(dial) {
+  const el = $("#dial");
+  if (!dial) { el.innerHTML = `<p class="empty">Could not read the retention dial.</p>`; return; }
+  if (!dial.cards) {
+    el.innerHTML = `<p class="empty">${esc(dial.message)}</p>
+      <p class="hint" style="margin-top:9px">A card only has an interval to shorten once it has been
+      reviewed, so this projection needs real sessions rather than more cards.</p>`;
+    return;
+  }
+  const max = Math.max(...dial.points.map(p => p.minutes_per_day)) || 1;
+  el.innerHTML = `
+    <div class="dialgrid">${dial.points.map(p => `
+      <div class="row ${p.is_current ? "now" : ""}" style="display:contents">
+        <span class="r">${p.retention.toFixed(2)}</span>
+        <span class="track"><i style="width:${Math.max(1, Math.round(p.minutes_per_day / max * 100))}%"></i></span>
+        <span class="m">${p.minutes_per_day < 10 ? p.minutes_per_day.toFixed(1) : Math.round(p.minutes_per_day)} min/day</span>
+        <span class="tag">${p.is_current ? "current" : ""}${p.is_optimal ? (p.is_current ? " · " : "") + "best per minute" : ""}</span>
+      </div>`).join("")}
+    </div>
+    <p class="hint" style="margin-top:12px">${esc(dial.message)}</p>
+    <p class="hint">Measured at ${dial.seconds_per_review}s per review across ${dial.cards}
+      scheduled card${dial.cards === 1 ? "" : "s"}. Change the target in <code>config.yaml</code>
+      (<code>study.desired_retention</code>).</p>`;
+}
+
+// Calibration is the one number here that is about judgement rather than
+// volume, and it is the one that most needs its empty state written properly:
+// with no confidence taps there is nothing to say, and saying "0% calibrated"
+// would be a lie rather than a starting point.
+function renderCalibration(c, cards) {
+  const el = $("#calib");
+  if (!c) { el.innerHTML = `<p class="empty">No calibration data.</p>`; return; }
+  if (!c.n) {
+    el.innerHTML = `<p class="empty">${esc(c.message)}</p>
+      <p class="hint" style="margin-top:9px">The tap is the row of buttons above the answer during a
+      session. It costs one keystroke and it is the only way to find out whether "I know this"
+      means anything.</p>`;
+    return;
+  }
+  const gap = c.overconfidence;
+  const verdict = Math.abs(gap) < 0.05
+    ? "About right — what you predict is roughly what happens."
+    : gap > 0
+      ? `Overconfident by ${Math.round(gap * 100)} points: you say you know it more often than you do.`
+      : `Underconfident by ${Math.round(-gap * 100)} points: you know more than you claim.`;
+  el.innerHTML = `
+    <div class="kpis" style="margin-bottom:16px">
+      <div class="kpi"><b>${Math.round(c.mean_confidence * 100)}%</b><span>you predicted</span></div>
+      <div class="kpi"><b>${Math.round(c.mean_accuracy * 100)}%</b><span>you were right</span></div>
+      <div class="kpi"><b>${c.brier}</b><span>brier score</span></div>
+      <div class="kpi"><b>${c.n}</b><span>judged reviews</span></div>
+    </div>
+    ${c.bins.filter(b => b.n).map(b => `
+      <div class="calrow">
+        <span class="lab">${esc(b.label)}</span>
+        <span class="track">
+          <i style="width:${Math.round((b.actual ?? 0) * 100)}%"></i>
+          <u style="left:calc(${Math.round((b.predicted ?? 0) * 100)}% - 1px)"></u>
+        </span>
+        <span class="n">${b.n}</span>
+      </div>`).join("")}
+    <p class="hint" style="margin-top:11px">The bar is how often you were actually right; the tick is
+      what you predicted. ${esc(verdict)}${c.enough ? "" : " Fewer than the minimum for a settled score — read it as a direction, not a verdict."}</p>
+    ${(cards || []).length ? `<p class="hint" style="margin-top:9px">${cards.length}
+      card${cards.length === 1 ? "" : "s"} you were sure about and got wrong — the most useful
+      list on this page.</p>` : ""}`;
 }
 
 loadOverview().catch(e => toast("Could not load", e.message, "err"));

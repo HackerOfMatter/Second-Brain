@@ -108,12 +108,46 @@ class LabelStore:
             if isinstance(rec, dict):
                 yield rec
 
+    def original_intake(self, note_id: str) -> Optional[Dict[str, Any]]:
+        """The first answer ever recorded about this note, if there is one.
+
+        What makes it worth reading back: filing a note by hand rewrites its
+        `intake.suggested` and `intake.confidence` to the answer lj gave, so
+        by the time a *second* answer is given — after story G2's undo — the
+        note no longer remembers what the rules had guessed. The log does.
+        Without this, a correction is recorded as "the system suggested what
+        you first picked, at 100% confidence, and you disagreed", which is a
+        labelled example of nothing.
+        """
+        for rec in self._read(INTAKE_LOG):
+            if rec.get("note_id") == note_id:
+                return rec
+        return None
+
     def intake_pairs(self) -> List[Tuple[float, bool]]:
-        return [
-            (float(r.get("confidence") or 0.0), bool(r.get("correct")))
-            for r in self._read(INTAKE_LOG)
-            if r.get("confidence") is not None
-        ]
+        """One pair per note, and it is the *last* answer given about it.
+
+        The log stays append-only — nothing is rewritten, and the earlier
+        lines are still there to read. But story G2's triage screen has an
+        undo, and undo plus re-file writes two lines about the same note, one
+        of which lj has explicitly retracted. Counting both would let a
+        keystroke lj took back move a threshold, and would count 60 pairs
+        when there were only 55 notes. Last answer wins; anything with no
+        `note_id` is kept as its own pair, because there is nothing to
+        supersede it with.
+        """
+        latest: Dict[str, Tuple[float, bool]] = {}
+        loose: List[Tuple[float, bool]] = []
+        for r in self._read(INTAKE_LOG):
+            if r.get("confidence") is None:
+                continue
+            pair = (float(r.get("confidence") or 0.0), bool(r.get("correct")))
+            note_id = r.get("note_id")
+            if note_id:
+                latest[str(note_id)] = pair
+            else:
+                loose.append(pair)
+        return list(latest.values()) + loose
 
     def link_pairs(self) -> List[Tuple[float, bool]]:
         return [

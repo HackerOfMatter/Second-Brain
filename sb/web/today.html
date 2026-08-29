@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14'%3E%F0%9F%A7%A0%3C/text%3E%3C/svg%3E">
+<title>Today · Second Brain</title>
+<!--
+  Story G1 — the daily surface.
+
+  This page is `/`. `run.py serve` opens the root and nothing else, so
+  whatever answers `/` is the page that gets looked at every morning. The
+  dashboard is a workbench and stays one, at `/dashboard`; this is the
+  answer to "what now?", and it is allowed to be almost empty.
+
+  It reads ONE payload for everything the story names — due cards, the next
+  project step, habits due, the inbox count — because `sb/digest.py` already
+  assembles exactly that set in one vault walk (`GET /api/today`). Three
+  more calls ride alongside it and none of them touch the vault: the problem
+  banner (`/api/problems`, story J1), and the two study reads that come off
+  the deck files. They are issued together, so the page costs one vault walk
+  and the wall clock is whichever of the four is slowest.
+
+  The load time is printed in the footer rather than asserted anywhere. A
+  budget you cannot see is a budget nobody notices breaking.
+-->
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --panel-2: #f0efea; --line: #e2e0d9;
+    --ink: #1a1a17; --muted: #6f6d66; --faint: #94918a;
+    --accent: #b8502a; --accent-soft: #f3e3dc;
+    --area: #3f7d6b; --project: #b8502a; --resource: #4a6b9c;
+    --good: #3f7d6b; --warn: #a8571b; --danger: #a33232;
+    --radius: 10px; --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --panel: #1e1e23; --panel-2: #26262c; --line: #34343c;
+      --ink: #e8e6e1; --muted: #9d9a94; --faint: #77746e;
+      --accent: #e08b5f; --accent-soft: #3a2a22;
+      --area: #6fb39c; --project: #e08b5f; --resource: #7fa3d6;
+      --good: #6fb39c; --warn: #d99b52; --danger: #d97070;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 26px 20px 70px; }
+  a { color: var(--accent); }
+  .hide { display: none !important; }
+  .spacer { flex: 1; }
+
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--accent); }
+  .today-date { color: var(--faint); font-size: 13px; }
+  nav.go { display: flex; gap: 6px; flex-wrap: wrap; }
+  nav.go a, button {
+    font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--ink); padding: 6px 11px; font-size: 13.5px;
+    text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+  }
+  nav.go a:hover, button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.tiny { padding: 3px 9px; font-size: 12px; }
+  kbd {
+    font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 4px; padding: 0 4px; color: var(--muted); background: var(--panel-2);
+  }
+
+  /* ---- the four counts: the whole "what is waiting" answer, above the fold */
+  .counts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
+  @media (max-width: 620px) { .counts { grid-template-columns: repeat(2, 1fr); } }
+  .count {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 13px 14px; text-decoration: none; color: inherit; display: block;
+  }
+  .count:hover { border-color: var(--muted); }
+  .count b { display: block; font-size: 27px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
+  .count b.zero { color: var(--faint); font-weight: 500; }
+  .count span { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .count em { display: block; font-style: normal; font-size: 12px; color: var(--faint); margin-top: 3px; }
+
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
+       margin: 0 0 11px; font-weight: 600; }
+  .empty { color: var(--faint); margin: 0; font-size: 14px; }
+  .hint { color: var(--faint); font-size: 12.5px; }
+
+  /* ---- the one thing to do next ---- */
+  .now .step { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.35; }
+  .now .of { color: var(--muted); font-size: 13.5px; margin-top: 4px; }
+  .now .acts { display: flex; gap: 7px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  .then { list-style: none; margin: 14px 0 0; padding: 13px 0 0; border-top: 1px solid var(--line); }
+  .then li { display: flex; gap: 9px; align-items: baseline; padding: 4px 0; font-size: 14px; }
+  .then .t { flex: 1; min-width: 0; }
+  .then .sub { color: var(--muted); font-size: 12.5px; }
+  .urg { font: 11px var(--mono); color: var(--muted); min-width: 2.2em; text-align: right; }
+
+  .pill { font-size: 11.5px; border: 1px solid var(--line); border-radius: 999px;
+          padding: 1px 8px; color: var(--muted); white-space: nowrap; }
+  .pill.due  { border-color: var(--warn); color: var(--warn); }
+  .pill.over { border-color: var(--danger); color: var(--danger); }
+
+  /* ---- the day, in time order ---- */
+  .day { list-style: none; margin: 0; padding: 0; }
+  .day li { display: grid; grid-template-columns: 62px 1fr; gap: 10px;
+            padding: 9px 0; border-top: 1px solid var(--line); }
+  .day li:first-child { border-top: none; padding-top: 0; }
+  .day .at { font: 12.5px var(--mono); color: var(--muted); padding-top: 2px; }
+  .day .what { min-width: 0; }
+  .day .cue { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .day .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); }
+  .day .acts { margin-top: 6px; }
+
+  .deckrow { display: flex; gap: 10px; align-items: baseline; padding: 5px 0; font-size: 14px; }
+
+  /* ---- study load (the G3 numbers, in their one-line form) ---- */
+  .load { display: flex; gap: 26px; flex-wrap: wrap; }
+  .load div b { display: block; font-size: 20px; font-weight: 600; }
+  .load div span { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .load div em { font-style: normal; color: var(--faint); font-weight: 500; }
+
+  /* ---- problems (story J1, same shape as the dashboard banner) ---- */
+  #problems { display: grid; gap: 8px; margin-bottom: 16px; }
+  .problem {
+    background: var(--panel); border: 1px solid var(--danger); border-left-width: 4px;
+    border-radius: 8px; padding: 10px 12px; display: flex; gap: 10px; align-items: flex-start;
+  }
+  .problem .body { flex: 1; min-width: 0; }
+  .problem .msg { font-weight: 600; color: var(--danger); }
+  .problem .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  footer { color: var(--faint); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap;
+           margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--line); }
+
+  #toast {
+    position: fixed; right: 18px; bottom: 18px; max-width: 380px; z-index: 20;
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 12px 14px; box-shadow: 0 8px 28px rgba(0,0,0,.18);
+    font-size: 13.5px; opacity: 0; transform: translateY(8px); transition: .18s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; transform: none; }
+  #toast .t-head { font-weight: 600; margin-bottom: 3px; }
+  #toast.err { border-left-color: var(--danger); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Today<span>.</span></h1>
+    <span class="today-date" id="datehead"></span>
+    <span class="spacer"></span>
+    <nav class="go">
+      <a href="/inbox" id="golinbox">Inbox<kbd>i</kbd></a>
+      <a href="/study" id="golstudy">Study<kbd>s</kbd></a>
+      <a href="/dashboard">Dashboard<kbd>d</kbd></a>
+      <a href="/review">Week<kbd>w</kbd></a>
+      <button id="refresh" title="Re-read the vault">Refresh<kbd>r</kbd></button>
+    </nav>
+  </header>
+
+  <div id="problems" class="hide"></div>
+
+  <div class="counts" id="counts"></div>
+
+  <section class="now">
+    <h2>Do this next</h2>
+    <div id="nowbody"><p class="empty">Reading the vault…</p></div>
+  </section>
+
+  <section>
+    <h2>The day, in order</h2>
+    <div id="daybody"><p class="empty">…</p></div>
+  </section>
+
+  <section>
+    <h2>Cards due</h2>
+    <div id="cardbody"><p class="empty">…</p></div>
+  </section>
+
+  <section>
+    <h2>Study load</h2>
+    <div id="loadbody"><p class="empty">…</p></div>
+  </section>
+
+  <footer id="footer"></footer>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: {"Content-Type": "application/json"}}, opts));
+  const data = await r.json().catch(() => ({error: "bad response"}));
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+
+let toastTimer;
+function toast(head, body, kind) {
+  const el = $("#toast");
+  el.className = "show " + (kind || "");
+  el.innerHTML = `<div class="t-head">${esc(head)}</div><div>${esc(body || "")}</div>`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.className = ""), kind === "err" ? 9000 : 5000);
+}
+
+const plural = (n, one, many) => n + " " + (n === 1 ? one : (many || one + "s"));
+
+function daysUntil(iso) {
+  if (!iso) return null;
+  const d = new Date(String(iso).slice(0, 10) + "T00:00:00"), t = new Date();
+  t.setHours(0, 0, 0, 0);
+  return Math.round((d - t) / 86400000);
+}
+function duePill(iso) {
+  const n = daysUntil(iso);
+  if (n === null) return "";
+  if (n < 0)   return `<span class="pill over">${-n}d overdue</span>`;
+  if (n === 0) return `<span class="pill due">due today</span>`;
+  if (n <= 7)  return `<span class="pill due">${n}d left</span>`;
+  return `<span class="pill">due ${esc(iso)}</span>`;
+}
+
+// ---- the four counts -------------------------------------------------------
+// Every tile is a link, and a zero is drawn quietly rather than loudly: on a
+// clear day the page should look clear, not look like four alarms reading 0.
+function renderCounts(d) {
+  const cards = d.cards.due_today, steps = d.next_steps.length;
+  const habits = d.habits.length, inbox = d.inbox.count;
+  const tile = (href, n, label, note) => `
+    <a class="count" href="${href}">
+      <b class="${n ? "" : "zero"}">${n}</b>
+      <span>${esc(label)}</span>
+      <em>${esc(note)}</em>
+    </a>`;
+  $("#counts").innerHTML = [
+    tile("/study", cards, "cards due",
+         cards ? (d.cards.decks === 1 ? "one deck" : "across " + d.cards.decks + " decks")
+               : (d.cards.new_waiting ? plural(d.cards.new_waiting, "new card") + " waiting" : "nothing scheduled")),
+    tile("#nowbody", steps, "next steps",
+         steps ? plural(d.projects_active, "active project") : "no project has work outstanding"),
+    tile("#daybody", habits, "habits due", habits ? "on the calendar today" : "none scheduled today"),
+    tile("/inbox", inbox, "in the inbox",
+         inbox ? "press i to triage" + (d.inbox.pending_dates ? " · " + plural(d.inbox.pending_dates, "date") + " to confirm" : "")
+               : "inbox zero"),
+  ].join("");
+  $("#golinbox").innerHTML = "Inbox" + (inbox ? " · " + inbox : "") + "<kbd>i</kbd>";
+  $("#golstudy").innerHTML = "Study" + (cards ? " · " + cards : "") + "<kbd>s</kbd>";
+}
+
+// ---- do this next ----------------------------------------------------------
+// One step, big. `workflow.next_actions` has already ranked every active
+// project's next step and returns one per project, so the top of that list is
+// genuinely the single most urgent thing -- not the first of six from the
+// same project. The rest are listed small, because knowing there IS a rest is
+// useful and reading it is not.
+function renderNow(steps, active) {
+  const el = $("#nowbody");
+  if (!steps.length) {
+    el.innerHTML = active
+      ? `<p class="empty">${plural(active, "active project")}, and none of them has an unfinished step.
+         Either they are done, or the next step has not been written yet —
+         <a href="/dashboard">the dashboard</a> is where steps get added.</p>`
+      : `<p class="empty">No active projects. Capture one on <a href="/dashboard">the dashboard</a>
+         and its steps get planned and put on the calendar.</p>`;
+    return;
+  }
+  const top = steps[0];
+  const rest = steps.slice(1, 4);
+  el.innerHTML = `
+    <div class="step">${esc(top.step.text)}</div>
+    <div class="of">${esc(top.note_title)}${top.step.minutes ? " · ~" + top.step.minutes + " min" : ""}</div>
+    <div class="acts">
+      ${duePill(top.deadline)}
+      <span class="pill">urgency ${Math.round(top.urgency * 100)}</span>
+      <button class="primary" data-start-note="${esc(top.note_id)}" data-start-step="${esc(top.step.id)}"
+        title="Start the clock. Without it there is nothing to score the estimate against."
+        >${top.step.started_at ? "Running — restart" : "Start"}</button>
+      <button data-done-note="${esc(top.note_id)}" data-done-step="${esc(top.step.id)}">Done</button>
+    </div>
+    ${rest.length ? `<ul class="then">${rest.map(a => `
+      <li>
+        <span class="urg">${Math.round(a.urgency * 100)}</span>
+        <span class="t">${esc(a.step.text)}<div class="sub">${esc(a.note_title)}</div></span>
+        ${duePill(a.deadline)}
+      </li>`).join("")}</ul>
+      ${steps.length > 4 ? `<p class="hint" style="margin:9px 0 0">${steps.length - 4} more on
+         <a href="/dashboard">the dashboard</a>.</p>` : ""}` : ""}`;
+}
+
+// ---- the day ---------------------------------------------------------------
+// The digest already merges scheduled project blocks, habit occurrences and
+// overdue resource reviews into one time-ordered list, and carries the H-lane
+// cue line for habits. Rendering it in that order is the whole job.
+function renderDay(cal) {
+  const el = $("#daybody");
+  if (!cal.length) {
+    el.innerHTML = `<p class="empty">Nothing on the calendar today. That is a real answer,
+      not a missing one — the block above is what to do with the time.</p>`;
+    return;
+  }
+  el.innerHTML = `<ul class="day">${cal.map(c => `
+    <li>
+      <span class="at">${c.time ? esc(c.time) : "—"}</span>
+      <span class="what">
+        <span class="kind">${esc(c.kind)}${c.minutes ? " · " + c.minutes + "m" : ""}${
+          c.overdue_days ? " · " + c.overdue_days + "d overdue" : ""}</span>
+        <div>${esc(c.title)}</div>
+        ${c.cue ? `<div class="cue">${esc(c.cue)}</div>` : ""}
+        ${c.kind === "habit"
+          ? `<div class="acts"><button class="tiny" data-habit-done="${esc(c.note_id)}">Did it</button></div>` : ""}
+      </span>
+    </li>`).join("")}</ul>`;
+}
+
+function renderCards(cards) {
+  const el = $("#cardbody");
+  if (!cards.due_today) {
+    el.innerHTML = cards.decks
+      ? `<p class="empty">Nothing due across ${plural(cards.decks, "deck")}${
+          cards.new_waiting ? ", and " + plural(cards.new_waiting, "new card") + " waiting to be introduced" : ""}.
+          <a href="/study">Study anyway</a> if you want.</p>`
+      : `<p class="empty">No decks yet. <a href="/study">Make cards</a> from a project or a resource
+         and they start arriving here.</p>`;
+    return;
+  }
+  el.innerHTML = cards.by_deck.map(d => `
+    <div class="deckrow"><strong>${esc(d.subject)}</strong>
+      <span class="spacer"></span><span class="pill due">${plural(d.due, "card")} due</span></div>`).join("")
+    + `<p class="hint" style="margin:10px 0 0"><a href="/study">Start the session</a>
+       — ${plural(cards.due_today, "card")} in total.</p>`;
+}
+
+// ---- study load ------------------------------------------------------------
+// The projected minutes come from sb/retention.py, which is honest about
+// having nothing to project from -- so the empty state is its own sentence
+// rather than a zero.
+function renderLoad(stats, dial) {
+  const el = $("#loadbody");
+  const done = stats ? stats.today : 0;
+  // A dial with no scheduled cards projects 0 min/day, which is arithmetically
+  // true and reads as a claim. It is not one — there is nothing to project
+  // from — so it renders as a dash, and a real but sub-minute load renders as
+  // "<1 min" rather than rounding down to the same 0.
+  const point = dial && dial.cards && dial.points
+    ? dial.points.find(p => p.is_current) : null;
+  const projected = point ? point.minutes_per_day : null;
+  const projLabel = projected == null
+    ? "<em>—</em>"
+    : (projected < 1 ? "&lt;1 min" : Math.round(projected) + " min");
+  el.innerHTML = `
+    <div class="load">
+      <div><b>${done}</b><span>reviewed today</span></div>
+      <div><b>${projLabel}</b><span>projected per day</span></div>
+      <div><b>${stats && stats.reviews_total ? stats.reviews_total : "<em>0</em>"}</b><span>reviews logged</span></div>
+    </div>
+    <p class="hint" style="margin:11px 0 0">${esc((dial && dial.message) || "")}
+      <a href="/study">Progress →</a></p>`;
+}
+
+function renderProblems(problems) {
+  const box = $("#problems");
+  box.classList.toggle("hide", !problems.length);
+  box.innerHTML = problems.map(p => {
+    const when = (p.since || "").replace("T", " ").slice(0, 16);
+    const times = (p.count || 1) > 1 ? ` · seen ${p.count}×` : "";
+    return `<div class="problem">
+      <div class="body">
+        <div class="msg">${esc(p.message || "Something failed in the background.")}</div>
+        <div class="meta">since ${esc(when)}${times}${p.hint ? " — " + esc(p.hint) : ""}</div>
+      </div>
+      <button data-problem="${esc(p.id || "")}" title="Dismiss. If it is still true, the next run files it again.">Dismiss</button>
+    </div>`;
+  }).join("");
+  box.querySelectorAll("[data-problem]").forEach(b => b.addEventListener("click", async e => {
+    const id = e.currentTarget.getAttribute("data-problem");
+    try {
+      const r = await api("/api/problems/clear", {method: "POST", body: JSON.stringify({id})});
+      renderProblems(r.problems || []);
+    } catch (err) { toast("Could not dismiss", err.message, "err"); }
+  }));
+}
+
+// ---- load ------------------------------------------------------------------
+// Four requests, issued together, so the page costs the slowest one rather
+// than the sum. Only the first walks the vault.
+async function load() {
+  const t0 = performance.now();
+  const [today, problems, stats, dial] = await Promise.all([
+    api("/api/today"),
+    api("/api/problems").catch(() => ({problems: []})),
+    api("/api/study/stats").catch(() => null),
+    api("/api/study/retention").catch(() => null),
+  ]);
+  const fetched = performance.now() - t0;
+
+  $("#datehead").textContent = new Date(today.date + "T00:00:00")
+    .toLocaleDateString(undefined, {weekday: "long", day: "numeric", month: "long"});
+  renderProblems(problems.problems || []);
+  renderCounts(today);
+  renderNow(today.next_steps || [], today.projects_active || 0);
+  renderDay(today.calendar || []);
+  renderCards(today.cards);
+  renderLoad(stats, dial);
+
+  const total = performance.now() - t0;
+  // The AC is a number, so the number is on the page. `fetched` is the server
+  // half; `total` includes rendering. Both, because only one of them is the
+  // server's fault when it goes wrong.
+  $("#footer").innerHTML =
+    `<span>loaded in ${total.toFixed(0)} ms (${fetched.toFixed(0)} ms waiting on the vault)</span>` +
+    `<span>as of ${esc((today.generated_at || "").slice(11, 16))}</span>` +
+    `<span class="hint">i inbox · s study · d dashboard · w week · r refresh</span>`;
+}
+
+// ---- actions ---------------------------------------------------------------
+document.addEventListener("click", async e => {
+  const start = e.target.closest("[data-start-note]");
+  if (start) {
+    try {
+      await api(`/api/notes/${start.dataset.startNote}/steps/${start.dataset.startStep}/start`, {method: "POST"});
+      toast("Clock started", "Tick it off when you stop and the estimate gets scored.");
+      load();
+    } catch (err) { toast("Could not start it", err.message, "err"); }
+    return;
+  }
+  const done = e.target.closest("[data-done-note]");
+  if (done) {
+    try {
+      await api(`/api/notes/${done.dataset.doneNote}/steps/${done.dataset.doneStep}/toggle`, {method: "POST"});
+      toast("Done", "Next step is whatever the queue says now.");
+      load();
+    } catch (err) { toast("Could not tick it", err.message, "err"); }
+    return;
+  }
+  const hab = e.target.closest("[data-habit-done]");
+  if (hab) {
+    try {
+      const r = await api(`/api/notes/${hab.dataset.habitDone}/habit/done`, {method: "POST"});
+      const m = (r.habit && r.habit.misses) || {};
+      toast("Logged", m.message || "One more.");
+      load();
+    } catch (err) { toast("Could not log it", err.message, "err"); }
+  }
+});
+
+$("#refresh").addEventListener("click", () => load());
+
+document.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (["TEXTAREA", "INPUT", "SELECT"].includes(document.activeElement.tagName)) return;
+  const go = {i: "/inbox", s: "/study", d: "/dashboard", w: "/review"}[e.key];
+  if (go) { e.preventDefault(); location.href = go; }
+  if (e.key === "r") { e.preventDefault(); load(); }
+});
+
+load().catch(e => {
+  toast("Could not read the vault", e.message, "err");
+  $("#nowbody").innerHTML = `<p class="empty">Could not reach the server: ${esc(e.message)}</p>`;
+});
+// Long enough that it is never the reason a click feels slow; short enough
+// that a page left open all morning is not lying by lunchtime.
+setInterval(() => load().catch(() => {}), 120000);
+</script>
+</body>
+</html>
