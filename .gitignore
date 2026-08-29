@@ -24,3 +24,10 @@ Untitled.md
 .sb*.tgz
 .pycache-quarantine/
 .obsidian/workspace.json.stale-backup-*
+
+# secrets and personal one-offs that must never reach the remote
+Code Red/
+*.text
+*.pem
+*.key
+.env
