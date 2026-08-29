@@ -350,6 +350,30 @@ def notify(text: str, error: bool = False) -> None:
 # an event on EVENTS, and poll_events() (running via root.after, on the main
 # thread) is what actually touches widgets.
 
+# -- Tcl/Tk lookup ---------------------------------------------------------
+# `import tkinter` succeeds without the Tcl runtime; it is tk.Tk() that
+# dies, with "Can't find a usable init.tcl". Inside a venv, _tkinter
+# derives its search path from sys.prefix (the venv), which has no tcl/
+# directory, and the paths it then guesses under the base install are
+# lib/tcl8.6 -- while python.org actually ships tcl/tcl8.6. So a perfectly
+# good Tcl sits on disk and is never found. Point at it explicitly, from
+# sys.base_prefix so this holds inside and outside the venv.
+def _fix_tcl_paths() -> None:
+    base = Path(getattr(sys, "base_prefix", sys.prefix))
+    for var, sub in (("TCL_LIBRARY", "tcl8.6"), ("TK_LIBRARY", "tk8.6")):
+        if os.environ.get(var):
+            continue  # respect an explicit override
+        for candidate in (base / "tcl" / sub, base / "lib" / sub):
+            if (candidate / "init.tcl").exists() or (candidate / "tk.tcl").exists():
+                os.environ[var] = str(candidate)
+                log(f"{var}={candidate}")
+                break
+        else:
+            log(f"{var}: no Tcl/Tk library directory found under {base}")
+
+
+_fix_tcl_paths()
+
 import tkinter as tk  # noqa: E402  (after the stdout/stderr redirect above)
 
 _box = {"win": None, "entry": None}
