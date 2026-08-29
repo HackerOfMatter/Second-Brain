@@ -278,11 +278,16 @@ def render_text(payload: Dict[str, Any]) -> str:
         more = f" +{len(cal) - 3} more" if len(cal) > 3 else ""
         parts.append(f"{len(cal)} on the calendar: {times}{more}")
 
+    # The top step is appended last, from whatever budget the fixed-width
+    # facts leave behind. Truncating it to a constant 34 characters while
+    # 240 characters of the segment sat unused produced "Review Claire's
+    # existing notes an… — complete second bra…" on a nearly empty day:
+    # two ellipses and no information. A placeholder holds its position so
+    # the step still reads before the counts.
+    step_slot = None
     if steps:
-        top = steps[0]
-        step_text = _truncate(top["step"].get("text", ""), 34)
-        title = _truncate(top["note_title"], 20)
-        parts.append(f"Top: {step_text} — {title}")
+        step_slot = len(parts)
+        parts.append("")
 
     if cards.get("due_today"):
         parts.append(f"{cards['due_today']} card{'s' if cards['due_today'] != 1 else ''} due")
@@ -299,7 +304,28 @@ def render_text(payload: Dict[str, Any]) -> str:
         # empty sentence.
         return f"{date_label}: nothing urgent."
 
-    msg = f"{date_label}: " + " | ".join(parts)
+    if step_slot is not None:
+        top = steps[0]
+        raw_step = (top["step"].get("text", "") or "").strip()
+        raw_title = (top["note_title"] or "").strip()
+        # Everything else, already decided, plus the separators and prefix.
+        fixed = parts[:step_slot] + parts[step_slot + 1 :]
+        overhead = len(f"{date_label}: ") + sum(len(p) for p in fixed)
+        overhead += 3 * max(len(fixed), 0)          # " | " joins
+        budget = TEXT_CHAR_LIMIT - overhead - len("Top:  — ")
+        if budget < 16:
+            # No room to say anything useful about the step; drop it rather
+            # than emit "Top: R… — c…".
+            parts.pop(step_slot)
+        else:
+            # Give the project title up to a third, the step the remainder.
+            title_budget = max(12, min(len(raw_title), budget // 3))
+            step_budget = budget - title_budget
+            step_text = _truncate(raw_step, step_budget)
+            title = _truncate(raw_title, title_budget)
+            parts[step_slot] = f"Top: {step_text} — {title}"
+
+    msg = f"{date_label}: " + " | ".join(p for p in parts if p)
     if len(msg) > TEXT_CHAR_LIMIT:
         msg = msg[: TEXT_CHAR_LIMIT - 1].rstrip() + "…"
     return msg
