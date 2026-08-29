@@ -1,6 +1,6 @@
 @echo off
 REM Story F1 - installs a Startup-folder shortcut that launches the global
-REM capture hotkey (Ctrl+Alt+Space) at logon, resident and with no console
+REM capture hotkey (Ctrl+Alt+N) at logon, resident and with no console
 REM window, so the capture box is available with no manual step after a
 REM reboot. Idempotent: overwrites the shortcut if run again rather than
 REM creating a duplicate. Mirrors install-autostart.bat's approach.
@@ -32,7 +32,7 @@ if not exist "%STARTUP%" (
   exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%SHORTCUT%'); $s.TargetPath='%PYTHONW%'; $s.Arguments='\"%SCRIPT%\"'; $s.WorkingDirectory='%~dp0'; $s.Description='Second Brain capture hotkey - Ctrl+Alt+Space, resident, no console'; $s.Save()"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%SHORTCUT%'); $s.TargetPath='%PYTHONW%'; $s.Arguments='\"%SCRIPT%\"'; $s.WorkingDirectory='%~dp0'; $s.Description='Second Brain capture hotkey - Ctrl+Alt+N, resident, no console'; $s.Save()"
 
 if errorlevel 1 (
   echo PowerShell failed to create the shortcut.
@@ -54,7 +54,8 @@ echo.
 echo Starting it now, so it is live without a reboot...
 start "" "%PYTHONW%" "%SCRIPT%"
 echo.
-echo Press Ctrl+Alt+Space anywhere to capture. It also survives reboot/logon.
+echo Press Ctrl+Alt+N anywhere to capture. It also survives reboot/logon.
+echo A toast on startup confirms which key it actually got.
 echo Log file (if something looks wrong): %LOCALAPPDATA%\secondbrain\capture-hotkey.log
 echo To undo, run uninstall-capture-hotkey.bat.
 echo.

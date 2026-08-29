@@ -1,6 +1,6 @@
 """Second Brain -- global capture hotkey (Story F1).
 
-Ctrl+Alt+Space, anywhere in Windows, opens a one-line capture box. Enter
+Ctrl+Alt+N, anywhere in Windows, opens a one-line capture box. Enter
 files it; Escape throws it away. This process is the whole point of the
 story: it must be resident (started once, at login) rather than launched
 fresh on every keypress, because a cold Python + tkinter start is commonly
@@ -201,11 +201,55 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 VK_SPACE = 0x20
 WM_HOTKEY = 0x0312
 HOTKEY_ID = 1
 ERROR_ALREADY_EXISTS = 183
+
+_MODS = {
+    "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
+    "alt": MOD_ALT, "shift": MOD_SHIFT,
+    "win": MOD_WIN, "super": MOD_WIN, "meta": MOD_WIN,
+}
+_KEYS = {"space": VK_SPACE, "enter": 0x0D, "return": 0x0D, "tab": 0x09}
+_KEYS.update({f"f{n}": 0x6F + n for n in range(1, 13)})  # F1=0x70 .. F12=0x7B
+
+
+def parse_hotkey(spec):
+    """'ctrl+alt+n' -> (modifier bitmask, virtual-key code), or None.
+
+    Only used for the value in config.yaml; the built-in candidates below
+    are already parsed. Unknown names return None so a typo falls through
+    to the defaults instead of registering something surprising."""
+    mods, vk = 0, None
+    for part in str(spec).lower().replace(" ", "").split("+"):
+        if not part:
+            continue
+        if part in _MODS:
+            mods |= _MODS[part]
+        elif part in _KEYS:
+            vk = _KEYS[part]
+        elif len(part) == 1 and (part.isalpha() or part.isdigit()):
+            vk = ord(part.upper())
+        else:
+            return None
+    return (mods, vk) if (mods and vk) else None
+
+
+# Ctrl+Alt+Space is NOT a candidate: the Claude desktop app registers it
+# globally, wins the race at login, and this process then never sees the
+# key. Candidates are tried in order and the first that registers wins;
+# whichever it is gets logged and shown once at startup, because a capture
+# box on an unknown key is the same as no capture box.
+HOTKEY_CANDIDATES = [
+    ("Ctrl+Alt+N", MOD_CONTROL | MOD_ALT, ord("N")),
+    ("Ctrl+Alt+J", MOD_CONTROL | MOD_ALT, ord("J")),
+    ("Ctrl+Shift+F9", MOD_CONTROL | MOD_SHIFT, 0x78),
+    ("Win+Alt+N", MOD_WIN | MOD_ALT, ord("N")),
+]
 
 user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
 user32.RegisterHotKey.restype = wintypes.BOOL
@@ -228,20 +272,50 @@ def ensure_single_instance() -> bool:
     return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
 
 
+def _candidates():
+    """Config first, then the built-in fallbacks."""
+    out = []
+    try:
+        import yaml  # noqa
+        cfgp = APP_DIR / "config.yaml"
+        if cfgp.exists():
+            raw = yaml.safe_load(cfgp.read_text(encoding="utf-8")) or {}
+            spec = raw.get("capture_hotkey")
+            if spec:
+                parsed = parse_hotkey(spec)
+                if parsed:
+                    out.append((str(spec), parsed[0], parsed[1]))
+                else:
+                    log(f"capture_hotkey {spec!r} in config.yaml is not a hotkey I understand")
+    except Exception as exc:  # config is optional; never let it stop capture
+        log(f"could not read capture_hotkey from config.yaml: {exc}")
+    return out + HOTKEY_CANDIDATES
+
+
 def hotkey_thread() -> None:
-    ok = user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE)
-    if not ok:
-        err = ctypes.get_last_error()
-        log(f"RegisterHotKey FAILED, error={err} (hotkey likely already owned by another app)")
+    chosen = None
+    for label, mods, vk in _candidates():
+        if user32.RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk):
+            chosen = label
+            break
+        log(f"{label} unavailable (error={ctypes.get_last_error()}) — trying the next one")
+
+    if chosen is None:
+        log("RegisterHotKey FAILED for every candidate")
         user32.MessageBoxW(
             None,
-            "Ctrl+Alt+Space is already registered by another application.\n"
-            "Second Brain's capture box will not open on that key.",
+            "Second Brain could not register a capture hotkey — every "
+            "candidate is already owned by another application.\n\n"
+            "Set one explicitly in config.yaml, e.g.\n"
+            "    capture_hotkey: ctrl+alt+k",
             "Second Brain Capture",
             0x30,  # MB_ICONWARNING
         )
         return
-    log("hotkey registered: Ctrl+Alt+Space")
+
+    log(f"hotkey registered: {chosen}")
+    notify(f"Capture ready — press {chosen}")
+
     msg = wintypes.MSG()
     try:
         while True:
