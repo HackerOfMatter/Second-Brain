@@ -73,6 +73,10 @@
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
   /* ---- review ---- */
+  .folders { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .folders button { padding: 4px 10px; font-size: 12.5px; border-radius: 8px; }
+  .folders button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--ink); }
+  .folders .nest { opacity: .45; letter-spacing: 1px; }
   .subjects { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
   .subjects button { padding: 4px 10px; font-size: 12.5px; border-radius: 999px; }
   .subjects button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--ink); }
@@ -89,6 +93,20 @@
   .progressline .bar { flex: 1; margin: 0; }
 
   .grades { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 14px; }
+  /* The confidence tap. Three buttons, not a slider: asking someone for a
+     probability mid-session is a good way to end the session. */
+  .conf { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+  .conf button { padding: 9px 6px; }
+  .conf button.on { border-color: var(--accent); font-weight: 600; }
+  .worked { margin-top: 12px; padding: 11px 13px; border-left: 3px solid var(--accent);
+            background: var(--panel2, rgba(127,127,127,.07)); border-radius: 6px; font-size: 14px; }
+  .worked .lbl { font: 11px var(--mono); text-transform: uppercase; letter-spacing: .05em;
+                 color: var(--muted); display: block; margin-bottom: 5px; }
+  .why-first { margin-top: 12px; }
+  .why-first textarea { width: 100%; font: inherit; padding: 8px; border-radius: 6px; }
+  .verdict { margin-top: 8px; font-size: 14px; }
+  .verdict.sound { color: var(--good); }
+  .verdict.off { color: var(--danger); }
   .grades button { display: flex; flex-direction: column; gap: 2px; align-items: center; padding: 10px 6px; }
   .grades .lbl { font-size: 14px; }
   .grades .iv { font: 11px var(--mono); color: var(--muted); }
@@ -180,6 +198,7 @@
   <div id="tab-review">
     <section id="startpanel">
       <h2>Start a session</h2>
+      <div class="folders" id="folders"></div>
       <div class="subjects" id="subjects"></div>
       <div class="row">
         <button class="primary" id="start">Start reviewing</button>
@@ -229,8 +248,31 @@
         <div id="explain" class="hide"></div>
       </div>
 
+      <!-- Sweller: a scaffold for the first attempts, withdrawn as competence
+           rises. Shown before the reveal, which is the whole point of it. -->
+      <div class="worked hide" id="worked"><span class="lbl" id="workedlbl">Worked example</span><span id="workedtext"></span></div>
+
+      <!-- Koriat & Bjork: the prediction has to be made before the answer is
+           visible, or it is not a prediction. -->
+      <div class="conf hide" id="conf">
+        <button data-conf="sure">Sure<kbd style="margin-left:6px">j</kbd></button>
+        <button data-conf="think-so">Think so<kbd style="margin-left:6px">k</kbd></button>
+        <button data-conf="no-idea">No idea<kbd style="margin-left:6px">l</kbd></button>
+      </div>
+
       <div id="revealrow" class="row" style="margin-top:14px">
         <button class="primary" id="reveal">Show answer<kbd style="margin-left:7px">space</kbd></button>
+      </div>
+
+      <!-- Chi et al.: prompted self-explanation, before the tutor's own. -->
+      <div class="why-first hide" id="whyfirst">
+        <p class="hint" style="margin:0 0 6px">Say why, in one line — before you read the explanation.</p>
+        <textarea id="whysaid" rows="2" placeholder="because…"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button id="whysend">Check my reasoning</button>
+          <button id="whyskip" class="ghost">Skip</button>
+        </div>
+        <div class="verdict hide" id="whyverdict"></div>
       </div>
 
       <div class="grades hide" id="grades">
@@ -378,7 +420,7 @@ function human(days) {
   return (days / 365.25).toFixed(1).replace(".0", "") + "y";
 }
 
-let CATS = {}, STATE = {overview: null, selected: new Set(), openDeck: null};
+let CATS = {}, STATE = {overview: null, selected: new Set(), folders: new Set(), openDeck: null};
 const swatch = key => CATS[key] ? `<span class="swatch" style="background:${esc(CATS[key].hex)}"></span>` : "";
 
 // ------------------------------------------------------------------ tabs
@@ -395,6 +437,7 @@ async function loadOverview() {
   const d = await api("/api/study/overview");
   STATE.overview = d;
   CATS = Object.fromEntries((d.categories || []).map(c => [c.key, c]));
+  renderFolders(d);
   renderSubjects(d);
   renderDecks(d);
   renderNotePicker(d);
@@ -405,11 +448,60 @@ async function loadOverview() {
     `${s.cards.due_today} due · ${s.cards.active} cards · ${s.streak}-day streak`;
 }
 
+// Folder scoping. The server decides what a session contains; this only has
+// to agree with it about which subject chips are still reachable, so the two
+// share one rule: a folder selects itself and everything under it.
+const tidyFolder = f => (f || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").trim();
+
+function inFolders(folder, scopes) {
+  if (!scopes.size) return true;
+  folder = tidyFolder(folder);
+  for (const raw of scopes) {
+    const scope = tidyFolder(raw);
+    if (!scope || folder === scope || folder.startsWith(scope + "/")) return true;
+  }
+  return false;
+}
+
+const studyableDecks = d => d.decks.filter(x => x.active > 0);
+const visibleDecks = d => studyableDecks(d).filter(x => inFolders(x.folder, STATE.folders));
+
+function renderFolders(d) {
+  const el = $("#folders");
+  // One folder is not a choice — don't spend a row of UI saying so.
+  const list = (d.folders || []).filter(f => f.path && f.cards > 0);
+  if (list.length < 2) { el.innerHTML = ""; return; }
+  el.innerHTML =
+    `<button data-folder="" class="${STATE.folders.size ? "" : "on"}">All folders</button>` +
+    list.map(f => `
+      <button data-folder="${esc(f.path)}" title="${esc(f.path)}"
+              class="${STATE.folders.has(f.path) ? "on" : ""}">
+        ${f.depth > 1 ? `<span class="nest">${"› ".repeat(f.depth - 1)}</span>` : ""}${esc(f.label)}
+        <span class="pill" style="margin-left:5px">${f.due}${f.new ? "+" + f.new : ""}</span>
+      </button>`).join("");
+}
+
+$("#folders").addEventListener("click", e => {
+  const b = e.target.closest("button[data-folder]");
+  if (!b) return;
+  const f = b.dataset.folder;
+  if (!f) STATE.folders.clear();
+  else STATE.folders.has(f) ? STATE.folders.delete(f) : STATE.folders.add(f);
+  // A subject picked before the folder narrowed would silently contribute
+  // nothing to the session. Drop the ones that are no longer on screen.
+  const reachable = new Set(visibleDecks(STATE.overview).map(x => x.note_id));
+  for (const id of [...STATE.selected]) if (!reachable.has(id)) STATE.selected.delete(id);
+  renderFolders(STATE.overview);
+  renderSubjects(STATE.overview);
+});
+
 function renderSubjects(d) {
   const el = $("#subjects");
-  const decks = d.decks.filter(x => x.active > 0);
+  const decks = visibleDecks(d);
   if (!decks.length) {
-    el.innerHTML = `<span class="empty">No cards yet — make some under “Decks &amp; cards”.</span>`;
+    el.innerHTML = studyableDecks(d).length
+      ? `<span class="empty">No cards in the selected folder${STATE.folders.size > 1 ? "s" : ""}.</span>`
+      : `<span class="empty">No cards yet — make some under “Decks &amp; cards”.</span>`;
     $("#start").disabled = true;
     $("#availability").textContent = "";
     return;
@@ -422,9 +514,13 @@ function renderSubjects(d) {
     </button>`).join("");
   const due = decks.reduce((a, x) => a + x.due, 0);
   const fresh = decks.reduce((a, x) => a + x.new, 0);
+  const scope = STATE.folders.size
+    ? `${STATE.folders.size} folder(s)`
+    : (STATE.selected.size ? "" : "all subjects");
   $("#availability").textContent =
     `${due} due, ${fresh} new · ${d.today.reviewed} done today` +
-    (STATE.selected.size ? ` · ${STATE.selected.size} subject(s) selected` : " · all subjects");
+    (STATE.selected.size ? ` · ${STATE.selected.size} subject(s) selected` : "") +
+    (scope ? ` · ${scope}` : "");
 }
 
 $("#subjects").addEventListener("click", e => {
@@ -472,7 +568,7 @@ $("#start").addEventListener("click", startSession);
 
 async function startSession() {
   try {
-    const body = {subjects: [...STATE.selected]};
+    const body = {subjects: [...STATE.selected], folders: [...STATE.folders]};
     const d = await api("/api/study/session", {method: "POST", body: JSON.stringify(body)});
     if (!d.queue.length) { toast("Nothing to review", d.message); return; }
     SESSION = {queue: d.queue, i: 0, total: d.queue.length, done: 0, again: 0, started: Date.now()};
@@ -499,7 +595,7 @@ function endSession(silent) {
 
 $("#quit").addEventListener("click", () => endSession(false));
 
-let CARD = null, REVEALED = false, SHOWN_AT = 0;
+let CARD = null, REVEALED = false, SHOWN_AT = 0, CONFIDENCE = null, PENDING_WHY = null;
 
 function showCard() {
   if (!SESSION) return;
@@ -524,6 +620,21 @@ function showCard() {
   $("#markresult").classList.add("hide");
   $("#gradehint").textContent = "";
   $("#typed").value = "";
+  CONFIDENCE = null;
+  $$("#conf button").forEach(b => b.classList.remove("on"));
+  $("#conf").classList.remove("hide");
+  $("#whyfirst").classList.add("hide");
+  $("#whyverdict").classList.add("hide");
+  $("#whysaid").value = "";
+
+  const worked = CARD.worked_example || {};
+  const showWorked = worked.show && worked.show !== "none" && worked.text;
+  $("#worked").classList.toggle("hide", !showWorked);
+  if (showWorked) {
+    $("#workedlbl").textContent =
+      worked.show === "full" ? "Worked example" : "Worked example — the start of it";
+    $("#workedtext").innerHTML = md(worked.text);
+  }
 
   const recall = $("#recallmode").checked;
   $("#typedbox").classList.toggle("hide", !recall);
@@ -546,6 +657,7 @@ async function reveal() {
     $("#ca").classList.remove("hide");
     if (full.source) { $("#cwhy").textContent = full.source; $("#cwhy").classList.remove("hide"); }
     showGrades(full.intervals);
+    $("#conf").classList.add("hide");
     $("#explainrow").classList.remove("hide");
     $("#revealrow").classList.add("hide");
     $("#typedbox").classList.add("hide");
@@ -559,6 +671,17 @@ function showGrades(intervals) {
   $("#iv4").textContent = human(intervals.easy);
   $("#grades").classList.remove("hide");
   $("#gradehint").textContent = "How well did you actually know it? Keys 1–4.";
+}
+
+$("#conf").addEventListener("click", e => {
+  const b = e.target.closest("button[data-conf]");
+  if (b) setConfidence(b.dataset.conf);
+});
+
+function setConfidence(value) {
+  if (REVEALED) return;   // after the reveal it is not a prediction any more
+  CONFIDENCE = value;
+  $$("#conf button").forEach(b => b.classList.toggle("on", b.dataset.conf === value));
 }
 
 $("#reveal").addEventListener("click", reveal);
@@ -608,9 +731,13 @@ async function grade(g) {
         mode: CARD.typed !== undefined ? "recall" : "self",
         typed: CARD.typed || "",
         seconds: (Date.now() - SHOWN_AT) / 1000,
+        confidence: CONFIDENCE,
       }),
     });
     SESSION.done += 1;
+    if (r.overconfident) {
+      toast("You were sure about that one", "It goes to the front of your next session.", "warn");
+    }
     if (r.again) {
       // A forgotten card comes back before the session ends, not tomorrow.
       SESSION.again += 1;
@@ -620,10 +747,59 @@ async function grade(g) {
     if (r.graduation) {
       toast("Looks learned", `${r.graduation.title} — ${Math.round(r.graduation.mastery * 100)}% mastered. Asking at the end.`);
     }
+    // Chi et al.: prompted self-explanation beats spontaneous, and almost
+    // nobody does it spontaneously. Only on Again/Hard, so it does not become
+    // the thing that ends the session.
+    if (r.ask_why) {
+      PENDING_WHY = {note_id: CARD.note_id, card_id: CARD.id};
+      $("#whyfirst").classList.remove("hide");
+      $$("#grades button").forEach(b => b.disabled = false);
+      setTimeout(() => $("#whysaid").focus(), 30);
+      return;
+    }
     SESSION.i += 1;
     showCard();
   } catch (e) { toast("Could not save the answer", e.message, "err"); }
   finally { $$("#grades button").forEach(b => b.disabled = false); }
+}
+
+function nextAfterWhy() {
+  PENDING_WHY = null;
+  $("#whyfirst").classList.add("hide");
+  SESSION.i += 1;
+  showCard();
+}
+
+$("#whyskip").addEventListener("click", nextAfterWhy);
+$("#whysend").addEventListener("click", sendWhy);
+$("#whysaid").addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); sendWhy(); }
+});
+
+async function sendWhy() {
+  if (!PENDING_WHY) return;
+  const said = $("#whysaid").value.trim();
+  if (!said) { nextAfterWhy(); return; }
+  const box = $("#whyverdict");
+  box.className = "verdict";
+  box.textContent = "Reading it…";
+  try {
+    const r = await api(`/api/study/${PENDING_WHY.note_id}/${PENDING_WHY.card_id}/why`,
+      {method: "POST", body: JSON.stringify({said: said})});
+    box.className = "verdict " + (r.verdict || "");
+    box.innerHTML =
+      `<b>${esc(r.verdict === "sound" ? "That holds up" : r.verdict === "partial" ? "Most of the way" : "Not quite")}</b>` +
+      (r.missing ? ` — ${esc(r.missing)}` : "") +
+      (r.followup ? `<div style="margin-top:6px">${md(r.followup)}</div>` : "") +
+      (r.answer ? `<div style="margin-top:8px;opacity:.85">${md(r.answer)}</div>` : "") +
+      `<div class="row" style="margin-top:9px"><button id="whynext" class="primary">Next card</button></div>`;
+    const next = document.getElementById("whynext");
+    if (next) next.addEventListener("click", nextAfterWhy);
+  } catch (e) {
+    box.className = "verdict";
+    box.textContent = "Could not reach the tutor — moving on.";
+    setTimeout(nextAfterWhy, 900);
+  }
 }
 
 $("#explainbtn").addEventListener("click", explainCard);
@@ -644,8 +820,14 @@ async function explainCard() {
 document.addEventListener("keydown", e => {
   const typing = ["TEXTAREA", "INPUT"].includes(document.activeElement.tagName);
   if (!SESSION) return;
+  if (!typing && !REVEALED && ["j", "k", "l"].includes(e.key)) {
+    e.preventDefault();
+    setConfidence({j: "sure", k: "think-so", l: "no-idea"}[e.key]);
+    return;
+  }
   if (e.key === " " && !typing && !REVEALED) { e.preventDefault(); reveal(); return; }
   if (typing) return;
+  if (PENDING_WHY) return;   // the grade keys must not skip past the prompt
   if (["1", "2", "3", "4"].includes(e.key) && REVEALED) { e.preventDefault(); grade(Number(e.key)); }
   if (e.key === "e" && REVEALED) { e.preventDefault(); explainCard(); }
 });
@@ -672,7 +854,7 @@ $("#gen").addEventListener("click", async () => {
     const r = await api(`/api/decks/${id}/generate`, {method: "POST", body: JSON.stringify({})});
     toast(
       r.generated ? `${r.generated} draft cards` : "No cards made",
-      (r.note || `From ${r.passages} passages${r.rejected ? `, ${r.rejected} rejected` : ""}. Review them below.`),
+      (r.note || `From ${r.passages} passages${r.repaired ? `, ${r.repaired} rewritten as cloze` : ""}${r.rejected ? `, ${r.rejected} dropped${Object.keys(r.rejections || {}).length ? ` (${Object.entries(r.rejections).map(([k, v]) => `${v} ${k}`).join(", ")})` : ""}` : ""}. Review them below.`),
       r.generated ? (r.degraded ? "warn" : "") : "warn"
     );
     await loadOverview();

@@ -14,6 +14,7 @@ signatures are shaped so a later swap is mechanical.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import traceback
 from pathlib import Path
@@ -62,6 +63,20 @@ def guard(handler: Callable):
     return wrapper
 
 
+async def body_of(request: Request) -> dict:
+    """Request JSON, or `{}` when there isn't any.
+
+    A POST with no body at all is normal from the UI — "do this thing" needs
+    no arguments — and `request.json()` raises on the empty string, which
+    surfaced as a 400 on a button that was working perfectly.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def build_app(cfg: Config | None = None) -> Starlette:
     cfg = cfg or load()
     engine = Engine(cfg)
@@ -74,7 +89,10 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def health(request: Request):
-        return ok(await run_in_threadpool(engine.health))
+        """`?progress=1` adds the trigger distances — a full vault walk, so
+        it is opt-in and the dashboard footer does not ask for it."""
+        want = request.query_params.get("progress") in ("1", "true", "yes")
+        return ok(await run_in_threadpool(engine.health, want))
 
     @guard
     async def dashboard(request: Request):
@@ -117,10 +135,61 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def toggle_step(request: Request):
+        """Tick or untick. An optional `minutes` records how long it took."""
+        body = await request.json() if await request.body() else {}
         return ok(await run_in_threadpool(
-            engine.toggle_step,
+            lambda: engine.toggle_step(
+                request.path_params["note_id"],
+                request.path_params["step_id"],
+                int(body["minutes"]) if body.get("minutes") is not None else None,
+            )
+        ))
+
+    @guard
+    async def start_step(request: Request):
+        """Start the clock, so the estimate can be scored against reality."""
+        return ok(await run_in_threadpool(
+            engine.start_step,
             request.path_params["note_id"],
             request.path_params["step_id"],
+        ))
+
+    @guard
+    async def estimates(request: Request):
+        return ok(await run_in_threadpool(engine.estimates))
+
+    @guard
+    async def weekly_review(request: Request):
+        days = int(request.query_params.get("days", 7))
+        return ok(await run_in_threadpool(engine.weekly_review, days))
+
+    @guard
+    async def retention_dial(request: Request):
+        return ok(await run_in_threadpool(engine.retention_dial))
+
+    @guard
+    async def atomicity(request: Request):
+        return ok(await run_in_threadpool(engine.atomicity))
+
+    @guard
+    async def thresholds(request: Request):
+        return ok(await run_in_threadpool(engine.thresholds))
+
+    @guard
+    async def fit_weights(request: Request):
+        body = await request.json() if await request.body() else {}
+        return ok(await run_in_threadpool(engine.fit_weights, bool(body.get("write"))))
+
+    @guard
+    async def label_link(request: Request):
+        """A suggested link was right, or it was not. One labelled example."""
+        body = await request.json()
+        return ok(await run_in_threadpool(
+            engine.label_link,
+            request.path_params["note_id"],
+            body.get("target", ""),
+            bool(body.get("kept")),
+            float(body.get("score") or 0.0),
         ))
 
     @guard
@@ -140,12 +209,43 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def habit(request: Request):
+        """Cadence, target, and the fields that actually move the needle.
+
+        Every field is optional: filling in only the cue must not require
+        restating a schedule the caller is not changing.
+        """
         body = await request.json()
         return ok(await run_in_threadpool(
-            engine.set_habit,
+            lambda: engine.set_habit(
+                request.path_params["note_id"],
+                cadence=body.get("cadence"),
+                target_count=(
+                    int(body["target_count"]) if body.get("target_count") is not None else None
+                ),
+                **{k: body.get(k) for k in Engine.HABIT_TEXT_FIELDS},
+            )
+        ))
+
+    @guard
+    async def habit_done(request: Request):
+        """One occurrence, with the time and place that make it measurable."""
+        body = await request.json() if await request.body() else {}
+        return ok(await run_in_threadpool(
+            engine.log_habit,
             request.path_params["note_id"],
-            body.get("cadence", "weekly"),
-            int(body.get("target_count", 3)),
+            body.get("on"),
+            body.get("at", ""),
+            body.get("place", ""),
+        ))
+
+    @guard
+    async def habit_checkin(request: Request):
+        body = await request.json() if await request.body() else {}
+        return ok(await run_in_threadpool(
+            engine.habit_checkin,
+            request.path_params["note_id"],
+            body.get("decision", "continue"),
+            int(body["target_count"]) if body.get("target_count") is not None else None,
         ))
 
     @guard
@@ -174,7 +274,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def review_answer(request: Request):
-        body = await request.json() if request.method == "POST" else {}
+        body = await body_of(request)
         action = str(body.get("action") or "keep").lower()
         note_id = request.path_params["note_id"]
         if action == "snooze":
@@ -203,6 +303,10 @@ def build_app(cfg: Config | None = None) -> Starlette:
     async def study_page(request: Request):
         return FileResponse(WEB_DIR / "study.html")
 
+    async def review_page(request: Request):
+        """Tier 3: one page for the week, rather than three timers."""
+        return FileResponse(WEB_DIR / "review.html")
+
     @guard
     async def study_overview(request: Request):
         return ok(await run_in_threadpool(engine.study_overview))
@@ -213,10 +317,11 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def study_session(request: Request):
-        body = await request.json() if request.method == "POST" else {}
+        body = await body_of(request)
         subjects = body.get("subjects") or None
+        folders = body.get("folders") or None
         limit = int(body["limit"]) if body.get("limit") else None
-        return ok(await run_in_threadpool(engine.study_session, subjects, limit))
+        return ok(await run_in_threadpool(engine.study_session, subjects, limit, folders))
 
     @guard
     async def study_reveal(request: Request):
@@ -237,6 +342,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
                 mode=body.get("mode", "self"),
                 typed=body.get("typed", ""),
                 seconds=float(body.get("seconds") or 0),
+                confidence=body.get("confidence"),
             )
         ))
 
@@ -260,6 +366,17 @@ def build_app(cfg: Config | None = None) -> Starlette:
             body.get("question", ""),
         ))
 
+    @guard
+    async def study_why(request: Request):
+        """lj's own explanation, marked. Nothing scheduled — see engine."""
+        body = await request.json()
+        return ok(await run_in_threadpool(
+            engine.study_self_explain,
+            request.path_params["note_id"],
+            request.path_params["card_id"],
+            body.get("said", ""),
+        ))
+
     # -- the info manager ----------------------------------------------------
 
     @guard
@@ -278,12 +395,12 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def reindex(request: Request):
-        body = await request.json() if request.method == "POST" else {}
+        body = await body_of(request)
         return ok(await run_in_threadpool(engine.reindex, bool(body.get("force"))))
 
     @guard
     async def connect_note(request: Request):
-        body = await request.json() if request.method == "POST" else {}
+        body = await body_of(request)
         return ok(
             await run_in_threadpool(
                 lambda: engine.connect(
@@ -299,7 +416,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
     async def connect_all(request: Request):
         """Deliberately POST-only and never called on a timer: this is the
         'tidy my graph' button, and it costs a model call per note."""
-        body = await request.json() if request.method == "POST" else {}
+        body = await body_of(request)
         return ok(
             await run_in_threadpool(
                 lambda: engine.connect_all(
@@ -319,7 +436,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def generate_cards(request: Request):
-        body = await request.json() if request.method == "POST" else {}
+        body = await body_of(request)
         return ok(await run_in_threadpool(
             lambda: engine.generate_cards(
                 request.path_params["note_id"],
@@ -359,9 +476,23 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def approve_cards(request: Request):
-        body = await request.json() if request.method == "POST" else {}
+        body = await body_of(request)
         return ok(await run_in_threadpool(
             engine.approve_drafts, request.path_params["note_id"], body.get("cards")
+        ))
+
+    @guard
+    async def intake_run(request: Request):
+        body = await body_of(request)
+        return ok(await run_in_threadpool(
+            engine.intake, bool(body.get("dry_run")), body.get("limit")
+        ))
+
+    @guard
+    async def classify(request: Request):
+        body = await body_of(request)
+        return ok(await run_in_threadpool(
+            engine.classify_note, request.path_params["note_id"], body.get("bucket", "")
         ))
 
     @guard
@@ -389,17 +520,31 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/notes", list_notes),
         Route("/api/notes/{note_id}", get_note),
         Route("/api/notes/{note_id}/steps/{step_id}/toggle", toggle_step, methods=["POST"]),
+        Route("/api/notes/{note_id}/steps/{step_id}/start", start_step, methods=["POST"]),
+        Route("/api/estimates", estimates),
+        Route("/api/review/weekly", weekly_review),
+        Route("/api/study/retention", retention_dial),
+        Route("/api/atomicity", atomicity),
+        Route("/api/thresholds", thresholds),
+        Route("/api/study/fit", fit_weights, methods=["GET", "POST"]),
+        Route("/api/notes/{note_id}/label-link", label_link, methods=["POST"]),
         Route("/api/notes/{note_id}/reparse", reparse, methods=["POST"]),
         Route("/api/notes/{note_id}/replan", replan, methods=["POST"]),
         Route("/api/notes/{note_id}/move", move, methods=["POST"]),
         Route("/api/notes/{note_id}/habit", habit, methods=["POST"]),
+        Route("/api/notes/{note_id}/habit/done", habit_done, methods=["POST"]),
+        Route("/api/notes/{note_id}/habit/checkin", habit_checkin, methods=["POST"]),
         Route("/api/notes/{note_id}/schedule", schedule, methods=["POST"]),
         Route("/api/notes/{note_id}/category", category, methods=["POST"]),
         Route("/api/notes/{note_id}/deadline", deadline, methods=["POST"]),
         Route("/api/notes/{note_id}/review", review_answer, methods=["POST"]),
+        Route("/api/notes/{note_id}/classify", classify, methods=["POST"]),
         Route("/api/categories", categories),
+        # -- the Drop folder
+        Route("/api/intake", intake_run, methods=["POST"]),
         # -- tutor
         Route("/study", study_page),
+        Route("/review", review_page),
         Route("/api/study/overview", study_overview),
         Route("/api/study/stats", study_stats),
         Route("/api/study/session", study_session, methods=["GET", "POST"]),
@@ -407,6 +552,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/study/{note_id}/{card_id}/mark", study_mark, methods=["POST"]),
         Route("/api/study/{note_id}/{card_id}/answer", study_answer, methods=["POST"]),
         Route("/api/study/{note_id}/{card_id}/explain", study_explain, methods=["POST"]),
+        Route("/api/study/{note_id}/{card_id}/why", study_why, methods=["POST"]),
         Route("/api/ask", ask, methods=["POST"]),
         Route("/api/index", index_status),
         Route("/api/index/rebuild", reindex, methods=["POST"]),
@@ -422,7 +568,58 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static"),
     ]
 
-    app = Starlette(routes=routes)
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        # `lifespan` rather than the older `on_startup` list: Starlette 1.0
+        # dropped that argument, and lifespan works on every version either
+        # machine is likely to have.
+        start_drop_watcher(engine)
+        yield
+
+    app = Starlette(routes=routes, lifespan=lifespan)
     app.state.engine = engine
     app.state.config = cfg
     return app
+
+
+def start_drop_watcher(engine: Engine) -> None:
+    """Poll the Drop folder while the app is running.
+
+    Dropping a file should be the whole interaction — a folder you have to
+    remember to press a button about is a folder that fills up. The button
+    stays for "do it now", and this is the same call on a timer.
+
+    Polling rather than filesystem events on purpose: the vault sits in
+    OneDrive, where a synced file arrives as a rename of a temp file and fires
+    events that do not correspond to a finished file. `intake.candidates`
+    already waits for a file to hold still, which makes a 20-second poll both
+    simpler and more correct than reacting to every event.
+
+    Daemon thread, so closing the app closes it; and it never raises into the
+    server — a folder that cannot be read is a log line, not a dead process.
+    """
+    cfg = engine.cfg
+    if not cfg.intake.watch or getattr(engine, "_watching", False):
+        return
+    engine._watching = True
+
+    import threading
+    import time
+
+    def loop() -> None:
+        while True:
+            time.sleep(max(5.0, float(cfg.intake.poll_seconds)))
+            try:
+                result = engine.intake()
+                if result.get("filed") or result.get("asking"):
+                    engine.vault.log_line(
+                        "intake",
+                        f"watch: {result['filed']} filed, {result['asking']} asked",
+                    )
+            except Exception as exc:  # never take the server down with it
+                try:
+                    engine.vault.log_line("intake", f"watch failed: {exc!r}")
+                except Exception:
+                    pass
+
+    threading.Thread(target=loop, name="drop-watcher", daemon=True).start()

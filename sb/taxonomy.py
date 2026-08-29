@@ -23,8 +23,10 @@ reads as a bug.
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -225,6 +227,29 @@ FALLBACK = "general"
 # --------------------------------------------------------------------------
 
 
+def _overrides(cfg) -> Dict[str, Dict[str, Any]]:
+    if cfg is None:
+        return {}
+    return dict(getattr(getattr(cfg, "calendar", None), "categories", {}) or {})
+
+
+def _token(overrides: Dict[str, Dict[str, Any]]) -> str:
+    """A hashable stand-in for one config's category overrides.
+
+    The table is rebuilt from `BUILTIN` on every call to `table()`, `index()`,
+    `get()` and `detect()` — pydantic `model_dump` plus a sort, for a result
+    that only changes when config does. This token keys the cache. Config is
+    read once at start-up and never mutated, so the cache is unbounded but
+    holds one entry in practice.
+    """
+    if not overrides:
+        return ""
+    try:
+        return json.dumps(overrides, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(sorted(overrides.items(), key=lambda kv: kv[0]))
+
+
 def table(cfg=None) -> List[Category]:
     """The built-in categories with `calendar.categories` folded in.
 
@@ -233,11 +258,30 @@ def table(cfg=None) -> List[Category]:
     for an unknown key defines a new category, and must supply enough to be
     drawable (emoji, color, hex, google_color_id all have defaults, so in
     practice `keywords` alone is enough).
-    """
-    overrides: Dict[str, Dict[str, Any]] = {}
-    if cfg is not None:
-        overrides = dict(getattr(getattr(cfg, "calendar", None), "categories", {}) or {})
 
+    Returns a fresh list so a caller can sort or filter it, over cached
+    `Category` objects, which are treated as immutable everywhere they are used.
+    """
+    return list(_table(_register(cfg)))
+
+
+def _register(cfg) -> str:
+    """Token for this config's overrides, remembering them so every cache
+    below can be keyed on the token alone."""
+    ov = _overrides(cfg)
+    token = _token(ov)
+    _BY_TOKEN.setdefault(token, ov)
+    return token
+
+
+def _table(token: str) -> List[Category]:
+    cached = _TABLE_CACHE.get(token)
+    if cached is None:
+        cached = _TABLE_CACHE[token] = _build_table(_BY_TOKEN.get(token, {}))
+    return cached
+
+
+def _build_table(overrides: Dict[str, Dict[str, Any]]) -> List[Category]:
     out: List[Category] = []
     seen = set()
     for base in BUILTIN:
@@ -278,12 +322,19 @@ def table(cfg=None) -> List[Category]:
 
 
 def index(cfg=None) -> Dict[str, Category]:
-    return {c.key: c for c in table(cfg)}
+    return dict(_index(_register(cfg)))
+
+
+def _index(token: str) -> Dict[str, Category]:
+    cached = _INDEX_CACHE.get(token)
+    if cached is None:
+        cached = _INDEX_CACHE[token] = {c.key: c for c in _table(token)}
+    return cached
 
 
 def get(key: Optional[str], cfg=None) -> Category:
     """Look up a category, falling back to `general` for unknown keys."""
-    idx = index(cfg)
+    idx = _index(_register(cfg))
     if key and key in idx:
         return idx[key]
     return idx.get(FALLBACK, BUILTIN[-1])
@@ -296,13 +347,30 @@ def get(key: Optional[str], cfg=None) -> Category:
 _WORD = re.compile(r"[a-z0-9]+")
 
 
+#: Characters that may stand between the words of a keyword. ":" is here for
+#: "1:1"; "." deliberately is not, or "…in the lab. Report your findings" would
+#: match the keyword "lab report" across a sentence boundary.
+_SEP = r"[\s\-_/:]"
+
+
 def _pattern(keyword: str) -> re.Pattern:
     """Word-boundary match, tolerant of the separators a keyword might appear
-    with: 'problem set' matches 'problem-set' and 'problem  set'."""
+    with: 'problem set' matches 'problem-set' and 'problem  set'.
+
+    Two *numbers* are the exception: the separator is required between them.
+    Allowing zero meant the keyword "1:1" never matched an actual "1:1" (":"
+    was not a separator) while matching every bare "11" — so any note whose
+    rendered body carried a due date ending in 11 was silently filed as work
+    and painted with the work colour on the calendar. "problemset" is a real
+    spelling of "problem set"; "11" is not a spelling of "1:1".
+    """
     parts = _WORD.findall(keyword.lower())
     if not parts:
         return re.compile(r"(?!)")
-    body = r"[\s\-_/]*".join(re.escape(p) for p in parts)
+    body = re.escape(parts[0])
+    for prev, part in zip(parts, parts[1:]):
+        numeric = prev[-1].isdigit() and part[0].isdigit()
+        body += _SEP + ("+" if numeric else "*") + re.escape(part)
     return re.compile(rf"(?<![a-z0-9]){body}(?![a-z0-9])", re.IGNORECASE)
 
 
@@ -316,18 +384,111 @@ def _match(keyword: str, text: str) -> bool:
     return bool(pat.search(text))
 
 
+# --------------------------------------------------------------------------
+# the scan
+# --------------------------------------------------------------------------
+#
+# Scoring used to run one regex per (keyword, scope): 11 categories x ~218
+# keywords x 3 scopes is ~650 `re.search` calls per note, a third of them over
+# 4,000 characters of body. One dashboard render categorises ~470 notes, so a
+# 700-note vault spent 1.5 million regex scans — 97% of the render — deciding
+# what colour things are.
+#
+# The observation that removes almost all of it: `_pattern` is a word-boundary
+# match, and 194 of the 218 keywords are a single word. For those, "does this
+# keyword match?" is exactly "is this word one of the text's words?", because
+# `_WORD` splits on the same character class the pattern's lookarounds guard.
+# So each scope is tokenised once into a set, shared by every category, and a
+# single-word keyword becomes one set lookup.
+#
+# Only multi-word keywords ("problem set", "lab write-up") still need a regex,
+# because the separator is optional and "problemset" has to match too. A
+# two-word keyword gets an exact prefilter first — the regex can only match if
+# both words are present as words, or the two fused into one — which skips the
+# scan for all but the handful of notes that could actually match. Three-word
+# keywords can fuse partially, so they are left to the regex.
+#
+# Same inputs, same score, same winner; the regex is still what decides every
+# multi-word match.
+
+
+class _Scan:
+    """One category's keywords, split by how cheaply they can be tested."""
+
+    __slots__ = ("key", "key_word", "key_pat", "singles", "pairs", "long")
+
+    def __init__(self, cat: Category):
+        self.key = cat.key
+        # A category key is normally one word, so it is a set lookup too; a
+        # config-defined key like "deep_work" is two, and needs the regex.
+        key_parts = _WORD.findall((cat.key or "").lower())
+        self.key_word = key_parts[0] if len(key_parts) == 1 else ""
+        self.key_pat = _pattern(cat.key) if len(key_parts) > 1 else None
+        singles: List[str] = []
+        pairs: List[Tuple[str, str, str, re.Pattern]] = []
+        long: List[re.Pattern] = []
+        for kw in cat.keywords:
+            parts = _WORD.findall(kw.lower())
+            if len(parts) == 1:
+                singles.append(parts[0])
+            elif len(parts) == 2:
+                pairs.append((parts[0], parts[1], parts[0] + parts[1], _pattern(kw)))
+            elif parts:
+                long.append(_pattern(kw))
+            # a keyword with no word characters matches nothing, as before
+        self.singles = tuple(singles)   # tuple, not set: duplicates still count twice
+        self.pairs = tuple(pairs)
+        self.long = tuple(long)
+
+    def key_score(self, tag_text: str, tag_words: frozenset) -> int:
+        """W_TAG if a tag names this category outright."""
+        if self.key_word:
+            return W_TAG if self.key_word in tag_words else 0
+        if self.key_pat is not None and self.key_pat.search(tag_text):
+            return W_TAG
+        return 0
+
+    def hits(self, text: str, words: frozenset) -> int:
+        """How many of this category's keywords occur in `text`."""
+        n = 0
+        for w in self.singles:
+            if w in words:
+                n += 1
+        for a, b, fused, pat in self.pairs:
+            # Necessary condition for `a[sep]*b` to match: either both words
+            # stand alone, or they are written as one word.
+            if (a in words and b in words) or fused in words:
+                if pat.search(text):
+                    n += 1
+        for pat in self.long:
+            if pat.search(text):
+                n += 1
+        return n
+
+
+def _scans(token: str) -> List[_Scan]:
+    cached = _SCAN_CACHE.get(token)
+    if cached is None:
+        cached = _SCAN_CACHE[token] = [
+            _Scan(c) for c in _table(token) if c.key != FALLBACK
+        ]
+    return cached
+
+
+_BY_TOKEN: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_TABLE_CACHE: Dict[str, List[Category]] = {}
+_INDEX_CACHE: Dict[str, Dict[str, Category]] = {}
+_SCAN_CACHE: Dict[str, List[_Scan]] = {}
+
+
 def score(cat: Category, tags: Iterable[str], title: str, body: str) -> int:
+    """Kept for callers and tests that score one category directly."""
     tag_text = " ".join(str(t) for t in tags).lower()
-    total = 0
-    if cat.key and _match(cat.key, tag_text):
-        total += W_TAG
-    for kw in cat.keywords:
-        if _match(kw, tag_text):
-            total += W_TAG
-        if _match(kw, title):
-            total += W_TITLE
-        if _match(kw, body):
-            total += W_BODY
+    scan = _Scan(cat)
+    total = W_TAG if cat.key and _match(cat.key, tag_text) else 0
+    total += W_TAG * scan.hits(tag_text, frozenset(_WORD.findall(tag_text)))
+    total += W_TITLE * scan.hits(title, frozenset(_WORD.findall(title.lower())))
+    total += W_BODY * scan.hits(body, frozenset(_WORD.findall(body.lower())))
     return total
 
 
@@ -338,16 +499,33 @@ def detect(
     cfg=None,
 ) -> str:
     """Best-scoring category key for a piece of text, or `general`."""
-    tags = list(tags or [])
-    title = title or ""
-    body = (body or "")[:4000]  # a long note should not outvote its own title
+    return _detect(
+        title or "",
+        (body or "")[:4000],  # a long note should not outvote its own title
+        tuple(str(t) for t in (tags or [])),
+        _register(cfg),
+    )
+
+
+# One render categorises the same note from four different code paths — the
+# dashboard, the calendar tasks, the pending-dates queue and the archive list.
+# Memoising on the text makes the second through fourth free.
+@lru_cache(maxsize=4096)
+def _detect(title: str, body: str, tags: tuple, token: str) -> str:
+    tag_text = " ".join(tags).lower()
+    # Tokenise each scope once for all categories instead of once per keyword.
+    tag_words = frozenset(_WORD.findall(tag_text))
+    title_words = frozenset(_WORD.findall(title.lower()))
+    body_words = frozenset(_WORD.findall(body.lower()))
+
     best_key, best_score = FALLBACK, 0
-    for cat in table(cfg):
-        if cat.key == FALLBACK:
-            continue
-        s = score(cat, tags, title, body)
+    for scan in _scans(token):
+        s = scan.key_score(tag_text, tag_words)
+        s += W_TAG * scan.hits(tag_text, tag_words)
+        s += W_TITLE * scan.hits(title, title_words)
+        s += W_BODY * scan.hits(body, body_words)
         if s > best_score:
-            best_key, best_score = cat.key, s
+            best_key, best_score = scan.key, s
     return best_key
 
 
@@ -355,14 +533,15 @@ def categorize(note, cfg=None) -> str:
     """The category of a note: the frontmatter override if it names a real
     category, otherwise detection. Detection never overwrites the stored value
     — a manual correction has to stick."""
+    token = _register(cfg)
     manual = getattr(note, "category", None)
-    if manual and manual in index(cfg):
+    if manual and manual in _index(token):
         return manual
-    return detect(
-        title=getattr(note, "title", "") or "",
-        body=getattr(note, "body", "") or "",
-        tags=getattr(note, "tags", None) or [],
-        cfg=cfg,
+    return _detect(
+        getattr(note, "title", "") or "",
+        (getattr(note, "body", "") or "")[:4000],
+        tuple(str(t) for t in (getattr(note, "tags", None) or [])),
+        token,
     )
 
 

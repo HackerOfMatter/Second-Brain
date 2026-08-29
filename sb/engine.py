@@ -10,15 +10,25 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import (
     ask as askmod,
+    calibration,
     connect as connectmod,
     extract,
+    fit as fitmod,
+    forecasting,
     generate,
+    habits as habitsmod,
+    intake as intakemod,
+    lint,
     parser,
+    quality,
+    retention,
+    threshold,
     taxonomy,
     tutor,
     workflow,
@@ -31,6 +41,7 @@ from .models import (
     AreaSchedule,
     Bucket,
     Cadence,
+    HabitEvent,
     HabitMeta,
     Material,
     MaterialKind,
@@ -39,6 +50,8 @@ from .models import (
     ReviewMeta,
     SrsState,
 )
+from .models import now as _now
+from .labels import LabelStore
 from .vault import Vault
 
 
@@ -49,6 +62,16 @@ class Engine:
         self.vault.ensure_structure()
         self.decks = DeckStore(cfg.vault)
         self.index = Index(cfg)
+        # Labelled examples, in `_labels/` rather than `_system/`, because
+        # unlike a cache nothing here can be regenerated. See sb/labels.py.
+        self.labels = LabelStore(cfg.vault)
+        #: The folder watcher and the dashboard button call `intake()` on
+        #: different threads, and both start by listing the same folder. Two
+        #: runs overlapping would read one dropped file twice and file it as
+        #: two notes, so the second caller is told the first is already on it
+        #: rather than made to wait for a duplicate.
+        self._intake_lock = threading.Lock()
+        self.ensure_drop_folder()
 
     # -- capture ------------------------------------------------------------
 
@@ -71,6 +94,30 @@ class Engine:
         # One read, reused by the planner and the calendar sync below.
         snapshot = self._snapshot()
 
+        info = self._apply_bucket(note, target, snapshot, due=due)
+
+        path = self.vault.write(note)
+        self.vault.log_line("capture", f"{note.bucket.value}  {note.id}  {note.title}")
+        self._sync_calendar_quiet(self._replacing(snapshot, note))
+        return {"note": _note_dict(note), "path": str(path), **info}
+
+    def _apply_bucket(
+        self,
+        note: Note,
+        target: Bucket,
+        snapshot: List[Note],
+        due: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Everything that happens to a note *because* of which bucket it is
+        in: parse and plan a Project, give an Area a habit and a block, put a
+        Resource on the review cycle.
+
+        Three entry points now reach a bucket — the capture buttons (§2), the
+        Drop folder, and confirming an Inbox suggestion — and a note filed by
+        any of them must come out identical. That is only true if there is one
+        copy of this, which is why it left `capture()`.
+        """
+        note.bucket = target
         info: Dict[str, Any] = {}
         if target == Bucket.PROJECT:
             result = parser.apply_to_note(note, self.cfg)
@@ -79,6 +126,7 @@ class Engine:
                 "degraded": result.degraded,
                 "note": result.note,
             }
+            info["forecast"] = self._apply_outside_view(note, snapshot)
             picked = _as_date(due)
             if picked and note.project:
                 note.project.deadline = picked
@@ -99,23 +147,267 @@ class Engine:
         elif target == Bucket.AREA:
             # An Area has no end, so it gets no deadline and no task — it gets
             # a recurring block of real time, editable at the weekly review.
-            note.habit = HabitMeta()
-            note.schedule = AreaSchedule(
+            note.habit = note.habit or HabitMeta()
+            note.schedule = note.schedule or AreaSchedule(
                 time=self.cfg.areas.default_time,
                 duration_minutes=self.cfg.areas.default_duration_minutes,
             )
             note.body = _area_body(note, self.cfg)
         elif target == Bucket.RESOURCE:
-            note.review = ReviewMeta(
+            note.review = note.review or ReviewMeta(
                 cycle_days=self.cfg.review.resource_cycle_days,
                 next=dt.date.today()
                 + dt.timedelta(days=self.cfg.review.resource_cycle_days),
             )
+        # Last, because it appends to the body the branches above just built.
+        info["links"] = self._link_on_write(note, snapshot)
+        return info
 
-        path = self.vault.write(note)
-        self.vault.log_line("capture", f"{note.bucket.value}  {note.id}  {note.title}")
+    def _link_on_write(self, note: Note, snapshot: List[Note]) -> Dict[str, Any]:
+        """Roadmap Tier 1.1 — connect the note while it is being written.
+
+        `connect.py` used to be the only way a note got a `## Related`
+        section, which meant every note was born unlinked and stayed that way
+        until someone pressed a button. The free tiers need one thing:
+        everything else's titles. `snapshot` is already that, read once by the
+        caller — so this adds no file read, no model call and no network.
+
+        Passing `index=None` and `allow_model=False` is the whole safety
+        argument: `connect_note` skips its embedding and model tiers
+        structurally rather than by a flag someone can flip, so a capture can
+        never block on Ollama or on an index that does not contain this note
+        yet. The periodic pass (`connect_all`) still visits the note — this
+        does not write the fingerprint that would gate it out — and adds what
+        the index finds later.
+
+        Failure here is never allowed to lose the capture: a note that is
+        filed but unlinked is a note; an exception on the write path is a lost
+        thought.
+        """
+        blank = {"linked": 0, "titles": []}
+        if not self.cfg.connect.link_on_write:
+            return blank
+        if note.bucket not in connectmod.CONNECTABLE:
+            return blank
+        others = [n for n in connectmod.connectable(snapshot) if n.id != note.id]
+        if not others:
+            return blank
+        try:
+            result = connectmod.connect_note(
+                note,
+                None,                      # no index: the free tiers only
+                self.cfg,
+                others=others,
+                max_links=self.cfg.connect.max_links_on_write,
+                write=True,
+                allow_model=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            self.vault.log_line("connect", f"link-on-write failed  {note.id}  {exc!r}")
+            return dict(blank, error=type(exc).__name__)
+        return {"linked": len(result.links), "titles": [l.title for l in result.links]}
+
+    # -- the Drop folder (sb/intake.py) --------------------------------------
+
+    def intake(self, dry_run: bool = False, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Read everything in Drop/, classify it, and file what it is sure of.
+
+        One vault read for the whole run rather than one per file: the planner
+        needs to know what time is already committed, and re-walking the vault
+        for every dropped note would turn a folder of twenty into twenty
+        whole-vault scans. `_replacing` keeps the snapshot current as notes are
+        added, so the second file of a run schedules around the first.
+        """
+        if not self._intake_lock.acquire(blocking=False):
+            return {
+                "scanned": 0, "waiting": 0, "filed": 0, "asking": 0,
+                "unreadable": 0, "model_calls": 0, "dry_run": dry_run,
+                "busy": True, "folder": str(self.cfg.drop_dir), "results": [],
+            }
+        try:
+            return self._intake(dry_run, limit)
+        finally:
+            self._intake_lock.release()
+
+    def _intake(self, dry_run: bool, limit: Optional[int]) -> Dict[str, Any]:
+        drop = self.cfg.drop_dir
+        self.ensure_drop_folder()
+        found = intakemod.candidates(drop, self.cfg.intake.settle_seconds)
+        cap = limit if limit is not None else self.cfg.intake.max_per_run
+        pending = found[: max(0, int(cap))]
+
+        snapshot = self._snapshot()
+        results: List[Dict[str, Any]] = []
+        filed = held = failed = model_calls = 0
+
+        for path in pending:
+            dropped = intakemod.read_file(path)
+            if not dropped.ok:
+                failed += 1
+                reason = dropped.error or "the file had no text in it"
+                if not dry_run:
+                    intakemod.file_away(path, drop, intakemod.PROBLEM_DIR)
+                self.vault.log_line("intake", f"unreadable  {path.name}  {reason}")
+                results.append(
+                    {"file": path.name, "status": "unreadable", "error": reason}
+                )
+                continue
+
+            verdict = intakemod.classify(
+                dropped.text,
+                dropped.title,
+                self.cfg,
+                use_model=self.cfg.intake.use_model,
+            )
+            model_calls += verdict.model_calls
+            auto = verdict.confidence >= self.cfg.intake.auto_floor
+
+            if dry_run:
+                results.append(
+                    {
+                        **verdict.as_dict(),
+                        "file": path.name,
+                        "title": dropped.title,
+                        "bucket": verdict.bucket if auto else "inbox",
+                        "status": "would file" if auto else "would ask",
+                    }
+                )
+                continue
+
+            note = Note.capture(
+                dropped.text,
+                Bucket(verdict.bucket) if auto else Bucket.INBOX,
+                title=dropped.title,
+            )
+            info: Dict[str, Any] = {}
+            if auto:
+                info = self._apply_bucket(note, Bucket(verdict.bucket), snapshot)
+            intakemod.stamp_note(note, dropped, verdict, filed=auto)
+
+            written = self.vault.write(note)
+            snapshot = self._replacing(snapshot, note)
+            intakemod.file_away(path, drop, intakemod.FILED_DIR)
+            self.vault.log_line(
+                "intake",
+                f"{path.name}  ->  {note.bucket.value}  "
+                f"{verdict.confidence:.2f} {verdict.decided_by}  {note.id}",
+            )
+            filed, held = (filed + 1, held) if auto else (filed, held + 1)
+            results.append(
+                {
+                    **verdict.as_dict(),
+                    "file": path.name,
+                    "note_id": note.id,
+                    "title": note.title,
+                    # Where it actually went, which is `inbox` for anything
+                    # held back — `suggested` still says what was proposed.
+                    "bucket": note.bucket.value,
+                    "status": "filed" if auto else "asking",
+                    "path": str(written),
+                    "category": taxonomy.categorize(note, self.cfg),
+                    "degraded": bool(info.get("parser", {}).get("degraded")),
+                }
+            )
+
+        if filed and not dry_run:
+            self._sync_calendar_quiet(snapshot)
+        return {
+            "scanned": len(pending),
+            "waiting": max(0, len(found) - len(pending)),
+            "filed": filed,
+            "asking": held,
+            "unreadable": failed,
+            "model_calls": model_calls,
+            "dry_run": dry_run,
+            "folder": str(drop),
+            "results": results,
+        }
+
+    def ensure_drop_folder(self) -> Path:
+        """Create Drop/ (and its two subfolders) with the note explaining it.
+
+        Called on startup as well as before every run: a folder lj is meant to
+        drop files into has to exist before they think to look for it, and a
+        folder they deleted by accident should come back rather than turning
+        the feature off silently.
+        """
+        drop = self.cfg.drop_dir
+        for sub in ("", intakemod.FILED_DIR, intakemod.PROBLEM_DIR):
+            (drop / sub if sub else drop).mkdir(parents=True, exist_ok=True)
+        readme = drop / "README.md"
+        if not readme.exists():
+            readme.write_text(intakemod.README, encoding="utf-8")
+        return drop
+
+    def classify_note(self, note_id: str, bucket: str) -> Dict[str, Any]:
+        """Answer the Inbox's question: this one is an Area/Project/Resource.
+
+        The note gets the full bucket treatment now rather than just a move,
+        which is the difference between this and `move()`: a dropped note that
+        waited in the Inbox and is then confirmed as a Project must end up
+        parsed, planned and on the calendar exactly as if it had been filed
+        automatically. `move()` deliberately does none of that — it is for a
+        note that already has its metadata and is changing shelves.
+        """
+        note = self.note(note_id)
+        target = Bucket(bucket)
+        if target not in (Bucket.AREA, Bucket.PROJECT, Bucket.RESOURCE):
+            raise ValueError(f"cannot file a note as {bucket!r}")
+        snapshot = self._snapshot()
+        info = self._apply_bucket(note, target, snapshot)
+        if note.intake:
+            # This click is a labelled example: the rules scored the note at
+            # `confidence` and suggested a bucket, and lj has just said what
+            # the answer actually was. Sixty of these turn AUTO_FLOOR from a
+            # preference into a parameter (roadmap 1.2, and Manning et al.
+            # ch.8). Recorded before the fields below are overwritten.
+            try:
+                self.labels.record_intake(
+                    note.id,
+                    suggested=note.intake.suggested,
+                    chosen=target.value,
+                    confidence=note.intake.confidence,
+                    decided_by=note.intake.decided_by,
+                )
+            except OSError as exc:
+                self.vault.log_line("intake", f"label not recorded: {exc}")
+            note.intake.filed_automatically = False
+            note.intake.decided_by = "manual"
+            note.intake.suggested = target.value
+            note.intake.confidence = 1.0
+        note.log("classified", f"-> {target.value} (confirmed)")
+        path = self.vault.save(note)
         self._sync_calendar_quiet(self._replacing(snapshot, note))
         return {"note": _note_dict(note), "path": str(path), **info}
+
+    def _inbox(self, all_notes: List[Note]) -> List[Dict[str, Any]]:
+        """What the Drop folder could not call, waiting for one click.
+
+        Everything in the Inbox appears here, not only dropped files — an
+        Inbox with something in it is a question either way, and the blueprint
+        says it should stay near-empty.
+        """
+        items = [n for n in all_notes if n.bucket == Bucket.INBOX]
+        items.sort(key=lambda n: n.created, reverse=True)
+        out: List[Dict[str, Any]] = []
+        for note in items[:25]:
+            meta = note.intake
+            out.append(
+                {
+                    "note_id": note.id,
+                    "title": note.title,
+                    "created": note.created,
+                    "category": taxonomy.categorize(note, self.cfg),
+                    "excerpt": _excerpt(note.body),
+                    "file": meta.file if meta else "",
+                    "suggested": meta.suggested if meta else "",
+                    "confidence": round(meta.confidence, 2) if meta else 0.0,
+                    "reason": meta.reason if meta else "",
+                    "signals": list(meta.signals) if meta else [],
+                    "decided_by": meta.decided_by if meta else "",
+                }
+            )
+        return out
 
     # -- read ---------------------------------------------------------------
 
@@ -163,6 +455,7 @@ class Engine:
             ],
             "areas": [self._area_dict(n) for n in areas],
             "next_actions": [a.as_dict for a in workflow.next_actions(active)],
+            "inbox": self._inbox(all_notes),
             "pending_dates": self._pending_dates(active),
             "reviews": self._reviews_due(all_notes),
             "archive": self._archived(all_notes),
@@ -171,6 +464,188 @@ class Engine:
             "study": self._study_summary(all_notes),
             "vault": str(self.cfg.vault),
         }
+
+    # -- the weekly review (roadmap Tier 3) ---------------------------------
+
+    def weekly_review(self, days: int = 7) -> Dict[str, Any]:
+        """One page that closes the week and opens the next.
+
+        The system already had three separate prompts — the habit check-in,
+        the Resource review, the "ready to graduate?" question — each firing
+        on its own timer, each answerable in isolation, and none of them ever
+        asking *how the week went*. David Allen's argument for the weekly
+        review is that it is the load-bearing habit of the entire method: not
+        because reviewing is valuable in itself, but because without one place
+        where everything outstanding is looked at together, trust in the system
+        decays and you go back to keeping it in your head.
+
+        Barry Zimmerman's self-regulated-learning cycle gives the shape:
+        forethought → performance → **self-reflection**, and the reflection
+        phase is the one that feeds the next forethought. So the page is three
+        columns and they are in that order: what closed, what slipped, what is
+        next. Not three lists of things to click.
+
+        Read-only. A review that changes things while you are reading it is a
+        review you cannot trust, and every item here already has its own
+        endpoint to act through.
+        """
+        since = dt.date.today() - dt.timedelta(days=max(1, int(days)))
+        notes = self.notes()
+        decks = self.decks.all()
+        reviews = list(self.decks.reviews(since=since))
+
+        return {
+            "since": since.isoformat(),
+            "days": days,
+            "closed": self._week_closed(notes, decks, reviews, since),
+            "slipped": self._week_slipped(notes, since),
+            "next": self._week_next(notes, decks),
+            # The reflection half: how good the estimates were, and how well
+            # lj knew what they knew. Both are week-scale questions that no
+            # single prompt was ever going to ask.
+            "estimates": forecasting.summary(notes),
+            "calibration": calibration.curve(self.decks.reviews()).as_dict(),
+            "atomicity": lint.check(notes).as_dict(),
+        }
+
+    def _week_closed(
+        self, notes: List[Note], decks: List, reviews: List[Dict[str, Any]], since: dt.date
+    ) -> Dict[str, Any]:
+        steps = []
+        for note in notes:
+            if not note.project:
+                continue
+            for step in note.project.steps:
+                if step.done and step.done_at and step.done_at.date() >= since:
+                    steps.append({
+                        "note_id": note.id,
+                        "title": note.title,
+                        "step": step.text,
+                        "estimated": step.minutes,
+                        "actual": step.actual_minutes,
+                        "on": step.done_at.date().isoformat(),
+                    })
+        finished = [
+            {"note_id": n.id, "title": n.title}
+            for n in notes
+            if n.project
+            and n.project.status == ProjectStatus.DONE
+            and any(h.event == "completed" and h.at.date() >= since for h in n.history)
+        ]
+        habits = []
+        for note in notes:
+            if note.bucket != Bucket.AREA or not note.habit:
+                continue
+            hits = [e for e in note.habit.log if e.on >= since]
+            if hits:
+                habits.append({
+                    "note_id": note.id, "title": note.title,
+                    "times": len(hits), "target": note.habit.target_count,
+                })
+        return {
+            "steps": steps,
+            "projects": finished,
+            "habits": habits,
+            "reviews": len(reviews),
+            "cards_learned": sum(1 for r in reviews if (r.get("before") or {}).get("reps") == 0),
+            "minutes_studied": round(sum(float(r.get("seconds") or 0) for r in reviews) / 60.0),
+        }
+
+    def _week_slipped(self, notes: List[Note], since: dt.date) -> Dict[str, Any]:
+        today = dt.date.today()
+        overdue_steps = []
+        overdue_projects = []
+        for note in notes:
+            project = note.project
+            if not project or project.status == ProjectStatus.DONE:
+                continue
+            if project.deadline and project.deadline < today:
+                overdue_projects.append({
+                    "note_id": note.id, "title": note.title,
+                    "deadline": project.deadline.isoformat(),
+                    "days": (today - project.deadline).days,
+                    "progress": round(project.progress, 2),
+                })
+            for step in project.steps:
+                if step.done or not step.scheduled:
+                    continue
+                if step.scheduled.date() < today:
+                    overdue_steps.append({
+                        "note_id": note.id, "title": note.title, "step": step.text,
+                        "was": step.scheduled.date().isoformat(),
+                        "days": (today - step.scheduled.date()).days,
+                    })
+        overdue_steps.sort(key=lambda s: -s["days"])
+
+        habits = []
+        for note in notes:
+            if note.bucket != Bucket.AREA or not note.habit:
+                continue
+            report = habitsmod.report(note.habit, title=note.title)
+            miss = report["misses"]
+            # Never miss twice: one miss is reported, two is the alert. A
+            # streak counter would have called the first one a failure.
+            if miss["consecutive_misses"] or report["intention_missing"]:
+                habits.append({
+                    "note_id": note.id, "title": note.title,
+                    "consecutive_misses": miss["consecutive_misses"],
+                    "alert": miss["alert"],
+                    "message": miss["message"],
+                    "missing": report["intention_missing"],
+                    "suggestions": report["suggestions"][:2],
+                })
+        habits.sort(key=lambda h: (not h["alert"], -h["consecutive_misses"]))
+        return {
+            "steps": overdue_steps[:12],
+            "projects": overdue_projects,
+            "habits": habits,
+            "unconfirmed_dates": self._pending_dates(
+                [n for n in notes if n.bucket == Bucket.PROJECT]
+            ),
+        }
+
+    def _week_next(self, notes: List[Note], decks: List) -> Dict[str, Any]:
+        active = [
+            n for n in notes
+            if n.bucket == Bucket.PROJECT and n.project
+            and n.project.status != ProjectStatus.DONE
+        ]
+        due_reviews = self._reviews_due(notes)
+        checkins = []
+        today = dt.date.today()
+        for note in notes:
+            if note.bucket != Bucket.AREA or not note.habit:
+                continue
+            last = note.habit.last_checkin
+            if last is None or (today - last).days >= 7:
+                checkins.append({"note_id": note.id, "title": note.title,
+                                 "last": last.isoformat() if last else None})
+        return {
+            "actions": [a.as_dict for a in workflow.next_actions(active, limit=8)],
+            "upcoming": workflow.upcoming(notes, days=7),
+            "graduation": self.graduation_candidates(),
+            "resource_reviews": due_reviews,
+            "habit_checkins": checkins,
+        }
+
+    def retention_dial(self) -> Dict[str, Any]:
+        """What the current retention target costs, and what it would cost
+        elsewhere. Roadmap Tier 3 — see sb/retention.py."""
+        return retention.curve(
+            self.decks.all(),
+            current=self.cfg.study.desired_retention,
+            seconds=retention.seconds_per_review(self.decks.reviews()),
+        )
+
+    def atomicity(self) -> Dict[str, Any]:
+        """Lint the vault for notes that hold more than one idea.
+
+        Roadmap Tier 3. Phase 6's free linking tier works because notes are
+        atomic and precisely named; nothing has ever checked that it is still
+        true. See sb/lint.py.
+        """
+        return lint.check(self.notes()).as_dict()
+
 
     def _study_summary(self, all_notes: List[Note]) -> Dict[str, Any]:
         """The one-line version of the tutor for the dashboard, including the
@@ -229,6 +704,10 @@ class Engine:
             "next": (
                 lambda first: first.isoformat() if first else None
             )(calevents.first_occurrence(sched, cadence, note.habit)),
+            # The causal half of the habit model — the implementation
+            # intention, the anchor, the friction, consecutive misses and
+            # context stability. See sb/habits.py for why each is here.
+            "habit": habitsmod.report(note.habit, title=note.title),
         }
 
     # -- mutate -------------------------------------------------------------
@@ -249,14 +728,54 @@ class Engine:
             "plan": {"scheduled": report.scheduled, "message": report.message},
         }
 
-    def toggle_step(self, note_id: str, step_id: str) -> Dict[str, Any]:
+    def start_step(self, note_id: str, step_id: str) -> Dict[str, Any]:
+        """Start the clock on one step.
+
+        The only way to score an estimate is to know when the work began, and
+        the only way to know that without lying is to ask. One tap, and the
+        alternative — inferring elapsed time from when the step was ticked —
+        would record "three days" for a step done in twenty minutes on
+        Thursday afternoon.
+        """
+        note = self.note(note_id)
+        if not note.project:
+            raise ValueError("note has no project metadata")
+        step = next((s for s in note.project.steps if s.id == step_id), None)
+        if step is None:
+            raise ValueError(f"no step {step_id!r}")
+        step.started_at = _now()
+        step.done = False
+        step.done_at = None
+        note.log("step", f"{step_id} started")
+        note.body = _project_body(note)
+        self.vault.save(note)
+        return _note_dict(note)
+
+    def toggle_step(
+        self, note_id: str, step_id: str, minutes: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Tick or untick a step, recording how long it really took.
+
+        `minutes` given wins; otherwise the elapsed time since `start_step` is
+        used, if the clock was ever started. Nothing is invented: a step
+        finished without either stays untimed and simply never reaches
+        `sb/forecasting.py`, which is correct — an estimate scored against a
+        made-up duration is worse than an estimate never scored.
+        """
         note = self.note(note_id)
         if not note.project:
             raise ValueError("note has no project metadata")
         for step in note.project.steps:
             if step.id == step_id:
                 step.done = not step.done
-                step.done_at = dt.datetime.now().astimezone() if step.done else None
+                step.done_at = _now() if step.done else None
+                if step.done:
+                    step.actual_minutes = self._elapsed_minutes(step, minutes)
+                else:
+                    # Reopening throws the measurement away rather than keeping
+                    # a duration for work that is evidently not finished.
+                    step.actual_minutes = None
+                    step.started_at = None
                 note.log("step", f"{step_id} {'done' if step.done else 'reopened'}")
                 break
         else:
@@ -271,7 +790,90 @@ class Engine:
         note.body = _project_body(note)
         self.vault.save(note)
         self._sync_calendar_quiet()
-        return _note_dict(note)
+        return {**_note_dict(note), "accuracy": forecasting.project_accuracy(note)}
+
+    def label_link(self, note_id: str, target: str, kept: bool, score: float = 0.0) -> Dict[str, Any]:
+        """Record that a suggested link was right or wrong.
+
+        The other half of roadmap 1.2. A link lj keeps and a link lj deletes
+        are both labelled examples, and they are the only source of ground
+        truth `connect.AUTO_FLOOR` will ever have.
+        """
+        self.labels.record_link(note_id, target, score, bool(kept))
+        return self.labels.counts()
+
+    def thresholds(self) -> Dict[str, Any]:
+        """Are the two auto-accept floors set right, on lj's own examples?
+
+        Roadmap 1.2. Manning, Raghavan & Schütze ch.8: a retrieval threshold
+        without a labelled evaluation set is a preference, not a parameter.
+        See sb/threshold.py for why precision is the constraint and not F1.
+        """
+        return threshold.report({
+            "intake": (self.labels.intake_pairs(), self.cfg.intake.auto_floor),
+            "connect": (self.labels.link_pairs(), connectmod.AUTO_FLOOR),
+        })
+
+    def _apply_outside_view(self, note: Note, snapshot: List[Note]) -> Dict[str, Any]:
+        """Scale a fresh estimate by how long lj's own steps actually take.
+
+        Buehler, Griffin & Ross: the inside view underestimates, reliably, and
+        knowing that does not fix it — only substituting the observed
+        distribution does. `snapshot` is already every note, so the reference
+        class costs nothing to build here.
+
+        Scaling the *steps* rather than only the total is deliberate: the
+        planner books calendar time per step, so adjusting the headline number
+        alone would leave the blocks the wrong size. And because the ratio is
+        measured against whatever estimate was in force, the correction
+        converges rather than compounding — once the scaled estimates are
+        right, the multiplier walks back to 1.
+        """
+        project = note.project
+        if project is None or not self.cfg.planner.apply_personal_multiplier:
+            return {"applied": False, "reason": "off"}
+        table = forecasting.classes(forecasting.observations(snapshot))
+        before = project.estimate_minutes
+        forecast = forecasting.adjust(before, project.level, table)
+        if forecast.multiplier == 1.0:
+            return {"applied": False, **forecast.as_dict()}
+        for step in project.steps:
+            step.minutes = max(5, int(round(step.minutes * forecast.multiplier)))
+        project.estimate_minutes = (
+            sum(s.minutes for s in project.steps) if project.steps else forecast.minutes
+        )
+        note.log("forecast", f"x{forecast.multiplier} from {forecast.basis}")
+        return {"applied": True, "before": before, **forecast.as_dict()}
+
+    @staticmethod
+    def _elapsed_minutes(step, given: Optional[int]) -> Optional[int]:
+        """Minutes for one finished step: what was typed, else what elapsed.
+
+        A step left running overnight is capped at a working day rather than
+        recorded as 900 minutes — an obvious mis-log should not become the
+        datapoint that skews every future estimate. `forecasting.py` also
+        drops extreme ratios, so this is the second of two guards.
+        """
+        if given is not None:
+            try:
+                return max(1, min(24 * 60, int(given)))
+            except (TypeError, ValueError):
+                return None
+        if not step.started_at:
+            return None
+        elapsed = (_now() - step.started_at).total_seconds() / 60.0
+        if elapsed <= 0:
+            return None
+        return max(1, min(12 * 60, int(round(elapsed))))
+
+    def estimates(self) -> Dict[str, Any]:
+        """How well the estimates have held up, and the multiplier that follows.
+
+        Roadmap 2.5. Buehler, Griffin & Ross on the planning fallacy;
+        Kahneman & Tversky's outside view; Flyvbjerg's reference-class
+        correction as the working method. See sb/forecasting.py.
+        """
+        return forecasting.summary(self.notes())
 
     # -- one read per mutation ----------------------------------------------
     #
@@ -464,21 +1066,121 @@ class Engine:
         self._sync_calendar_quiet()
         return {"note": _note_dict(note), "next": note.review.next}
 
-    def set_habit(self, note_id: str, cadence: str, target_count: int) -> Dict[str, Any]:
+    HABIT_TEXT_FIELDS = ("cue", "behaviour", "place", "anchor", "easier", "harder")
+
+    def set_habit(
+        self,
+        note_id: str,
+        cadence: Optional[str] = None,
+        target_count: Optional[int] = None,
+        **fields: Any,
+    ) -> Dict[str, Any]:
+        """Set the cadence, the target, and — the part that actually matters —
+        the implementation intention, the anchor and the friction.
+
+        Cadence and target are optional now. Filling in only the cue must not
+        force a caller to restate a schedule it is not changing, because the
+        whole point of roadmap 2.4 is that the count is the least important
+        field on this model.
+        """
         note = self.note(note_id)
         note.habit = note.habit or HabitMeta()
-        note.habit.cadence = Cadence(cadence)
-        note.habit.target_count = int(target_count)
+        if cadence:
+            note.habit.cadence = Cadence(cadence)
+        if target_count is not None:
+            note.habit.target_count = max(1, min(7, int(target_count)))
+        for key in self.HABIT_TEXT_FIELDS:
+            if fields.get(key) is not None:
+                setattr(note.habit, key, str(fields[key]).strip()[:300])
         if note.bucket == Bucket.AREA and not note.schedule:
             note.schedule = AreaSchedule(
                 time=self.cfg.areas.default_time,
                 duration_minutes=self.cfg.areas.default_duration_minutes,
             )
-        note.log("habit", f"{cadence} x{target_count}")
+        note.log("habit", f"{note.habit.cadence.value} x{note.habit.target_count}")
         note.body = _area_body(note, self.cfg)
         self.vault.save(note)
         self._sync_calendar_quiet()
-        return _note_dict(note)
+        return {**_note_dict(note), "habit": habitsmod.report(note.habit, title=note.title)}
+
+    def log_habit(
+        self,
+        note_id: str,
+        on: Optional[str] = None,
+        at: str = "",
+        place: str = "",
+    ) -> Dict[str, Any]:
+        """Record one occurrence, with the context that makes it measurable.
+
+        Time and place are optional and default to *now* and the habit's
+        planned place, because an occurrence logged with one tap is worth more
+        than a form nobody fills in — but when they are there, they are what
+        `habits.stability()` reads. Wood's finding is that same-time-same-place
+        is what automates a behaviour; a bare date cannot express it.
+
+        Idempotent per day per time: tapping twice for the same slot does not
+        inflate the count.
+        """
+        note = self.note(note_id)
+        if note.bucket != Bucket.AREA:
+            raise ValueError("only Areas carry a habit")
+        note.habit = note.habit or HabitMeta()
+        when = _as_date(on) or dt.date.today()
+        stamp = (at or "").strip() or _now().strftime("%H:%M")
+        where = (place or "").strip() or (note.habit.place or "").strip()
+        if not any(e.on == when and e.at == stamp for e in note.habit.log):
+            note.habit.log.append(HabitEvent(on=when, at=stamp, place=where))
+            note.habit.log.sort(key=lambda e: (e.on, e.at))
+        note.log("habit-done", when.isoformat())
+        note.body = _area_body(note, self.cfg)
+        self.vault.save(note)
+        return {
+            **_note_dict(note),
+            "habit": habitsmod.report(note.habit, title=note.title),
+        }
+
+    def habit_checkin(
+        self, note_id: str, decision: str = "continue", target_count: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """The weekly check-in, answering the question the evidence asks.
+
+        Phase 3 asked "continue or change the count?". That is the weakest
+        question available. This still accepts it — a count change is
+        sometimes the right answer, especially after two misses — but the
+        payload it returns leads with consecutive misses and the blank fields
+        of the implementation intention, so the prompt asks the strongest
+        question first.
+        """
+        note = self.note(note_id)
+        if note.bucket != Bucket.AREA:
+            raise ValueError("only Areas carry a habit")
+        note.habit = note.habit or HabitMeta()
+        decision = (decision or "continue").strip().lower()
+        if decision not in ("continue", "change", "pause"):
+            raise ValueError(f"unknown check-in decision {decision!r}")
+        report = habitsmod.report(note.habit, title=note.title)
+        if decision == "change" and target_count is not None:
+            note.habit.target_count = max(1, min(7, int(target_count)))
+        if decision == "pause" and note.schedule:
+            note.schedule.enabled = False
+        note.habit.last_checkin = dt.date.today()
+        note.habit.checkins.append(
+            {
+                "on": dt.date.today().isoformat(),
+                "decision": decision,
+                "target_count": note.habit.target_count,
+                "consecutive_misses": report["misses"]["consecutive_misses"],
+            }
+        )
+        note.log("checkin", f"{decision} x{note.habit.target_count}")
+        note.body = _area_body(note, self.cfg)
+        self.vault.save(note)
+        self._sync_calendar_quiet()
+        return {
+            **_note_dict(note),
+            "habit": habitsmod.report(note.habit, title=note.title),
+            "decision": decision,
+        }
 
     def set_schedule(self, note_id: str, **fields: Any) -> Dict[str, Any]:
         """The "option to change" behind the weekly schedule review: move an
@@ -611,11 +1313,90 @@ class Engine:
     # -- calendar -----------------------------------------------------------
 
     def sync_calendar(self, snapshot: Optional[List[Note]] = None) -> Dict[str, Any]:
+        """Push the vault out. Reads ticks back in first, if that is on.
+
+        Order is load-bearing. The push deletes the Google task for any
+        project the vault considers finished; if the read came second, a tick
+        made on the phone would be deleted before it was ever seen. Read, then
+        write, is the only ordering under which the tick survives.
+        """
         sink = get_sink(self.cfg)
         notes = self._snapshot() if snapshot is None else snapshot
+        pulled = self.pull_task_completions(notes)
+        if pulled.get("applied"):
+            notes = self._snapshot()   # completions changed what gets pushed
         result = sink.sync(notes, self.cfg, len(self.decks.all()))
         self.vault.log_line("calendar", f"{sink.name}: {result}")
-        return {"sink": sink.name, "result": result}
+        return {"sink": sink.name, "result": result, "pulled": pulled}
+
+    def pull_task_completions(self, snapshot: Optional[List[Note]] = None) -> Dict[str, Any]:
+        """Roadmap 1.3 — the one field Google is allowed to win.
+
+        The vault wins on content and Google wins on completion, because
+        ticking is the only thing lj can do to one of these tasks on a phone.
+        See the comment in sb/calsync/gtasks.py for why that is a per-field
+        merge rather than last-writer-wins.
+
+        Never raises: a phone that cannot be reached is a sync that did not
+        happen, not a write that failed. The same rule the whole calendar
+        layer already follows.
+        """
+        blank = {"applied": 0, "checked": 0, "enabled": False}
+        if self.cfg.resolved_task_sink() not in ("google", "both"):
+            return blank
+        if not self.cfg.calendar.read_back_completions:
+            return dict(blank, reason="off")
+        try:
+            from .calsync import gtasks
+            ticked = gtasks.read_back(self.cfg)
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            self.vault.log_line("calendar", f"read-back failed: {type(exc).__name__}: {exc}")
+            return dict(blank, enabled=True, error=type(exc).__name__)
+
+        notes = self._snapshot() if snapshot is None else snapshot
+        by_id = {n.id: n for n in notes}
+        applied: List[str] = []
+        for uid in ticked:
+            note = by_id.get(gtasks.note_id_of(uid))
+            if note is None or not note.project:
+                continue
+            if note.project.status == ProjectStatus.DONE:
+                continue
+            if self._apply_remote_completion(note):
+                applied.append(note.id)
+        return {
+            "applied": len(applied),
+            "checked": len(ticked),
+            "enabled": True,
+            "notes": applied,
+        }
+
+    def _apply_remote_completion(self, note: Note) -> bool:
+        """A tick that arrived from the phone.
+
+        A learning Project is *not* marked DONE by this. Blueprint §4 puts
+        graduation behind a confirmed prompt driven by review history, and a
+        tick on a due-date reminder is not that evidence — it means the work
+        is finished, not that the material is known. So its steps close and
+        its status stays ACTIVE, which is exactly what happens when the last
+        step is ticked in the app.
+        """
+        project = note.project
+        if project is None:
+            return False
+        for step in project.steps:
+            if not step.done:
+                step.done = True
+                step.done_at = _now()
+        if project.learning:
+            project.status = ProjectStatus.ACTIVE
+            note.log("step", "completed on Google Tasks")
+        else:
+            project.status = ProjectStatus.DONE
+            note.log("completed", "ticked on Google Tasks")
+        note.body = _project_body(note)
+        self.vault.save(note)
+        return True
 
     def _sync_calendar_quiet(self, snapshot: Optional[List[Note]] = None) -> None:
         """Best-effort resync after a mutation; never fails a write because a
@@ -627,6 +1408,72 @@ class Engine:
 
     def ics_path(self) -> Path:
         return self.cfg.ics_path
+
+    def _progress_report(self) -> Dict[str, Any]:
+        """How close each self-measuring part is to having something to say.
+
+        Four numbers in this system start as guesses and are supposed to
+        become measurements: the FSRS weights, the two auto-accept floors, the
+        estimate multiplier, and the calibration curve. Each needs data lj has
+        not produced yet. Reporting the distance is the difference between "not
+        working" and "not yet" — and it is the only honest way to ship a
+        feature whose whole design is that it waits.
+
+        Cheap by construction: one vault read, one pass over each log. It runs
+        from `doctor`, never on a request path.
+        """
+        notes = self.notes()
+        reviews = list(self.decks.reviews())
+        predictions = calibration.judged(reviews)
+        labels = self.labels.counts()
+        timed = forecasting.observations(notes)
+        index = self.index.status()
+
+        areas = [n for n in notes if n.bucket == Bucket.AREA]
+        planless = [
+            n for n in areas
+            if habitsmod.intention_missing(n.habit, fallback=n.title)
+        ]
+        untimed_steps = sum(
+            1
+            for n in notes
+            if n.project
+            for s in n.project.steps
+            if s.done and not s.actual_minutes
+        )
+        return {
+            "fsrs": {
+                "have": len(fitmod.samples(reviews)),
+                "need": fitmod.MIN_REVIEWS,
+                "fitted": bool(fitmod.load(self.cfg.deck_dir)),
+                "using_fitted": (
+                    self.cfg.study.use_fitted_weights
+                    and not self.cfg.study.weights
+                    and bool(fitmod.load(self.cfg.deck_dir))
+                ),
+            },
+            "calibration": {"have": len(predictions), "need": calibration.MIN_FOR_SCORE},
+            "thresholds": {
+                "intake": labels["intake"],
+                "connect": labels["link"],
+                "need": threshold.MIN_LABELS,
+            },
+            "estimates": {
+                "have": len(timed),
+                "need": forecasting.MIN_CLASS_SAMPLES,
+                "untimed": untimed_steps,
+            },
+            "habits": {"areas": len(areas), "without_plan": len(planless)},
+            "atomicity": lint.check(notes).by_rule,
+            "numpy": {
+                "chunks": index.get("chunks", 0),
+                "at": index.get("numpy_at"),
+                "available": index.get("numpy_available", False),
+                "accelerated": index.get("accelerated", False),
+            },
+            "plugin": (self.cfg.vault / ".obsidian" / "plugins"
+                       / "second-brain-capture" / "main.js").exists(),
+        }
 
     def _google_status(self) -> Optional[Dict[str, Any]]:
         """Why Google sync will or won't work, without opening a browser or
@@ -692,6 +1539,11 @@ class Engine:
             "subject": deck.subject,
             "category": deck.category,
             "kind": card.kind,
+            "topic": card.topic,
+            # Sweller: a scaffold for the first attempts, withdrawn as
+            # competence rises. Available before the reveal on purpose — that
+            # is the whole point of a worked example.
+            "worked_example": tutor.worked_example_for(card, deck, self.cfg),
             "front": card.front if reveal else "",
             "back": card.back if reveal else "",
             "question": card.question(),
@@ -761,6 +1613,8 @@ class Engine:
             "deck": self._deck_payload(deck),
             "generated": len(result.cards),
             "rejected": result.rejected,
+            "repaired": result.repaired,
+            "rejections": result.rejections,
             "passages": result.chunks,
             "provider": result.provider,
             "degraded": result.degraded,
@@ -780,7 +1634,13 @@ class Engine:
         )
         self.decks.save(deck)
         self._sync_calendar_quiet()
-        return self._deck_payload(deck)
+        payload = self._deck_payload(deck)
+        # Advisory, never a refusal: a card lj typed is a decision, not a
+        # draft. The generator is held to sb/quality.py; a person is told.
+        verdict = quality.assess(front, back, max_words=self.cfg.study.max_answer_words)
+        if not verdict.ok:
+            payload["warning"] = verdict.reason
+        return payload
 
     def update_card(self, note_id: str, card_id: str, **fields: Any) -> Dict[str, Any]:
         """Edit, approve, suspend or delete one card.
@@ -826,8 +1686,14 @@ class Engine:
         decks = self.decks.all()
         today = dt.date.today()
         reviewed, introduced = tutor.counted_today(self.decks)
+        where = self.vault.folders_by_id()
         return {
-            "decks": [tutor.deck_progress(d, self.cfg, today) for d in decks],
+            "decks": [
+                {**tutor.deck_progress(d, self.cfg, today),
+                 "folder": where.get(d.note_id, "")}
+                for d in decks
+            ],
+            "folders": self._folder_summary(decks, where, today),
             "stats": tutor.stats(self.decks, decks, self.cfg),
             "today": {"reviewed": reviewed, "introduced": introduced},
             "limits": {
@@ -840,6 +1706,43 @@ class Engine:
             "candidates": self._deckable_notes(decks),
             "categories": taxonomy.as_dicts(self.cfg),
         }
+
+    def _folder_summary(
+        self, decks: List[Deck], where: Dict[str, str], today: dt.date
+    ) -> List[Dict[str, Any]]:
+        """Every folder that holds cards, with what is waiting in it.
+
+        Counts roll up into ancestors, because selecting a folder selects
+        everything under it: if 30-Resources/Statics has four cards due, then
+        30-Resources shows four due too. Without that the number on the chip
+        would contradict the session you get when you click it.
+        """
+        agg: Dict[str, Dict[str, int]] = {}
+        for deck in decks:
+            due, new, active = len(deck.due(today)), len(deck.new()), len(deck.active)
+            if not active:
+                continue  # a deck of drafts is not somewhere you can study
+            folder = tutor.normalize_folder(where.get(deck.note_id, ""))
+            parts = folder.split("/") if folder else []
+            # "" is the vault root, and every note is under it
+            for depth in range(len(parts) + 1):
+                key = "/".join(parts[:depth])
+                row = agg.setdefault(key, {"decks": 0, "due": 0, "new": 0, "cards": 0})
+                row["decks"] += 1
+                row["due"] += due
+                row["new"] += new
+                row["cards"] += active
+        out = [
+            {
+                "path": path,
+                "label": path.rsplit("/", 1)[-1] if path else "All notes",
+                "depth": path.count("/") + 1 if path else 0,
+                **counts,
+            }
+            for path, counts in agg.items()
+        ]
+        out.sort(key=lambda f: (f["depth"], f["path"]))
+        return out
 
     def _deckable_notes(self, decks: List[Deck]) -> List[Dict[str, Any]]:
         """Notes worth making cards from that do not have any yet."""
@@ -865,20 +1768,32 @@ class Engine:
         return out
 
     def study_session(
-        self, subjects: Optional[List[str]] = None, limit: Optional[int] = None
+        self,
+        subjects: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        folders: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Build a mixed-subject queue. Answers are posted one at a time, so
         this holds no server-side session state — close the tab mid-session
         and nothing is lost or double-counted."""
         decks = self.decks.all()
         reviewed, introduced = tutor.counted_today(self.decks)
+        # Koriat & Bjork's illusion of competence, made actionable: the cards
+        # lj predicted they knew and then missed go to the front. Scoped to a
+        # recent window, because a miss from four months ago is a card that
+        # has since been relearned, not a belief that is still wrong.
+        since = dt.date.today() - dt.timedelta(days=self.cfg.study.overconfidence_window_days)
+        priority = calibration.priority_card_ids(self.decks.reviews(since=since), since=since)
         session = tutor.build_session(
             decks,
             self.cfg,
             subjects=subjects,
+            folders=folders,
+            folder_of=self.vault.folders_by_id() if folders else None,
             limit=limit,
             reviewed_today=reviewed,
             introduced_today=introduced,
+            priority=priority,
         )
         return {
             "queue": [
@@ -910,8 +1825,16 @@ class Engine:
         mode: str = "self",
         typed: str = "",
         seconds: float = 0.0,
+        confidence: Any = None,
     ) -> Dict[str, Any]:
-        """Grade one card. `mode="recall"` marks a typed answer first."""
+        """Grade one card. `mode="recall"` marks a typed answer first.
+
+        `confidence` is lj's own prediction, tapped before the answer was
+        revealed. Optional at every layer — a session where it is never sent
+        behaves exactly as it did before — and coerced rather than validated,
+        because a malformed prediction should cost the prediction, not the
+        answer. See sb/calibration.py.
+        """
         deck = self.deck(note_id)
         card = deck.card(card_id)
 
@@ -937,6 +1860,7 @@ class Engine:
             seconds=seconds,
             feedback=grading.feedback if grading else "",
             score=grading.score if grading else None,
+            confidence=calibration.clamp(confidence),
         )
         graduation = self._check_graduation(deck)
         return {
@@ -960,6 +1884,11 @@ class Engine:
             ),
             "deck": tutor.deck_progress(deck, self.cfg),
             "graduation": graduation,
+            "confidence": result.confidence,
+            "overconfident": result.overconfident,
+            # Chi et al.: the prompt is the intervention. Asking only on
+            # Again/Hard keeps it from becoming the thing that ends sessions.
+            "ask_why": tutor.wants_self_explanation(result.grade),
         }
 
     def study_mark(self, note_id: str, card_id: str, typed: str) -> Dict[str, Any]:
@@ -989,9 +1918,72 @@ class Engine:
         note = self.note(note_id)
         return {"answer": tutor.explain(card, note.body, question, self.cfg)}
 
+    def study_self_explain(self, note_id: str, card_id: str, said: str) -> Dict[str, Any]:
+        """lj explains first; the model marks it; nothing is scheduled.
+
+        Roadmap 2.3. `explain()` runs the transfer in the weaker direction —
+        the model explains to lj — and the literature is unambiguous that the
+        stronger one is lj producing the account (Slamecka & Graf's generation
+        effect; Chi et al. on self-explanation, and on *prompted* beating
+        spontaneous). This is the prompt.
+
+        Written to `_decks/_explanations.jsonl`, not to the review log: it is
+        not a graded answer and must never be counted as one. Nothing here
+        touches the card's schedule, so a bad marking costs a sentence.
+        """
+        deck = self.deck(note_id)
+        card = deck.card(card_id)
+        note = self.note(note_id)
+        marked = tutor.mark_self_explanation(card, note.body, said, self.cfg)
+        self.decks.log_explanation(
+            {
+                "at": _now().isoformat(),
+                "note_id": note_id,
+                "subject": deck.subject,
+                "card": card_id,
+                "said": marked.said[:1000],
+                "verdict": marked.verdict,
+                "score": marked.score,
+                "graded_by": marked.graded_by,
+            }
+        )
+        return {
+            **marked.as_dict(),
+            # The tutor's own explanation, shown *after* theirs. Order is the
+            # whole point: reading it first is the passive path this replaces.
+            "answer": tutor.explain(card, note.body, "", self.cfg),
+        }
+
+    def fit_weights(self, write: bool = False) -> Dict[str, Any]:
+        """Fit FSRS to lj's own review history. Roadmap Tier 4.
+
+        The trigger — roughly 1,000 reviews — is enforced inside `sb/fit.py`
+        rather than checked here, and `write=True` is refused below it. Every
+        review line has carried the pre-review state since phase 2 precisely
+        so that this needed no migration when the trigger finally fired.
+        """
+        result = fitmod.fit(self.decks.reviews())
+        if write and result["enough"] and result["improved"]:
+            path = fitmod.save(self.cfg.deck_dir, result)
+            result["written"] = str(path)
+            self.vault.log_line(
+                "study", f"fitted FSRS weights from {result['n']} reviews -> {path.name}"
+            )
+        elif write:
+            result["written"] = ""
+            result["refused"] = (
+                "not enough reviews yet" if not result["enough"] else "no improvement over the defaults"
+            )
+        return result
+
     def study_stats(self) -> Dict[str, Any]:
         decks = self.decks.all()
-        return tutor.stats(self.decks, decks, self.cfg)
+        stats = tutor.stats(self.decks, decks, self.cfg)
+        window = dt.date.today() - dt.timedelta(days=self.cfg.study.overconfidence_window_days)
+        reviews = list(self.decks.reviews())
+        stats["calibration"] = calibration.curve(reviews).as_dict()
+        stats["overconfident_cards"] = calibration.overconfident_cards(reviews, since=window)
+        return stats
 
     # -- the info manager (blueprint §7) -------------------------------------
 
@@ -1299,7 +2291,15 @@ class Engine:
 
     # -- health -------------------------------------------------------------
 
-    def health(self) -> Dict[str, Any]:
+    def health(self, progress: bool = False) -> Dict[str, Any]:
+        """Wiring check. `progress` is off by default and that is deliberate.
+
+        The dashboard calls `/api/health` on every load for its footer, and
+        `_progress_report()` walks the whole vault, reads the whole review log
+        and lints every Resource. Attaching that to a footer would undo phase
+        9's read-path work on the one endpoint that runs most often. `doctor`
+        asks for it; the footer does not.
+        """
         from .llm import get_provider, lane_report
 
         provider = get_provider(self.cfg.llm)
@@ -1323,11 +2323,24 @@ class Engine:
                 "lanes": lanes,
             },
             "index": self.index.status(),
+            "drop": {
+                "path": str(self.cfg.drop_dir),
+                "waiting": len(
+                    intakemod.candidates(self.cfg.drop_dir, 0.0)
+                ),
+                "watch": self.cfg.intake.watch,
+                "auto_floor": self.cfg.intake.auto_floor,
+            },
             "study": {
                 "decks": len(self.decks.all()),
                 "retention": self.cfg.study.desired_retention,
                 "path": str(self.cfg.deck_dir),
             },
+            # Everything that measures itself, and how far off it still is.
+            # A feature that unlocks on a trigger is invisible until it fires,
+            # which makes it feel broken rather than pending — so `doctor`
+            # states the distance to each one. Opt-in: see the docstring.
+            **({"progress": self._progress_report()} if progress else {}),
             "calendar": {
                 "sink": self.cfg.calendar.sink,
                 "task_sink": self.cfg.resolved_task_sink(),
@@ -1381,6 +2394,24 @@ def _link_sources(results: List[Dict[str, Any]]) -> Dict[str, int]:
             key = link.get("source") or "unknown"
             counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _excerpt(body: str, limit: int = 180) -> str:
+    """Enough of a note to recognise it by, on one line.
+
+    Headings and list bullets are stripped rather than shown: the Inbox row is
+    asking "what is this?", and `## Notes` answers that worse than the first
+    real sentence under it does.
+    """
+    lines = []
+    for line in (body or "").splitlines():
+        line = re.sub(r"^\s*(?:[-*+]\s*(?:\[[ xX]\])?|#{1,6}|>\s*)\s*", "", line).strip()
+        if line:
+            lines.append(line)
+        if sum(len(x) for x in lines) > limit:
+            break
+    text = " · ".join(lines)
+    return text[: limit - 1] + "…" if len(text) > limit else text
 
 
 def _note_dict(note: Note, **extra) -> Dict[str, Any]:
@@ -1545,6 +2576,22 @@ def _area_body(note: Note, cfg: Optional[Config] = None) -> str:
         "*Area — ongoing. No due date: it recurs on the calendar instead.*",
         "",
     ]
+    # The implementation intention goes first, above the schedule. It is the
+    # largest effect in the habit literature (Gollwitzer 1999, d≈0.65) and the
+    # target count is the smallest; the note should read in that order.
+    intention = habitsmod.intention_sentence(note.habit, fallback=note.title)
+    if intention:
+        lines += [f"> **{intention}**", ""]
+    if note.habit:
+        extras = []
+        if (note.habit.anchor or "").strip():
+            extras.append(f"**Right after:** {note.habit.anchor.strip()}")
+        if (note.habit.easier or "").strip():
+            extras.append(f"**Made easier:** {note.habit.easier.strip()}")
+        if (note.habit.harder or "").strip():
+            extras.append(f"**Made harder:** {note.habit.harder.strip()}")
+        if extras:
+            lines += extras + [""]
     if sched:
         when = calevents._days_label(sched, note)
         state = "" if sched.enabled else "  ·  **paused**"
@@ -1554,6 +2601,12 @@ def _area_body(note: Note, cfg: Optional[Config] = None) -> str:
             f"*Target {target}× per {cadence.value} — change it at the weekly schedule review.*",
             "",
         ]
+    if note.habit and note.habit.log:
+        miss = habitsmod.misses(note.habit)
+        # Consecutive misses, never a streak. A streak counter turns the first
+        # miss into the loss of a whole number, at exactly the moment Lally et
+        # al. found nothing has gone wrong yet.
+        lines += [f"*{miss.message}*", ""]
     capture, log = _split_checkin_log(original)
     lines += ["## Capture", "", capture.strip(), "", "## Check-in log", ""]
     if log.strip():

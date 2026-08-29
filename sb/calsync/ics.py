@@ -167,17 +167,37 @@ def _esc(text: str) -> str:
 
 def _fold(line: str) -> str:
     """RFC 5545 §3.1: fold at 75 octets, continuation lines start with a space."""
+    # Almost every line is short ASCII, where the character count *is* the
+    # octet count. `str.isascii()` reads a flag CPython already keeps, so this
+    # skips an encode() per line — and a full calendar render folds tens of
+    # thousands of lines.
+    if len(line) <= 75 and line.isascii():
+        return line
     raw = line.encode("utf-8")
     if len(raw) <= 75:
         return line
-    chunks, cursor = [], 0
+    chunks, cursor, total = [], 0, len(raw)
     limit = 74
-    while cursor < len(raw):
-        end = min(cursor + limit, len(raw))
-        # do not split a multi-byte character
-        while end > cursor and (raw[end - 1] & 0xC0) == 0x80:
+    while cursor < total:
+        end = min(cursor + limit, total)
+        # Do not split a multi-byte character. The test is on the byte *after*
+        # the cut: `end` is a character boundary exactly when it is the end of
+        # the string, or the byte sitting there is not a continuation byte
+        # (0b10xxxxxx).
+        #
+        # Backing off over continuation bytes instead — testing raw[end - 1] —
+        # stops on the character's *lead* byte and leaves it stranded at the end
+        # of the chunk, so `.decode()` raises "unexpected end of data". Every
+        # emoji this system prefixes onto a summary (📝 💚 💼) is three or four
+        # bytes, so a title long enough to fold crashed the entire calendar
+        # sync whenever the emoji happened to land on the boundary.
+        while cursor < end < total and (raw[end] & 0xC0) == 0x80:
             end -= 1
-        chunks.append(raw[cursor:end].decode("utf-8"))
+        if end <= cursor:  # unreachable for UTF-8 (4 bytes max), but never spin
+            end = min(cursor + limit, total)
+            chunks.append(raw[cursor:end].decode("utf-8", "replace"))
+        else:
+            chunks.append(raw[cursor:end].decode("utf-8"))
         cursor = end
         limit = 73
     return "\r\n ".join(chunks)

@@ -1,4 +1,6 @@
 @echo off
+REM Second Brain - file whatever is sitting in the Drop folder.
+REM The app does this by itself while it is open; this is for when it isn't.
 setlocal
 cd /d "%~dp0"
 REM Keep Python bytecode out of the vault: Obsidian indexes and watches
@@ -10,9 +12,6 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-".venv\Scripts\python.exe" run.py doctor
-echo.
-echo Running the test suite on this machine...
-".venv\Scripts\python.exe" tests\test_all.py
+".venv\Scripts\python.exe" run.py intake
 echo.
 pause

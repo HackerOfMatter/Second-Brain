@@ -279,6 +279,11 @@ class Index:
             "model": man.get("model", ""),
             "built_at": man.get("built_at", ""),
             "semantic": bool(vectors),
+            # Which scoring path a search will take, so a slow vault is
+            # diagnosable from `doctor` rather than from a stopwatch.
+            "accelerated": bool(vectors) and len(vectors) >= NUMPY_AT_CHUNKS and _np() is not None,
+            "numpy_available": _np() is not None,
+            "numpy_at": NUMPY_AT_CHUNKS,
             "path": str(self.dir),
             "buckets": sorted({c.get("bucket", "") for c in chunks if c.get("bucket")}),
         }
@@ -449,15 +454,17 @@ class Index:
         query_terms = _terms(question)
         query_vec = self._embed_query(question) if vectors else None
 
+        # One vectorised pass over the whole matrix when the vault is big
+        # enough to justify it, one Python loop otherwise. Same numbers.
+        cosine_by_index: List[float] = (
+            cosines(query_vec, vectors, dim) if query_vec is not None else []
+        )
+
         scored: List[Tuple[float, float, int]] = []
         for i in candidates:
             keyword = _keyword_score(query_terms, chunks[i].get("text", ""))
-            if query_vec is not None and i < len(vectors) and len(vectors[i]) == len(query_vec):
-                cosine = _dot(query_vec, vectors[i])  # both unit vectors
-                score = cosine + KEYWORD_WEIGHT * keyword
-            else:
-                cosine = 0.0
-                score = keyword
+            cosine = cosine_by_index[i] if i < len(cosine_by_index) else 0.0
+            score = cosine + KEYWORD_WEIGHT * keyword if query_vec is not None else keyword
             scored.append((score, cosine, i))
 
         scored.sort(key=lambda s: -s[0])
@@ -516,8 +523,70 @@ def _normalize(vec: array) -> None:
         vec[i] = vec[i] / norm
 
 
+#: Roadmap Tier 4: numpy, on a trigger rather than on principle.
+#:
+#: Scoring a query is one dot product per chunk. In pure Python that is a
+#: `sum(zip(...))` over 768 floats — a few hundred microseconds each, which is
+#: nothing at 500 chunks and is most of a second at 5,000. The trigger the
+#: phase 3 docs named is 5,000 chunks, roughly a few hundred notes, and it is
+#: a real trigger rather than a guess: below it the import of numpy costs more
+#: than the arithmetic it saves.
+#:
+#: numpy is deliberately **not** a requirement. The whole system runs on the
+#: standard library plus four small packages, and a vault that never reaches
+#: 5,000 chunks should never be asked to install a 60MB dependency. If it is
+#: absent the pure-Python path runs, at any size, and `status()` says which
+#: one is in use.
+NUMPY_AT_CHUNKS = 5000
+
+_numpy = None
+_numpy_checked = False
+
+
+def _np():
+    """numpy if it is installed, else None. Imported once, lazily."""
+    global _numpy, _numpy_checked
+    if not _numpy_checked:
+        _numpy_checked = True
+        try:
+            import numpy as np  # type: ignore
+
+            _numpy = np
+        except Exception:  # noqa: BLE001 — a missing optional dep is not an error
+            _numpy = None
+    return _numpy
+
+
 def _dot(a: array, b: array) -> float:
     return sum(x * y for x, y in zip(a, b))
+
+
+def cosines(query: array, vectors: Sequence[array], dim: int) -> List[float]:
+    """Every chunk's cosine against the query, the fastest available way.
+
+    Both sides are already unit vectors, so the cosine *is* the dot product —
+    there is no normalisation step to get wrong, and the numpy path and the
+    Python path compute the identical quantity rather than approximations of
+    each other. Rows whose length does not match the query are scored 0, the
+    same rule both paths follow, because a stale row is not a similar row.
+    """
+    if not vectors:
+        return []
+    np = _np() if len(vectors) >= NUMPY_AT_CHUNKS else None
+    if np is not None:
+        try:
+            matrix = np.frombuffer(
+                b"".join(v.tobytes() for v in vectors), dtype=np.float32
+            ).reshape(len(vectors), dim)
+            q = np.frombuffer(query.tobytes(), dtype=np.float32)
+            if q.shape[0] == dim:
+                return [float(x) for x in matrix @ q]
+        except Exception:  # noqa: BLE001 — fall back rather than fail a search
+            pass
+    return [
+        _dot(query, v) if len(v) == len(query) else 0.0
+        for v in vectors
+    ]
 
 
 def _terms(text: str) -> set:

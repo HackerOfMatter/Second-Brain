@@ -32,9 +32,9 @@ import datetime as dt
 import random
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from . import fsrs
+from . import calibration, fit, fsrs
 from .cards import Card, Deck, DeckStore
 from .config import Config
 from .llm import resolve_provider
@@ -48,13 +48,45 @@ from .llm import resolve_provider
 class QueuedCard:
     deck: Deck
     card: Card
-    reason: str  # "due" | "new"
+    reason: str  # "due" | "new" | "overconfident"
+
+    @property
+    def key(self) -> str:
+        return f"{self.deck.note_id}/{self.card.id}"
 
     @property
     def overdue_days(self) -> int:
         if not self.card.due:
             return 0
         return max(0, (dt.date.today() - self.card.due).days)
+
+
+def normalize_folder(value: str) -> str:
+    """One spelling for a vault folder, whoever typed it.
+
+    Obsidian shows backslashes on Windows, the API carries whatever the UI
+    sent, and a person typing a filter adds a trailing slash as often as not.
+    All of it collapses to "30-Resources/Statics".
+    """
+    return (value or "").replace("\\", "/").strip("/").strip()
+
+
+def in_folders(folder: str, scopes: Sequence[str]) -> bool:
+    """Is `folder` one of `scopes`, or inside one?
+
+    Picking a folder means picking its subject, and a subject with sub-topics
+    is still that subject: 30-Resources selects 30-Resources/Statics/Ch4 too.
+    The empty scope is the vault root and therefore matches everything, which
+    is also what "no folders given" means.
+    """
+    if not scopes:
+        return True
+    folder = normalize_folder(folder)
+    for scope in scopes:
+        scope = normalize_folder(scope)
+        if not scope or folder == scope or folder.startswith(scope + "/"):
+            return True
+    return False
 
 
 @dataclass
@@ -72,11 +104,14 @@ def build_session(
     cfg: Config,
     *,
     subjects: Optional[Sequence[str]] = None,
+    folders: Optional[Sequence[str]] = None,
+    folder_of: Optional[Mapping[str, str]] = None,
     limit: Optional[int] = None,
     on: Optional[dt.date] = None,
     reviewed_today: int = 0,
     introduced_today: int = 0,
     seed: Optional[int] = None,
+    priority: Optional[Sequence[str]] = None,
 ) -> Session:
     """Pick and order this session's cards.
 
@@ -85,11 +120,22 @@ def build_session(
     not "first in the list", because a session that front-loads every overdue
     card and trails off into new material is a session you abandon halfway.
     Due and new are interleaved together, spread across subjects.
+
+    `subjects` and `folders` both narrow the pool and stack: pass a folder to
+    revise one course, a subject to revise one note, or both. `folder_of` maps
+    a deck's note id to the folder that note lives in — see
+    `Vault.folders_by_id`.
     """
     on = on or dt.date.today()
     study = cfg.study
     wanted = set(subjects or [])
-    pool = [d for d in decks if not wanted or d.note_id in wanted]
+    scopes = [normalize_folder(f) for f in (folders or [])]
+    where = folder_of or {}
+    pool = [
+        d for d in decks
+        if (not wanted or d.note_id in wanted)
+        and in_folders(where.get(d.note_id, ""), scopes)
+    ]
 
     due_budget = max(0, study.max_reviews_per_day - max(0, reviewed_today))
     new_budget = max(0, study.new_cards_per_day - max(0, introduced_today))
@@ -106,8 +152,15 @@ def build_session(
     session.subjects = sorted({d.subject or d.note_id for d in pool})
 
     # Most overdue first — a card three weeks late has decayed furthest and
-    # gains the most from being seen.
-    due_all.sort(key=lambda q: (q.card.due or on, q.deck.subject))
+    # gains the most from being seen. Ahead of even that sit the cards lj was
+    # *sure* about and got wrong: not the hardest cards, the ones they do not
+    # yet know are hard. Koriat & Bjork's illusion of competence is invisible
+    # to the scheduler, because FSRS only ever sees the grade.
+    hot = set(priority or ())
+    for q in due_all:
+        if q.key in hot:
+            q.reason = "overconfident"
+    due_all.sort(key=lambda q: (q.key not in hot, q.card.due or on, q.deck.subject))
     rng = random.Random(seed if seed is not None else _daily_seed(on))
     rng.shuffle(new_all)
 
@@ -122,24 +175,43 @@ def build_session(
     return session
 
 
-def _interleave(items: List[QueuedCard], rng: random.Random) -> List[QueuedCard]:
-    """Spread cards so consecutive ones rarely share a deck.
+def _lane(item: QueuedCard) -> str:
+    """What this card is interleaved *against*.
 
-    Each deck's queue is laid out on the unit interval — a deck with four
+    A deck alone was the easy half. Rohrer & Taylor (2007, 2015) measured
+    interleaving on **problem types within a subject** — students who
+    practised mixed problem kinds outperformed blocked practice by a wide
+    margin on a delayed test, and the mechanism they identified is
+    discrimination: blocked practice never requires you to work out *which*
+    method applies, because the last problem already told you. Mixing decks
+    gives you that across subjects and not at all inside one, which is where
+    the effect was actually found.
+
+    A card with no `Type` label falls back to its deck, so a deck that has
+    never been labelled behaves exactly as it did before.
+    """
+    topic = (item.card.topic or "").strip().lower()
+    return f"{item.deck.note_id}::{topic}" if topic else item.deck.note_id
+
+
+def _interleave(items: List[QueuedCard], rng: random.Random) -> List[QueuedCard]:
+    """Spread cards so consecutive ones rarely share a deck *or a problem type*.
+
+    Each lane's queue is laid out on the unit interval — a lane with four
     cards puts them at .125, .375, .625, .875 — and everything is then sorted
-    by position. Proportional by construction: a deck with twenty cards due
-    and a deck with two both stay evenly distributed across the whole session
+    by position. Proportional by construction: a lane with twenty cards due
+    and a lane with two both stay evenly distributed across the whole session
     instead of the small one being over in the first minute.
     """
-    by_deck: Dict[str, List[QueuedCard]] = {}
+    by_lane: Dict[str, List[QueuedCard]] = {}
     for item in items:
-        by_deck.setdefault(item.deck.note_id, []).append(item)
+        by_lane.setdefault(_lane(item), []).append(item)
 
     spread: List[Tuple[float, int, QueuedCard]] = []
-    for order, (_, queue) in enumerate(sorted(by_deck.items())):
+    for order, (_, queue) in enumerate(sorted(by_lane.items())):
         n = len(queue)
         for i, item in enumerate(queue):
-            # jitter breaks ties between decks of equal size without letting
+            # jitter breaks ties between lanes of equal size without letting
             # any card drift far from its slot
             position = (i + 0.5) / n + rng.uniform(-0.02, 0.02)
             spread.append((position, order, item))
@@ -153,10 +225,13 @@ def _session_message(session: Session, due_budget: int, new_budget: int) -> str:
             return "Daily cap reached — come back tomorrow, or raise the cap in config.yaml."
         return "Nothing due. Everything you know is still known."
     bits = []
-    due = sum(1 for q in session.queue if q.reason == "due")
+    due = sum(1 for q in session.queue if q.reason in ("due", "overconfident"))
     new = len(session.queue) - due
     if due:
         bits.append(f"{due} due")
+    hot = sum(1 for q in session.queue if q.reason == "overconfident")
+    if hot:
+        bits.append(f"{hot} you were sure about")
     if new:
         bits.append(f"{new} new")
     subjects = len({q.deck.note_id for q in session.queue})
@@ -187,6 +262,9 @@ class AnswerResult:
     feedback: str = ""
     score: Optional[float] = None
     correct: Optional[bool] = None
+    confidence: Optional[float] = None
+    #: Set when lj predicted >= calibration.OVERCONFIDENT_AT and then missed.
+    overconfident: bool = False
 
 
 def answer(
@@ -201,8 +279,15 @@ def answer(
     seconds: float = 0.0,
     feedback: str = "",
     score: Optional[float] = None,
+    confidence: Optional[float] = None,
 ) -> AnswerResult:
     """Apply one answer: schedule it, persist it, log it.
+
+    `confidence` is what lj predicted *before* the answer was revealed. It
+    rides on the same log line as the grade rather than in a store of its own,
+    so the two can never disagree about which review they describe, and every
+    line written before this existed is simply a review with no prediction on
+    it. See sb/calibration.py.
 
     The log entry records the state *before* the review as well as the grade.
     That is what makes the history re-analysable later — you can recompute what
@@ -240,6 +325,7 @@ def answer(
             "seconds": round(float(seconds or 0), 1),
             "typed": (typed or "")[:500],
             "score": score,
+            "confidence": confidence,
             "before": before,
             "after": {
                 "s": round(card.stability, 4),
@@ -267,14 +353,31 @@ def answer(
         feedback=feedback,
         score=score,
         correct=None if score is None else score >= 0.6,
+        confidence=confidence,
+        overconfident=(
+            confidence is not None
+            and confidence >= calibration.OVERCONFIDENT_AT
+            and not calibration.is_correct(grade)
+        ),
     )
 
 
 def weights(cfg: Config):
-    """Personal FSRS weights if lj has ever fitted them, else the published
-    defaults. A wrong-length list is ignored rather than crashing a session."""
+    """Personal FSRS weights if lj has ever fitted them, else the defaults.
+
+    Three sources, in order of how deliberate they are: `config.yaml` beats a
+    fitted file, because a number lj typed is a decision and a number a fit
+    produced is a suggestion. A wrong-length list from either is ignored
+    rather than crashing a session mid-review. See sb/fit.py.
+    """
     custom = list(cfg.study.weights or [])
-    return custom if len(custom) == len(fsrs.DEFAULT_W) else fsrs.DEFAULT_W
+    if len(custom) == len(fsrs.DEFAULT_W):
+        return custom
+    if cfg.study.use_fitted_weights:
+        fitted = fit.load(cfg.deck_dir)
+        if fitted:
+            return fitted
+    return fsrs.DEFAULT_W
 
 
 def button_intervals(card: Card, cfg: Config) -> Dict[str, int]:
@@ -451,6 +554,203 @@ def explain(card: Card, note_body: str, question: str, cfg: Config) -> str:
 # --------------------------------------------------------------------------
 # progress
 # --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# self-explanation — the generation effect, prompted
+# --------------------------------------------------------------------------
+
+SELF_EXPLAIN_SYSTEM = """You are marking a student's own explanation of why an \
+answer is what it is. You are given the flashcard, the reference answer, the \
+sentence from their notes it came from, and what they said.
+
+Rules:
+- Output JSON only.
+- Mark the *reasoning*, not the wording, and not whether they recalled the \
+answer — they have already been told the answer.
+- "sound" means their account would let them derive the answer again. \
+"partial" means it is right as far as it goes but leaves out something \
+load-bearing. "off" means it would lead them somewhere wrong.
+- `missing` names the one thing most worth adding. One clause. Empty if sound.
+- `followup` is two sentences at most, addressed to them, filling exactly that \
+gap. Do not restate their explanation back to them.
+- An empty or nonsense explanation is "off" with score 0."""
+
+SELF_EXPLAIN_SCHEMA = """{"score": 0.0, "verdict": "sound|partial|off", \
+"missing": "", "followup": ""}"""
+
+
+@dataclass
+class SelfExplanation:
+    """What lj said, and what the model made of it. Nothing is scheduled."""
+
+    said: str = ""
+    score: float = 0.0
+    verdict: str = "off"          # sound | partial | off
+    missing: str = ""
+    followup: str = ""
+    graded_by: str = "model"      # model | rule
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "said": self.said,
+            "score": round(float(self.score), 3),
+            "verdict": self.verdict,
+            "missing": self.missing,
+            "followup": self.followup,
+            "graded_by": self.graded_by,
+        }
+
+
+#: Grades that earn the prompt. Again and Hard are where the explanation is
+#: worth having; a card graded Good or Easy does not need interrupting.
+SELF_EXPLAIN_GRADES = (1, 2)
+
+
+def wants_self_explanation(grade: int) -> bool:
+    try:
+        return int(grade) in SELF_EXPLAIN_GRADES
+    except (TypeError, ValueError):
+        return False
+
+
+def mark_self_explanation(
+    card: Card, note_body: str, said: str, cfg: Config
+) -> SelfExplanation:
+    """Mark "say why in one line", written before the explanation is shown.
+
+    The direction is the point. `explain()` has the model explain *to* lj;
+    this has lj explain first. Slamecka & Graf (1978) is the generation
+    effect — material you produce is remembered better than the same material
+    read — and Chi et al. (1989, 1994) is the specific finding that
+    self-explanation while studying predicts transfer, and that **prompted**
+    self-explanation beats waiting for it to happen spontaneously. Almost
+    nobody does it spontaneously; the prompt is the intervention.
+
+    Marked the same way a typed recall is marked, and for the same reason:
+    the model proposes and lj disposes. Nothing here touches the schedule, the
+    deck or the review log, so a model that misreads a good explanation costs
+    a sentence of bad advice rather than a card.
+    """
+    said = (said or "").strip()
+    if not said:
+        return SelfExplanation(
+            said="", score=0.0, verdict="off",
+            missing="nothing was written", followup="", graded_by="rule",
+        )
+
+    reference = card.answer()
+    provider = resolve_provider(cfg.llm, "grade")
+    if not getattr(provider, "is_llm", False):
+        return _overlap_self_explanation(said, reference, card.source or note_body)
+
+    prompt = (
+        f"Card: {card.question()}\n"
+        f"Reference answer: {reference}\n"
+        f"From their notes: {(card.source or '')[:400]}\n"
+        f"They said: {said}\n\n"
+        "Mark their reasoning. Return JSON."
+    )
+    try:
+        raw = provider.complete_json(
+            prompt, system=SELF_EXPLAIN_SYSTEM, schema_hint=SELF_EXPLAIN_SCHEMA
+        )
+    except Exception:
+        return _overlap_self_explanation(said, reference, card.source or note_body)
+    if not isinstance(raw, dict):
+        return _overlap_self_explanation(said, reference, card.source or note_body)
+
+    verdict = str(raw.get("verdict") or "").strip().lower()
+    if verdict not in ("sound", "partial", "off"):
+        verdict = "partial"
+    try:
+        score = max(0.0, min(1.0, float(raw.get("score", 0.0))))
+    except (TypeError, ValueError):
+        score = {"sound": 0.9, "partial": 0.55, "off": 0.1}[verdict]
+    return SelfExplanation(
+        said=said,
+        score=score,
+        verdict=verdict,
+        missing=str(raw.get("missing") or "").strip(),
+        followup=str(raw.get("followup") or "").strip(),
+        graded_by="model",
+    )
+
+
+def _overlap_self_explanation(said: str, reference: str, source: str) -> SelfExplanation:
+    """No model: score on how much of the reference the explanation touches.
+
+    Blunt, and it says so. It exists so that closing Ollama turns the prompt
+    into a private note-to-self rather than an error — writing the explanation
+    is where most of the effect lives, and that half needs no model at all.
+    """
+    wanted = _content_words(reference) | _content_words(source[:300])
+    got = _content_words(said)
+    hit = len(wanted & got) / len(wanted) if wanted else 0.0
+    verdict = "sound" if hit >= 0.5 else "partial" if hit >= 0.2 else "off"
+    return SelfExplanation(
+        said=said,
+        score=round(hit, 3),
+        verdict=verdict,
+        missing="" if verdict == "sound" else "no model running — this is a word overlap, not a judgement",
+        followup="",
+        graded_by="rule",
+    )
+
+
+# --------------------------------------------------------------------------
+# worked examples, and getting rid of them
+# --------------------------------------------------------------------------
+
+
+def worked_example_for(card: Card, deck: Deck, cfg: Config) -> Dict[str, Any]:
+    """Should this card show its worked example, and how much of it?
+
+    Sweller's worked-example effect: for material a learner cannot yet do,
+    studying a full solution beats attempting the problem, because attempting
+    it spends all available working memory on search rather than on learning
+    the schema. A bare recall card handed to someone on their first encounter
+    with a topic is exactly that wasted search.
+
+    And the reason this fades rather than staying on: the **expertise-reversal
+    effect**, also Sweller's. The same worked example that helped a novice
+    *hurts* someone competent, because they now have to reconcile the guidance
+    with the solution they were already producing. A scaffold that never comes
+    down is not a scaffold.
+
+    So: shown in full on the first attempt, shown as an opening fragment while
+    the card is still being learned, and withdrawn entirely once either the
+    card has been answered enough times or the deck as a whole is mature.
+    Nothing is shown if lj never wrote one, which is the ordinary case.
+    """
+    text = (card.worked or "").strip()
+    if not text:
+        return {"show": "none", "text": ""}
+
+    study = cfg.study
+    mature = [c for c in deck.cards if c.status == "active" and _is_mature(c, cfg)]
+    active = [c for c in deck.cards if c.status == "active"]
+    competence = len(mature) / len(active) if active else 0.0
+    if competence >= study.expertise_reversal_at:
+        # Expertise reversal: past this, the example is interference.
+        return {"show": "none", "text": "", "reason": "you know this deck"}
+    if card.reps == 0:
+        return {"show": "full", "text": text}
+    if card.reps < study.worked_example_fade_reps:
+        return {"show": "partial", "text": _fade(text)}
+    return {"show": "none", "text": "", "reason": "faded"}
+
+
+def _fade(text: str) -> str:
+    """The opening of a worked example — enough to start, not enough to copy.
+
+    Sweller's completion-problem format: the scaffold is withdrawn from the
+    end backwards, so the learner always performs the final step themselves.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    keep = max(1, len(sentences) // 2)
+    head = " ".join(sentences[:keep]).strip()
+    return head + ("  …finish it from here." if keep < len(sentences) else "")
 
 
 def deck_progress(deck: Deck, cfg: Config, on: Optional[dt.date] = None) -> Dict[str, Any]:

@@ -52,14 +52,28 @@ from .models import slugify
 
 DECK_DIR = "_decks"
 REVIEW_LOG = "_reviews.jsonl"
+#: Self-explanations (sb/tutor.mark_self_explanation). A separate file
+#: rather than a `kind` field on the review log, because everything that
+#: reads `_reviews.jsonl` assumes every line is a graded answer, and a
+#: line that is not would quietly skew the streak, the heatmap and any
+#: future FSRS fit.
+EXPLAIN_LOG = "_explanations.jsonl"
 
 #: One card block in a deck body. The id in the heading is the join key.
 #: The trailing `.*` swallows the decorative status marker the renderer adds
 #: ("· *awaiting review*"); only the id is load-bearing.
 CARD_HEADING = re.compile(r"^###\s+Card\s+([A-Za-z0-9_-]+)\b.*$", re.M)
-FIELD_LABEL = re.compile(r"^\*\*(Q|A|Hint|Why)\.\*\*[ \t]*", re.M)
+FIELD_LABEL = re.compile(r"^\*\*(Q|A|Hint|Why|Type|Worked)\.\*\*[ \t]*", re.M)
 
-LABEL_TO_FIELD = {"Q": "front", "A": "back", "Hint": "hint", "Why": "source"}
+#: `Type` is the within-subject problem type — what Rohrer & Taylor's
+#: interleaving was actually measured on. `Worked` is a fully solved
+#: example, shown for a card's first attempts and then faded (Sweller).
+#: Both are body-owned text, like the question: lj can write or fix either
+#: by typing in Obsidian.
+LABEL_TO_FIELD = {
+    "Q": "front", "A": "back", "Hint": "hint", "Why": "source",
+    "Type": "topic", "Worked": "worked",
+}
 FIELD_TO_LABEL = {v: k for k, v in LABEL_TO_FIELD.items()}
 
 CLOZE = re.compile(r"\{\{([^{}]+)\}\}")
@@ -86,6 +100,15 @@ class Card(BaseModel):
     back: str = ""
     hint: str = ""
     source: str = ""  # the line from the note that justifies the answer
+    #: The *kind* of question this is, within its subject — "elasticity",
+    #: "unit conversion", "date". Interleaving across decks was the easy half;
+    #: Rohrer & Taylor measured the effect across problem types *within* a
+    #: subject, and without this label that cannot be done.
+    topic: str = ""
+    #: A fully worked example. Shown while a card is new and withdrawn as
+    #: competence rises — Sweller's worked-example effect, and its
+    #: expertise-reversal counterpart. See sb/tutor.worked_example_for.
+    worked: str = ""
     status: str = "draft"  # draft | active | suspended
     stability: float = 0.0
     difficulty: float = 0.0
@@ -275,8 +298,12 @@ def render_body(deck: Deck) -> str:
         lines += [f"### Card {card.id}{state}", ""]
         lines += [f"**Q.** {card.front.strip()}", ""]
         lines += [f"**A.** {card.back.strip()}", ""]
+        if card.topic.strip():
+            lines += [f"**Type.** {card.topic.strip()}", ""]
         if card.hint.strip():
             lines += [f"**Hint.** {card.hint.strip()}", ""]
+        if card.worked.strip():
+            lines += [f"**Worked.** {card.worked.strip()}", ""]
         if card.source.strip():
             lines += [f"**Why.** {card.source.strip()}", ""]
     return "\n".join(lines).rstrip() + "\n"
@@ -428,9 +455,17 @@ class DeckStore:
         """Atomic, with a unique temp name — see `Vault.write` for why the
         temp name has to be unique. A deck is rewritten on every single answer,
         so two reviews graded a moment apart is the *normal* case here, not an
-        edge one."""
+        edge one, and this is the highest write rate in the system.
+
+        The replace itself goes through `sb/atomic.py`: on Windows a rename
+        can be refused outright while anything else holds the destination
+        open, and losing a graded answer to a virus scanner's read handle is
+        not an acceptable failure mode for the one folder the logs call
+        non-disposable."""
         import os
         import uuid
+
+        from . import atomic
 
         self.ensure()
         deck.updated = _now()
@@ -438,7 +473,7 @@ class DeckStore:
         tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:
             tmp.write_text(dump(deck), encoding="utf-8")
-            tmp.replace(target)
+            atomic.replace(tmp, target)
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
@@ -457,24 +492,28 @@ class DeckStore:
     def log_path(self) -> Path:
         return self.root / REVIEW_LOG
 
+    @property
+    def explain_log_path(self) -> Path:
+        return self.root / EXPLAIN_LOG
+
     def log_review(self, entry: Dict[str, Any]) -> None:
+        self._append(self.log_path, entry)
+
+    def log_explanation(self, entry: Dict[str, Any]) -> None:
+        self._append(self.explain_log_path, entry)
+
+    def _append(self, path: Path, entry: Dict[str, Any]) -> None:
         self.ensure()
-        with self.log_path.open("a", encoding="utf-8") as fh:
+        with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, default=str) + "\n")
+
+    def explanations(self) -> Iterator[Dict[str, Any]]:
+        yield from _read_jsonl(self.explain_log_path)
 
     def reviews(self, since: Optional[dt.date] = None) -> Iterator[Dict[str, Any]]:
         """Every logged answer, oldest first. A corrupt line is skipped rather
         than raising — a broken byte in a log should never break studying."""
-        if not self.log_path.exists():
-            return
-        for line in self.log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for rec in _read_jsonl(self.log_path):
             if since:
                 at = _as_datetime(rec.get("at"))
                 if not at or at.date() < since:
@@ -538,3 +577,24 @@ Each deck file has two halves:
 Add this folder to Obsidian's excluded files if you don't want cards showing up
 in search results.
 """
+
+
+def _read_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
+    """Lines of a JSONL file, oldest first, skipping anything unreadable.
+
+    A corrupt byte in a log is a lost line, never a lost session — these files
+    are appended to on every answer, which is exactly when a machine is most
+    likely to be shut mid-write.
+    """
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            yield rec

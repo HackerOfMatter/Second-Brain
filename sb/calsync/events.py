@@ -248,12 +248,7 @@ def area_event(note: Note, cfg: Config, category: Optional[str] = None) -> Optio
         summary=taxonomy.decorate(note.title, category, cfg, cfg.calendar.emoji_prefix),
         start=first,
         end=first + dt.timedelta(minutes=sched.duration_minutes),
-        description=(
-            f"Area — ongoing.\n"
-            f"Target: {target}× per {cadence.value}.\n"
-            f"{sched.duration_minutes} min, {_days_label(sched, note)}.\n"
-            "Change the time, length or days at the weekly schedule review."
-        ),
+        description=_area_description(note, sched, cadence, target),
         reminders=[10],
         kind="area",
         note_id=note.id,
@@ -459,6 +454,34 @@ def next_habit_checkin(note: Note, cfg: Config) -> Optional[dt.date]:
     if note.habit.cadence == Cadence.MONTHLY:
         return (today.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
     return _next_weekday(today + dt.timedelta(days=1), int(cfg.review.habit_checkin_weekday) % 7)
+
+
+def _area_description(note: Note, sched, cadence, target: int) -> str:
+    """What the reminder says when it fires.
+
+    The implementation intention leads, ahead of the target count, because
+    this notification *is* the cue's moment: Gollwitzer's effect comes from
+    the if-then plan being present when the situation arrives, not from having
+    written it down once in a note nobody has open. The anchor and the "made
+    easier" line follow for the same reason — they are instructions for the
+    next sixty seconds, not statistics.
+    """
+    from .. import habits
+
+    lines = ["Area — ongoing."]
+    intention = habits.intention_sentence(note.habit, fallback=note.title)
+    if intention:
+        lines.append(intention)
+    if note.habit and (note.habit.anchor or "").strip():
+        lines.append(f"Right after: {note.habit.anchor.strip()}")
+    if note.habit and (note.habit.easier or "").strip():
+        lines.append(f"Made easier: {note.habit.easier.strip()}")
+    lines += [
+        f"Target: {target}× per {cadence.value}.",
+        f"{sched.duration_minutes} min, {_days_label(sched, note)}.",
+        "Change the time, length or days at the weekly schedule review.",
+    ]
+    return "\n".join(lines)
 
 
 def _project_description(note: Note) -> str:

@@ -4,6 +4,9 @@ REM Calls python.exe -m pip, never the pip.exe shim (antivirus
 REM and cloud sync tools quarantine that launcher, so "pip" appears missing).
 setlocal
 cd /d "%~dp0"
+REM Keep Python bytecode out of the vault: Obsidian indexes and watches
+REM every file under it, including the temp files Python writes while importing.
+set "PYTHONPYCACHEPREFIX=%LOCALAPPDATA%\secondbrain\pycache"
 
 echo ============================================
 echo   Second Brain setup

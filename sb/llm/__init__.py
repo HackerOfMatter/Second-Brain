@@ -81,9 +81,9 @@ def installed_models(cfg: LLMConfig, force: bool = False) -> List[str]:
             return hit[1]
     tags: List[str] = []
     try:
-        import httpx
+        from . import _http
 
-        r = httpx.get(f"{cfg.ollama_url.rstrip('/')}/api/tags", timeout=3.0)
+        r = _http.client(cfg.ollama_url).get("/api/tags", timeout=3.0)
         if r.status_code == 200:
             tags = [m.get("name", "") for m in r.json().get("models", [])]
     except Exception:

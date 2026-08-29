@@ -143,8 +143,24 @@ class ConnectResult:
 
 
 def existing_links(body: str) -> set:
-    """Every `[[title]]` already in the note, slugified."""
+    """Every `[[title]]` in the given text, slugified."""
     return {slugify(m.group(1).strip()) for m in WIKILINK.finditer(body or "")}
+
+
+def own_links(note: Note) -> set:
+    """Links the note carries *outside* the section we generate.
+
+    Deduplicating against the whole body looks right and is badly wrong: our
+    own `## Related` block is part of the body, so on a second run every tier
+    would see its own previous output as "already linked", find nothing new,
+    and `apply([])` would then strip the section — quietly deleting every link
+    the last run made. That is what "Re-link everything" did before this
+    function existed.
+
+    Only links lj (or a template) put in the note count as reasons not to
+    suggest something.
+    """
+    return existing_links(strip_related(note.body or ""))
 
 
 def parent_of(note: Note) -> Optional[str]:
@@ -209,7 +225,7 @@ def structural_links(note: Note, others: Sequence[Note]) -> List[Link]:
     atomic note and says what a note **is**, not what it is **about**.
     """
     own = slugify(note.title)
-    seen = existing_links(note.body) | {own}
+    seen = own_links(note) | {own}
     mine = parent_of(note)
     out: List[Link] = []
 
@@ -226,7 +242,10 @@ def structural_links(note: Note, others: Sequence[Note]) -> List[Link]:
                 add(other, "atomized from the same source")
 
     for other in others:
-        if own in existing_links(other.body):
+        # `own_links`, not every link: if another note only points here because
+        # a previous run suggested it, that is our own echo coming back, not
+        # evidence of a relationship.
+        if own in own_links(other):
             add(other, "links here")
 
     return out
@@ -279,7 +298,7 @@ def title_links(
     haystack = WIKILINK.sub(" ", haystack)
 
     own = slugify(note.title)
-    seen = existing_links(note.body) | {own}
+    seen = own_links(note) | {own}
     by_slug = {slugify(n.title): n for n in others}
 
     out: List[Link] = []
@@ -321,7 +340,7 @@ def candidates(
     hits = index.search(query, k=limit * 2, include_archive=include_archive, per_note=1)
 
     own = slugify(note.title)
-    seen = existing_links(note.body) | {own} | {slugify(t) for t in (exclude or [])}
+    seen = own_links(note) | {own} | {slugify(t) for t in (exclude or [])}
 
     out: List[Link] = []
     for hit in hits:

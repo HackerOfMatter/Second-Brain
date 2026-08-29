@@ -11,10 +11,9 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Optional
 
-import httpx
 
 from ..config import LLMConfig
-from . import _json
+from . import _http, _json
 
 
 class CloudProvider:
@@ -57,8 +56,8 @@ class CloudProvider:
         }
         if system:
             payload["system"] = system
-        r = httpx.post(
-            "https://api.anthropic.com/v1/messages",
+        r = _http.client("https://api.anthropic.com").post(
+            "/v1/messages",
             headers={
                 "x-api-key": self.api_key,
                 "anthropic-version": "2023-06-01",
@@ -75,8 +74,8 @@ class CloudProvider:
         messages = ([{"role": "system", "content": system}] if system else []) + [
             {"role": "user", "content": prompt}
         ]
-        r = httpx.post(
-            "https://api.openai.com/v1/chat/completions",
+        r = _http.client("https://api.openai.com").post(
+            "/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": self.cfg.cloud_model,

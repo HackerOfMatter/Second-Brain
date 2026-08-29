@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import quality
 from .cards import CLOZE, Card, Deck, fingerprint
 from .config import Config
 from .llm import resolve_provider
@@ -43,23 +44,30 @@ Rules:
 - Output JSON only. No prose, no code fence.
 - Every card must be answerable from the passage alone. Never use outside \
 knowledge, and never write a card the passage does not settle.
-- One fact per card. If an answer needs "and", it is two cards.
+- One fact per card. If an answer needs "and", it is two cards. Never \
+answer with a list, a set, or an enumeration — those are the least learnable \
+cards there are.
 - The question must make sense on its own, with no "this", "the above", or \
 "as mentioned". Someone reading only the question should know what is asked.
-- The answer is the shortest complete form: a term, a number, a phrase, one \
-sentence at most. Never restate the question.
+- The answer is the shortest complete form: a term, a number, or a short \
+phrase — under 15 words, and one sentence at most. Never restate the question.
 - "why" must be a short exact quote copied from the passage, word for word, \
 that contains the answer. Copy it; do not paraphrase it.
 - Never write a card whose answer is the passage's title or the note's name.
 - Prefer cards that test understanding — why, when, what happens if — over \
 cards that test wording.
+- "type" is two or three words naming the *kind* of question this is within \
+the subject — "elasticity", "unit conversion", "date", "definition". Reuse the \
+same label for cards of the same kind. It is used to mix question types \
+within a session, so a generic label is worse than none.
 - If the passage is boilerplate, navigation, or too thin to test, return an \
 empty list. Returning nothing is a correct answer."""
 
 SCHEMA_HINT = """{
   "cards": [
     {"q": "question, self-contained", "a": "shortest complete answer",
-     "why": "exact quote from the passage containing the answer"}
+     "why": "exact quote from the passage containing the answer",
+     "type": "two or three words naming the kind of question"}
   ]
 }"""
 
@@ -137,7 +145,16 @@ class GenerationResult:
     degraded: bool = False
     chunks: int = 0
     rejected: int = 0
+    #: Cards the quality pass rewrote rather than threw away (sb/quality.py).
+    repaired: int = 0
+    #: Why cards were dropped, by rule. Surfaced so a deck that comes back
+    #: thin says which rule ate it instead of looking like a model failure.
+    rejections: Dict[str, int] = field(default_factory=dict)
     note: str = ""
+
+    def _drop(self, rule: str) -> None:
+        self.rejected += 1
+        self.rejections[rule] = self.rejections.get(rule, 0) + 1
 
 
 # --------------------------------------------------------------------------
@@ -209,6 +226,9 @@ def generate(
     existing: Optional[Sequence[Card]] = None,
 ) -> GenerationResult:
     """Draft cards from `source`. Nothing here writes to disk."""
+    max_answer_words = (
+        cfg.study.max_answer_words if getattr(cfg.study, "enforce_card_quality", True) else 0
+    )
     passages = chunk(source)
     seen = {_norm(c.front) for c in (existing or [])}
     result = GenerationResult(chunks=len(passages))
@@ -244,16 +264,21 @@ def generate(
         for item in _coerce_cards(raw):
             if len(result.cards) >= max_cards:
                 break
-            card = _validate(item, passage, subject)
-            if card is None:
-                result.rejected += 1
+            made, rule = _validate(item, passage, subject, max_answer_words=max_answer_words)
+            if not made:
+                result._drop(rule or "unusable")
                 continue
-            key = _norm(card.front)
-            if key in seen:
-                result.rejected += 1
-                continue
-            seen.add(key)
-            result.cards.append(card)
+            if rule == "repaired":
+                result.repaired += 1
+            for card in made:
+                if len(result.cards) >= max_cards:
+                    break
+                key = _norm(card.front)
+                if key in seen:
+                    result._drop("duplicate")
+                    continue
+                seen.add(key)
+                result.cards.append(card)
 
     if not result.cards and not result.note:
         result.note = "The model returned nothing usable from this note."
@@ -287,33 +312,90 @@ def _coerce_cards(raw: Any) -> List[Dict[str, Any]]:
 # --------------------------------------------------------------------------
 
 
-def _validate(item: Dict[str, Any], passage: str, subject: str) -> Optional[Card]:
+def _validate(
+    item: Dict[str, Any],
+    passage: str,
+    subject: str,
+    *,
+    max_answer_words: int = quality.MAX_ANSWER_WORDS,
+) -> Tuple[List[Card], str]:
+    """One model card in, zero to four real cards out.
+
+    Returns the cards and a tag: `""` when the card passed as written,
+    `"repaired"` when the quality pass rewrote it, and the broken rule's name
+    when nothing survived. The caller counts the tags so a thin deck can say
+    *why* it is thin.
+    """
     front = _text(item.get("q") or item.get("question") or item.get("front"))
     back = _text(item.get("a") or item.get("answer") or item.get("back"))
     why = _text(item.get("why") or item.get("source") or item.get("quote"))
 
     if not front or not back:
-        return None
+        return [], "empty"
     if len(front) < 8 or len(front) > 320 or len(back) > 400:
-        return None
+        return [], "length"
     if _norm(front) == _norm(back):
-        return None
+        return [], "restates-question"
     # An answer that is just the note's name tests nothing.
     if subject and _norm(back) == _norm(subject):
-        return None
+        return [], "title-as-answer"
     # "As mentioned above" questions are unanswerable outside their passage.
     if re.search(r"\b(the above|as mentioned|this passage|the text|the note)\b", front, re.I):
-        return None
+        return [], "not-self-contained"
     if not re.search(r"[?？]$", front) and not CLOZE.search(front):
         front = front.rstrip(".") + "?"
 
-    return Card(
-        id="tmp",
-        front=front,
-        back=back,
-        source=why if _quote_is_real(why, passage) else "",
-        status="draft",
-    )
+    quote = why if _quote_is_real(why, passage) else ""
+    topic = _topic(item)
+
+    def card(f: str, b: str, src: str) -> Card:
+        return Card(id="tmp", front=f, back=b, source=src, topic=topic, status="draft")
+
+    if max_answer_words <= 0:  # quality enforcement switched off in config
+        return [card(front, back, quote)], ""
+
+    # Rule 5 first: a wordy definition is better asked as a blank than as a
+    # question, and converting it usually also fixes the length.
+    if quality.words(back) >= 8:
+        clozed = quality.to_cloze(front, back, quote, passage)
+        if clozed:
+            return [card(*clozed)], "repaired"
+
+    verdict = quality.assess(front, back, max_words=max_answer_words)
+    if verdict.ok:
+        return [card(front, back, quote)], ""
+
+    # Rules 7 and 8: a list answer becomes one cloze per item, over the
+    # note's own sentence. Unciteable means unrepairable.
+    if verdict.rule in ("enumeration", "set", "list-question"):
+        split = quality.split_to_cloze(back, quote, passage)
+        if split:
+            return [card(*triple) for triple in split], "repaired"
+
+    return [], verdict.rule
+
+
+#: A label this generic tells the interleaver nothing, so it is dropped
+#: rather than kept — a lane called "concept" holding every card is the same
+#: as no lanes at all.
+USELESS_TOPICS = {
+    "general", "concept", "fact", "misc", "other", "knowledge", "question",
+    "recall", "note", "notes", "topic", "info", "information",
+}
+
+
+def _topic(item: Dict[str, Any]) -> str:
+    """The problem-type label, normalised, or "".
+
+    Rohrer & Taylor's effect needs the *kinds* to be distinguishable; a label
+    that is a whole sentence is a label the model invented per-card and will
+    never reuse, so it cannot group anything.
+    """
+    raw = _text(item.get("type") or item.get("topic") or item.get("kind"))
+    raw = raw.strip().strip(".").lower()
+    if not raw or len(raw.split()) > 4 or raw in USELESS_TOPICS:
+        return ""
+    return raw
 
 
 def _quote_is_real(quote: str, passage: str) -> bool:
@@ -369,6 +451,10 @@ def _heuristic_cards(passages: List[str], max_cards: int, seen: set) -> List[Car
             term, rest = m.group("term").strip(), m.group("rest").strip()
             if len(term) < 3 or _norm(term) in seen:
                 continue
+            # A definition long enough to be a paragraph is not one card
+            # either, even when every word of it came from the note.
+            if quality.words(sentence) > 45:
+                continue
             seen.add(_norm(term))
             out.append(
                 Card(
@@ -406,6 +492,8 @@ def add_to_deck(
                 back=card.back,
                 hint=card.hint,
                 source=card.source,
+                topic=card.topic,
+                worked=card.worked,
                 status="draft",
             )
         )

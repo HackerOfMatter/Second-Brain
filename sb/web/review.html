@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14'%3E%F0%9F%97%93%3C/text%3E%3C/svg%3E">
+<title>Second Brain — Weekly review</title>
+<style>
+
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --panel-2: #f0efea; --line: #e2e0d9;
+    --ink: #1a1a17; --muted: #6f6d66; --faint: #94918a;
+    --accent: #b8502a; --accent-soft: #f3e3dc;
+    --area: #3f7d6b; --project: #b8502a; --resource: #4a6b9c;
+    --warn: #a8571b; --danger: #a33232; --good: #3f7d6b;
+    --radius: 10px; --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --panel: #1e1e23; --panel-2: #26262c; --line: #34343c;
+      --ink: #e8e6e1; --muted: #9d9a94; --faint: #77746e;
+      --accent: #e08b5f; --accent-soft: #3a2a22;
+      --area: #6fb39c; --project: #e08b5f; --resource: #7fa3d6;
+      --warn: #d99b52; --danger: #d97070; --good: #6fb39c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 28px 20px 80px; }
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--faint); font-size: 13px; }
+  .spacer { flex: 1; }
+  a { color: var(--accent); }
+
+  button {
+    font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--ink); padding: 8px 14px; transition: .12s;
+  }
+  button:hover { border-color: var(--muted); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { filter: brightness(1.06); }
+  input[type=text], textarea, select {
+    font: inherit; width: 100%; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  }
+  textarea { resize: vertical; }
+  kbd {
+    font: 11px var(--mono); background: var(--bg); border: 1px solid var(--line);
+    border-bottom-width: 2px; border-radius: 4px; padding: 1px 5px; color: var(--muted);
+  }
+
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 16px; }
+  section.card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px 18px;
+  }
+  section.card > h2 {
+    font-size: 13px; margin: 0 0 4px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted);
+  }
+  section.card > .lede { font-size: 13px; color: var(--faint); margin: 0 0 12px; }
+  ul.items { list-style: none; margin: 0; padding: 0; }
+  ul.items li { padding: 7px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  ul.items li:first-child { border-top: 0; }
+  .meta { color: var(--faint); font-size: 12px; font-family: var(--mono); }
+  .empty { color: var(--faint); font-size: 13px; font-style: italic; padding: 7px 0; }
+  .pill {
+    display: inline-block; font: 11px var(--mono); padding: 1px 6px; border-radius: 20px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .pill.bad { border-color: var(--danger); color: var(--danger); }
+  .pill.ok { border-color: var(--good); color: var(--good); }
+  .stat { display: flex; gap: 18px; flex-wrap: wrap; margin: 0 0 14px; }
+  .stat div { min-width: 88px; }
+  .stat b { display: block; font-size: 22px; line-height: 1.1; }
+  .stat span { font-size: 12px; color: var(--faint); }
+  .note { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
+  .why { font-size: 12px; color: var(--faint); font-style: italic; }
+  h3.band { font-size: 14px; margin: 16px 0 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Second <span>Brain</span> — weekly review</h1>
+    <div class="spacer"></div>
+    <span class="sub" id="period"></span>
+    <a href="/">dashboard</a>
+    <a href="/study">study</a>
+  </header>
+
+  <!--
+    Tier 3. The system had three prompts — the habit check-in, the Resource
+    review, the "ready to graduate?" question — each on its own timer and each
+    answerable without ever looking at the week. Allen's argument for the
+    weekly review is that it is the load-bearing habit of the whole method:
+    without one place where everything outstanding is seen together, trust in
+    the system decays and you go back to keeping it in your head.
+
+    Zimmerman's self-regulated-learning cycle gives the order, and it is the
+    order of these three columns: forethought -> performance -> self-reflection,
+    with the reflection feeding the next forethought. Hence closed, slipped,
+    next — never three lists of things to click.
+  -->
+  <div id="body"><p class="sub">Reading the week…</p></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = t => String(t ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const pct = v => v == null ? "—" : Math.round(v * 100) + "%";
+
+async function api(path) {
+  const r = await fetch(path);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((data && data.error) || r.statusText);
+  return data;
+}
+
+function list(items, render, empty) {
+  if (!items || !items.length) return `<p class="empty">${esc(empty)}</p>`;
+  return `<ul class="items">${items.map(render).join("")}</ul>`;
+}
+
+function render(d) {
+  const c = d.closed, s = d.slipped, n = d.next;
+  $("#period").textContent = `${d.days} days, since ${d.since}`;
+
+  $("#body").innerHTML = `
+    <div class="cols">
+      <section class="card">
+        <h2>What closed</h2>
+        <p class="lede">The week that actually happened.</p>
+        <div class="stat">
+          <div><b>${c.steps.length}</b><span>steps done</span></div>
+          <div><b>${c.reviews}</b><span>cards reviewed</span></div>
+          <div><b>${c.minutes_studied}</b><span>min studying</span></div>
+          <div><b>${c.cards_learned}</b><span>new cards learned</span></div>
+        </div>
+        ${list(c.steps, x => `<li>${esc(x.step)}
+          <div class="meta">${esc(x.title)} · est ${x.estimated}m${x.actual ? ` · took ${x.actual}m` : " · untimed"}</div></li>`,
+          "No steps ticked this week.")}
+        ${c.projects.length ? `<h3 class="band">Finished</h3>` + list(c.projects,
+          x => `<li>${esc(x.title)}</li>`, "") : ""}
+        ${c.habits.length ? `<h3 class="band">Habits</h3>` + list(c.habits,
+          x => `<li>${esc(x.title)} <span class="pill ${x.times >= x.target ? "ok" : ""}">${x.times}/${x.target}</span></li>`, "") : ""}
+      </section>
+
+      <section class="card">
+        <h2>What slipped</h2>
+        <p class="lede">Not a scolding — the list you would otherwise carry in your head.</p>
+        ${list(s.projects, x => `<li>${esc(x.title)} <span class="pill bad">${x.days}d late</span>
+          <div class="meta">${pct(x.progress)} of steps done · was due ${x.deadline}</div></li>`,
+          "Nothing overdue.")}
+        ${s.steps.length ? `<h3 class="band">Scheduled and not done</h3>` + list(s.steps,
+          x => `<li>${esc(x.step)}<div class="meta">${esc(x.title)} · ${x.days}d ago</div></li>`, "") : ""}
+        ${s.habits.length ? `<h3 class="band">Habits</h3>` + list(s.habits, x => `<li>
+          ${esc(x.title)} ${x.alert ? `<span class="pill bad">2+ missed</span>` : ""}
+          <div class="meta">${esc(x.message)}</div>
+          ${(x.suggestions || []).map(g => `<div class="why">${esc(g.ask)} <span style="opacity:.75">${esc(g.why)}</span></div>`).join("")}
+        </li>`, "") : ""}
+        ${s.unconfirmed_dates && s.unconfirmed_dates.length
+          ? `<h3 class="band">Dates to confirm</h3>` + list(s.unconfirmed_dates,
+              x => `<li>${esc(x.title)}<div class="meta">read from “${esc(x.phrase || "")}”</div></li>`, "")
+          : ""}
+      </section>
+
+      <section class="card">
+        <h2>What's next</h2>
+        <p class="lede">One forward plan, instead of three prompts on three timers.</p>
+        ${list(n.actions, x => `<li>${esc(x.step.text)}<div class="meta">${esc(x.note_title)}</div></li>`,
+          "Nothing queued.")}
+        ${n.graduation.length ? `<h3 class="band">Ready to graduate</h3>` + list(n.graduation,
+          x => `<li>${esc(x.title)} <span class="pill ok">${pct(x.mastery)}</span></li>`, "") : ""}
+        ${n.habit_checkins.length ? `<h3 class="band">Check in on</h3>` + list(n.habit_checkins,
+          x => `<li>${esc(x.title)}<div class="meta">${x.last ? "last checked " + x.last : "never checked in"}</div></li>`, "") : ""}
+        ${n.resource_reviews.length ? `<h3 class="band">Still needed?</h3>` + list(n.resource_reviews,
+          x => `<li>${esc(x.title)}</li>`, "") : ""}
+      </section>
+    </div>
+
+    <h3 class="band" style="margin-top:26px">Reflection</h3>
+    <div class="cols">
+      <section class="card">
+        <h2>Your estimates</h2>
+        <p class="lede">The planning fallacy, measured on your own steps.</p>
+        <div class="stat">
+          <div><b>${d.estimates.multiplier}×</b><span>how long things really take</span></div>
+          <div><b>${d.estimates.n}</b><span>timed steps</span></div>
+        </div>
+        <p class="note">${esc(d.estimates.message)}</p>
+        ${list((d.estimates.worst || []).slice(0, 3),
+          x => `<li>${esc(x.step)}<div class="meta">${x.estimated}m planned · ${x.actual}m actual · ${x.ratio}×</div></li>`, "")}
+      </section>
+
+      <section class="card">
+        <h2>Did you know that you knew it?</h2>
+        <p class="lede">The gap between what you expected and what happened.</p>
+        <div class="stat">
+          <div><b>${d.calibration.brier ?? "—"}</b><span>Brier score (lower is better)</span></div>
+          <div><b>${pct(d.calibration.mean_confidence)}</b><span>you expected</span></div>
+          <div><b>${pct(d.calibration.mean_accuracy)}</b><span>you got</span></div>
+        </div>
+        <p class="note">${esc(d.calibration.message)}</p>
+      </section>
+
+      <section class="card">
+        <h2>Are the notes still atomic?</h2>
+        <p class="lede">Linking by title works only while they are.</p>
+        <p class="note">${esc(d.atomicity.message)}</p>
+        ${list((d.atomicity.findings || []).slice(0, 6),
+          x => `<li>${esc(x.title)} <span class="pill">${esc(x.rule)}</span>
+            <div class="meta">${esc(x.detail)}</div></li>`, "Nothing to fix.")}
+      </section>
+    </div>`;
+}
+
+api("/api/review/weekly")
+  .then(render)
+  .catch(e => { $("#body").innerHTML = `<p class="empty">Could not load the review: ${esc(e.message)}</p>`; });
+</script>
+</body>
+</html>

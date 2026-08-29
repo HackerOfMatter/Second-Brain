@@ -137,6 +137,30 @@ study:
   generate_max_cards: 20
   generate_per_passage: 3
 
+  # Card quality. A drafted answer longer than this, or one holding a
+  # list, is rewritten as cloze cards over the note's own sentence, or
+  # dropped if nothing in the note can cite it. Woźniak's minimum
+  # information principle — see docs/card-quality.md.
+  max_answer_words: 15
+  enforce_card_quality: true
+
+  # Metacognitive calibration. How far back the "you were sure and wrong"
+  # priority queue looks. A confident miss from four months ago is a card you
+  # have since relearned, not a belief you still hold.
+  overconfidence_window_days: 45
+
+  # Worked-example fading (Sweller). A card with a `Worked.` block shows it in
+  # full on the first attempt, as an opening fragment for the next few, and
+  # not at all once this share of the deck is mature — the expertise-reversal
+  # effect, where a scaffold that helped a novice hinders someone competent.
+  worked_example_fade_reps: 3
+  expertise_reversal_at: 0.6
+
+  # Personal FSRS weights fitted from _decks/_reviews.jsonl, when `weights:`
+  # above is empty. `python run.py fit` shows the fit; --write saves it, and
+  # refuses below ~1,000 reviews because below that it is noise.
+  use_fitted_weights: true
+
   # Graduation (blueprint §4). A card counts as learned once it has survived
   # `review.graduation_min_reps` spaced attempts *and* the model predicts it
   # will still be there this many days out.
@@ -147,3 +171,13 @@ study:
   calendar_event: true
   study_time: "19:30"
   study_minutes: 20
+
+connect:
+  # Link a note to the notes it mentions while it is being written,
+  # not later when you press a button. Only the free tiers run here
+  # (a note's own parent/child facts, and literal mentions of other
+  # note titles) — no embedding search, no model call, so a capture
+  # never waits on Ollama. The periodic pass still adds what the
+  # index finds.
+  link_on_write: true
+  max_links_on_write: 4

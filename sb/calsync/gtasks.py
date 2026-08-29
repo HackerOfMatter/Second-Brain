@@ -28,6 +28,55 @@ from .events import CalTask, tasks_for_vault
 
 MARKER = re.compile(r"\[sb:([^\]]+)\]")
 
+#: Read-back (roadmap 1.3). Sync has been one-way since it was built, which
+#: was correct while nothing outside the vault could change: the vault is the
+#: source of truth, and a two-way sync between a rich model and a lossy one is
+#: how you lose data.
+#:
+#: One field breaks that, and only one. On a phone, the thing lj can do to a
+#: Second Brain task is **tick it**. Nothing else about the project is even
+#: visible there, so nothing else can meaningfully disagree.
+#:
+#: So the conflict rule is per-field rather than last-writer-wins:
+#:
+#:   * **the vault wins on content** — title, notes, due date, progress. Those
+#:     are derived from the note and are rewritten on every push, so an edit
+#:     made in Google is overwritten by design.
+#:   * **Google wins on completion** — because it is the only field lj edits
+#:     there, and a tick that gets silently undone on the next sync is worse
+#:     than no sync at all.
+#:
+#: Kleppmann's argument against generic last-writer-wins is exactly this: LWW
+#: discards a real edit whenever clocks or ordering disagree. Terry et al.'s
+#: Bayou made the same case for application-specific merge procedures — the
+#: application knows which field means what, and a generic rule cannot.
+
+
+def completed_uids(svc, list_id: str) -> Dict[str, dict]:
+    """Tasks this system owns that have been ticked, wherever they were ticked.
+
+    `showCompleted` plus `showHidden` is required together: Google hides a
+    completed task from the default listing, so asking only for completed
+    tasks returns nothing.
+    """
+    return {
+        uid: item
+        for uid, item in _existing(svc, list_id).items()
+        if (item.get("status") or "").lower() == "completed"
+    }
+
+
+def read_back(cfg: Config) -> Dict[str, dict]:
+    """Every ticked task, keyed by uid. Network call; raises like any other."""
+    svc = _google_service(cfg, "tasks", "v1")
+    return completed_uids(svc, ensure_tasklist(svc, cfg))
+
+
+def note_id_of(uid: str) -> str:
+    """`20260826T101500-learn-rust-due@second-brain.local` -> the note id."""
+    head = (uid or "").split("@", 1)[0]
+    return head[: -len("-due")] if head.endswith("-due") else head
+
 
 class GoogleTasksSink:
     name = "gtasks"

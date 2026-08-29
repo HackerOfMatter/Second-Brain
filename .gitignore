@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 config.yaml
 _system/
+_decks/
+_labels/
 
 # personal vault content (not part of the code repo)
 00-Inbox/
@@ -12,7 +14,13 @@ _system/
 30-Resources/
 40-Archive/
 .obsidian/
-_to_delete/
+.to-delete-offline/
 *.lnk
 Start here.md
 Untitled.md
+
+# bulk file dump — hidden from Obsidian with a dot prefix
+.archive-offline/
+.sb*.tgz
+.pycache-quarantine/
+.obsidian/workspace.json.stale-backup-*

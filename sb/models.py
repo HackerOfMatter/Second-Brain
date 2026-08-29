@@ -106,6 +106,19 @@ class Step(BaseModel):
     done: bool = False
     done_at: Optional[dt.datetime] = None
     scheduled: Optional[dt.datetime] = None  # set by the planner, pushed to calendar
+    #: When the clock was started on this step, and how long it really took.
+    #: `minutes` is the plan and is never overwritten by reality — keeping both
+    #: is the entire point, because the pair is the training data for the
+    #: reference-class correction in sb/forecasting.py.
+    started_at: Optional[dt.datetime] = None
+    actual_minutes: Optional[int] = None
+
+    @property
+    def overrun(self) -> Optional[float]:
+        """Actual over estimated, or None if this step was never timed."""
+        if not self.actual_minutes or self.minutes <= 0:
+            return None
+        return round(self.actual_minutes / self.minutes, 3)
 
 
 class Material(BaseModel):
@@ -203,16 +216,75 @@ class SrsState(BaseModel):
     history: List[Dict[str, Any]] = Field(default_factory=list)
 
 
-class HabitMeta(BaseModel):
-    """Area habit tracking (§8): fixed schedule + weekly continue/change check-in."""
+class HabitEvent(BaseModel):
+    """One occurrence: when, and — if known — what time and where.
+
+    Time and place are not decoration. Wendy Wood's finding is that context
+    stability, not frequency, is what turns a behaviour automatic, and a bare
+    date cannot express that. Both are optional, because a habit logged with
+    a tap and no context is still a habit logged.
+    """
 
     model_config = ConfigDict(extra="ignore")
+
+    on: dt.date
+    at: str = ""      # HH:MM, when it actually happened
+    place: str = ""
+
+
+class HabitMeta(BaseModel):
+    """Area habit tracking (§8), rebuilt around the causal levers.
+
+    `target_count` was the whole of phase 3's habit model and is the weakest
+    thing here: it measures the habit rather than causing it. The fields above
+    it are ordered by effect size in the literature — see sb/habits.py, which
+    holds the reasoning and the citations. They are separate strings rather
+    than one free-text plan because a sentence with a blank in it is a
+    sentence that gets left blank.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    #: Gollwitzer's implementation intention: "When [cue], I will [behaviour]
+    #: at [place]." d ≈ 0.65 — the largest single effect in the field.
+    cue: str = ""
+    behaviour: str = ""
+    place: str = ""
+    #: Fogg / Clear: the existing routine this attaches to. "After what?"
+    anchor: str = ""
+    #: Wood: one thing made easier for this, one made harder for its rival.
+    easier: str = ""
+    harder: str = ""
 
     cadence: Cadence = Cadence.WEEKLY
     target_count: int = 3  # occurrences per cadence period
     checkins: List[Dict[str, Any]] = Field(default_factory=list)
     last_checkin: Optional[dt.date] = None
-    log: List[dt.date] = Field(default_factory=list)
+    log: List[HabitEvent] = Field(default_factory=list)
+
+    @field_validator("log", mode="before")
+    @classmethod
+    def _coerce_log(cls, value: Any) -> Any:
+        """Accept the old shape: a bare list of dates.
+
+        Every habit logged before occurrences carried a time and a place is a
+        list of `date` on disk, and the vault is the source of truth — nobody
+        is going to migrate it by hand.
+        """
+        if not isinstance(value, list):
+            return value
+        out: List[Any] = []
+        for item in value:
+            if isinstance(item, (dt.date, str)):
+                out.append({"on": item})
+            else:
+                out.append(item)
+        return out
+
+    @property
+    def dates(self) -> List[dt.date]:
+        """The occurrence dates alone — what the old `log` used to be."""
+        return [e.on for e in self.log if e.on]
 
 
 #: Which weekdays a habit lands on for a given "n times per period" target.
@@ -275,6 +347,27 @@ class ReviewMeta(BaseModel):
     last: Optional[dt.date] = None
 
 
+class IntakeMeta(BaseModel):
+    """Where a note came from when it arrived as a file (see sb/intake.py).
+
+    Kept on the note rather than only in a log, because the question this
+    answers — "why is this filed here?" — gets asked while looking at the
+    note, and a log has rotated by then. `filed_automatically` false means the
+    note is waiting in the Inbox for lj to confirm the suggestion.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    file: str = ""                        # the dropped filename
+    dropped_at: Optional[dt.datetime] = None
+    suggested: str = ""                   # area | project | resource
+    confidence: float = 0.0               # 0..1; below the floor means "ask"
+    reason: str = ""
+    signals: List[str] = Field(default_factory=list)
+    decided_by: str = "rules"             # rules | rules+model | model | manual
+    filed_automatically: bool = False
+
+
 class HistoryEntry(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -299,7 +392,7 @@ class Note(BaseModel):
     created: dt.datetime = Field(default_factory=now)
     updated: dt.datetime = Field(default_factory=now)
     tags: List[str] = Field(default_factory=list)
-    source: str = "capture"  # capture | graduation | restore | import
+    source: str = "capture"  # capture | drop | graduation | restore | import
     history: List[HistoryEntry] = Field(default_factory=list)
 
     # Colour keyword (fun / health / chore / hw / study / quiz / ...). Left
@@ -312,6 +405,7 @@ class Note(BaseModel):
     habit: Optional[HabitMeta] = None
     schedule: Optional[AreaSchedule] = None
     review: Optional[ReviewMeta] = None
+    intake: Optional[IntakeMeta] = None
 
     body: str = ""
 

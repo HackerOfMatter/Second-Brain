@@ -9,10 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-import httpx
-
 from ..config import LLMConfig
-from . import _json
+from . import _http, _json
 
 
 class OllamaProvider:
@@ -40,14 +38,14 @@ class OllamaProvider:
 
     def available(self) -> bool:
         try:
-            r = httpx.get(f"{self.base}/api/tags", timeout=2.0)
+            r = _http.client(self.base).get("/api/tags", timeout=2.0)
             return r.status_code == 200
         except Exception:
             return False
 
     def models(self) -> List[str]:
         try:
-            r = httpx.get(f"{self.base}/api/tags", timeout=5.0)
+            r = _http.client(self.base).get("/api/tags", timeout=5.0)
             r.raise_for_status()
             return [m["name"] for m in r.json().get("models", [])]
         except Exception:
@@ -69,7 +67,7 @@ class OllamaProvider:
         }
         if json_mode:
             payload["format"] = "json"
-        r = httpx.post(f"{self.base}/api/chat", json=payload, timeout=self.cfg.timeout_s)
+        r = _http.client(self.base).post("/api/chat", json=payload, timeout=self.cfg.timeout_s)
         r.raise_for_status()
         return r.json().get("message", {}).get("content", "")
 
@@ -95,8 +93,8 @@ class OllamaProvider:
         """
         out: List[List[float]] = []
         for text in texts:
-            r = httpx.post(
-                f"{self.base}/api/embeddings",
+            r = _http.client(self.base).post(
+                "/api/embeddings",
                 json={
                     "model": self.cfg.embed_model,
                     "prompt": text,

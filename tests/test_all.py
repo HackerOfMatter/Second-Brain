@@ -26,6 +26,7 @@ from sb import (  # noqa: E402
     fsrs,
     generate,
     index as idxmod,
+    intake as intakemod,
     parser,
     taxonomy,
     tutor,
@@ -43,6 +44,7 @@ from sb.models import (  # noqa: E402
     HabitMeta,
     Note,
     ProjectMeta,
+    ProjectStatus,
     Step,
 )
 from sb.vault import Vault  # noqa: E402
@@ -2286,6 +2288,123 @@ def test_card_generation():
           generate.generate("", cfg).cards == [] and generate.generate("", cfg).note)
 
 
+def test_card_quality():
+    """Woźniak's minimum information principle, as a gate (sb/quality.py).
+
+    Two failure directions matter equally. Letting an enumeration through
+    ships a card that spaced repetition will drill forever and never teach;
+    flagging "September 4, 2026" as a list would gut the deck. The false
+    positives are checked as hard as the true ones.
+    """
+    section("card quality: minimum information")
+    from sb import quality
+
+    check("one fact passes", quality.assess("What is the capital of France?", "Paris").ok)
+    check("a date is not a list",
+          quality.assess("When is it due?", "September 4, 2026").ok)
+    check("a thousands separator is not a list",
+          quality.assess("How many reviews?", "about 1,000").ok)
+    check("a fixed pair is one term",
+          quality.assess("What seasoning?", "salt and pepper").ok)
+    check("'the difference between X and Y' is one idea",
+          quality.assess("What is the difference?", "stability is how long a memory lasts").ok)
+
+    enum = quality.assess("What are the branches?", "legislative, executive, and judicial")
+    check("an enumeration is caught", enum.rule == "enumeration", enum.rule)
+    check("and its items are recovered", len(enum.items) == 3, enum.items)
+    pair = quality.assess("What happens?", "price falls and quantity demanded rises")
+    check("two facts in one answer is two cards", pair.rule == "set", pair.rule)
+    check("a list question is caught",
+          quality.assess("List the PARA buckets", "Projects, Areas").rule == "list-question")
+    long_answer = " ".join(["word"] * 20)
+    check("an over-long answer is caught",
+          quality.assess("Why?", long_answer).rule == "length")
+    check("a paragraph is past repair",
+          quality.assess("Why?", " ".join(["word"] * 40)).rule == "length")
+    check("the limit is configurable",
+          quality.assess("Why?", long_answer, max_words=25).ok)
+
+    section("card quality: repair, not just refusal")
+    passage = (
+        "The three branches of government are legislative, executive, and judicial. "
+        "Opportunity cost is the value of the next best alternative you gave up when "
+        "you made a choice."
+    )
+    split = quality.split_to_cloze(
+        "legislative, executive, and judicial",
+        "The three branches of government are legislative, executive, and judicial.",
+    )
+    check("a list becomes one card per item", len(split) == 3, len(split))
+    check("each card blanks exactly one item",
+          all(len(cardsmod.CLOZE.findall(f)) == 1 for f, _, _ in split))
+    check("every repaired card is verbatim from the note",
+          all(src in passage for _, _, src in split))
+    check("the answer is what the blank hides",
+          all(b in f for f, b, _ in split))
+    check("an uncitable list is not repaired",
+          quality.split_to_cloze("alpha, beta, gamma", "nothing relevant here at all") == [])
+
+    clozed = quality.to_cloze(
+        "What is opportunity cost?",
+        "the value of the next best alternative you gave up",
+        "", passage,
+    )
+    check("rule 5: a definition becomes a blank", clozed is not None)
+    check("and the blank falls on the term, not the definition",
+          clozed and clozed[1].lower() == "opportunity cost", clozed and clozed[1])
+    check("a non-definitional question is left alone",
+          quality.to_cloze("Why does it happen?", "because of x", "", passage) is None)
+
+    section("card quality: inside the generator")
+    cfg = Config()
+    payload = {"cards": [
+        {"q": "What are the three branches of government?",
+         "a": "legislative, executive, and judicial",
+         "why": "The three branches of government are legislative, executive, and judicial."},
+        {"q": "What are the two capitals?", "a": "Alpha and Beta",
+         "why": "Nothing in the passage supports this at all whatsoever."},
+        {"q": "Which branch interprets the law?", "a": "The judicial branch",
+         "why": "The three branches of government are legislative, executive, and judicial."},
+    ]}
+    original = generate.resolve_provider
+    generate.resolve_provider = lambda c, role='': FakeLLM(payload)
+    try:
+        r = generate.generate(passage, cfg, subject="Civics", max_cards=20)
+        check("no card ships with a list answer",
+              not any(len(quality.facts(c.back)) > 1 for c in r.cards),
+              [c.back for c in r.cards])
+        check("the list was rewritten, not thrown away", r.repaired >= 1, r.repaired)
+        check("the uncitable one was dropped", r.rejected >= 1, r.rejections)
+        check("and the deck says which rule dropped it", bool(r.rejections), r.rejections)
+        check("the one-fact card survives untouched",
+              any(c.back == "The judicial branch" for c in r.cards), [c.back for c in r.cards])
+        check("repaired cards are still drafts", all(c.status == "draft" for c in r.cards))
+
+        cfg_off = Config()
+        cfg_off.study.enforce_card_quality = False
+        r_off = generate.generate(passage, cfg_off, subject="Civics", max_cards=20)
+        check("enforcement can be switched off",
+              any(len(quality.facts(c.back)) > 1 for c in r_off.cards),
+              [c.back for c in r_off.cards])
+    finally:
+        generate.resolve_provider = original
+
+    section("card quality: a card you typed is a decision")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg2 = Config(vault=Path(tmp) / "vault")
+        cfg2.llm.provider = "heuristic"
+        cfg2.calendar.sink = "ics"
+        engine = Engine(cfg2)
+        note_id = engine.capture("Civics revision", "resource")["note"]["id"]
+        out = engine.add_card(note_id, "What are the branches?", "legislative, executive, judicial")
+        check("a hand-written list card is still added",
+              any(c["back"].startswith("legislative") for c in out["cards"]),
+              out["cards"])
+        check("but it comes back with the warning", bool(out.get("warning")), out.get("warning"))
+        clean = engine.add_card(note_id, "Which branch interprets the law?", "the judicial branch")
+        check("a good card warns about nothing", not clean.get("warning"), clean.get("warning"))
+
+
 def _deck_with(note_id, subject, n, due_offset=0, category="study"):
     deck = cardsmod.Deck(note_id=note_id, subject=subject, category=category)
     for i in range(n):
@@ -2947,6 +3066,936 @@ def test_capture_reads_once():
               "Learn Rust generics" in ics)
 
 
+def test_link_at_write_time():
+    """Roadmap Tier 1.1 — a note is born linked, not linked later by a button.
+
+    The claim being tested is not just that links appear. It is that they
+    appear *for free*: no extra walk of the vault, no model call, no index.
+    Each of those is checked, because the reason linking was a separate pass
+    in the first place was that nobody wanted a capture to pay for it.
+    """
+    section("linking happens at write time")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+
+        first = engine.capture("Amdahl's Law", "resource")
+        check("the first note in an empty vault links nothing, and survives it",
+              first["links"]["linked"] == 0, first["links"])
+
+        engine.capture("Little's Law", "resource")
+        made = engine.capture(
+            "Read the chapter on Amdahl's Law and compare it to Little's Law by Friday",
+            "project",
+        )
+        note = engine.note(made["note"]["id"])
+        check("a captured note comes out already linked",
+              made["links"]["linked"] >= 1, made["links"])
+        check("and the Related section is in the file on disk",
+              "## Related" in note.body, note.body[:200])
+        check("linking to the note it actually mentions",
+              "[[Amdahl's Law]]" in note.body, note.body)
+        check("the capture response says what it linked",
+              any("Amdahl" in t for t in made["links"]["titles"]), made["links"])
+
+        # The whole argument for doing this on the write path is that the free
+        # tiers need the snapshot the caller already holds.
+        existing = len(engine.vault.notes())
+        calls = _count_reads(engine.vault)
+        engine.capture("Another note mentioning Amdahl's Law", "resource")
+        check("linking on write adds no extra walk of the vault",
+              calls["n"] <= existing + 2, f"{calls['n']} reads for {existing} notes")
+
+        # A capture must never wait on Ollama, so the model tiers do not run.
+        from sb import connect as connectmod
+        judged = {"n": 0}
+        real_judge = connectmod.judge
+        connectmod.judge = lambda *a, **k: judged.__setitem__("n", judged["n"] + 1)
+        try:
+            engine.capture("Yet another note about Amdahl's Law and Little's Law", "resource")
+        finally:
+            connectmod.judge = real_judge
+        check("and never asks the model", judged["n"] == 0, judged)
+
+        # Off means off.
+        cfg2 = Config(vault=Path(tmp) / "vault2")
+        cfg2.llm.provider = "heuristic"
+        cfg2.calendar.sink = "ics"
+        cfg2.connect.link_on_write = False
+        e2 = Engine(cfg2)
+        e2.capture("Amdahl's Law", "resource")
+        off = e2.capture("A project about Amdahl's Law", "project")
+        check("the write-time pass can be switched off", off["links"]["linked"] == 0, off["links"])
+
+        # An Area is not a connectable bucket (Archive and Areas are excluded
+        # in connect.CONNECTABLE); it must not grow a Related section here.
+        area = engine.capture("Go to the gym every Tuesday", "area")
+        check("an Area is not linked on write", area["links"]["linked"] == 0, area["links"])
+
+        # The periodic pass must still be allowed to visit the note and add
+        # what the index finds — link-on-write deliberately does not write the
+        # fingerprint that would gate it out.
+        state = connectmod.ConnectState(cfg).load()
+        check("write-time linking does not gate out the periodic tidy",
+              made["note"]["id"] not in state, state)
+
+
+def test_atomic_rename_is_patient_on_windows():
+    """sb/atomic.py — the fix for four Windows-only failures.
+
+    POSIX `os.replace` cannot fail for a reason that goes away on the next
+    attempt. Windows' can: another handle on the destination — the other
+    writer, Defender scanning the file we just created, Obsidian or OneDrive
+    watching the folder — makes `MoveFileEx` return Access Denied or Sharing
+    Violation, non-deterministically, in code that is otherwise correct.
+
+    None of this reproduces on Linux, which is the whole reason the suite had
+    to be run on lj-studio. So the tests drive the retry through injected
+    failures rather than hoping the platform provides them.
+    """
+    section("atomic renames survive a Windows lock")
+    from sb import atomic
+
+    def winerr(number, message="busy"):
+        exc = OSError(number, message)
+        exc.winerror = number
+        return exc
+
+    check("a sharing violation is a busy signal", atomic.is_transient(winerr(32)))
+    check("so is access denied", atomic.is_transient(winerr(5)))
+    check("a real error is not", not atomic.is_transient(winerr(13)))
+    check("and a plain POSIX error is not",
+          not atomic.is_transient(PermissionError(13, "Permission denied")))
+    check("nor is something that is not an OSError", not atomic.is_transient(ValueError("x")))
+
+    calls = {"n": 0, "slept": 0.0}
+    real_replace, real_sleep = atomic._raw_replace, atomic.time.sleep
+    atomic.time.sleep = lambda d: calls.__setitem__("slept", calls["slept"] + d)
+    try:
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise winerr(32, "used by another process")
+        atomic._raw_replace = flaky
+        atomic.replace("a", "b")
+        check("a locked destination is retried, not failed", calls["n"] == 3, calls["n"])
+        check("and it backs off between attempts", calls["slept"] > 0, calls["slept"])
+
+        calls["n"] = 0
+        def always_denied(src, dst):
+            calls["n"] += 1
+            raise winerr(5)
+        atomic._raw_replace = always_denied
+        try:
+            atomic.replace("a", "b")
+            check("a permanently locked file eventually raises", False, "no exception")
+        except OSError:
+            check("a permanently locked file eventually raises", True)
+        check("after a bounded number of attempts",
+              calls["n"] == atomic.ATTEMPTS, calls["n"])
+
+        calls["n"] = 0
+        def real_failure(src, dst):
+            calls["n"] += 1
+            raise winerr(13, "no such device")
+        atomic._raw_replace = real_failure
+        try:
+            atomic.replace("a", "b")
+        except OSError:
+            pass
+        check("a real error is raised at once, not retried for a second",
+              calls["n"] == 1, calls["n"])
+    finally:
+        atomic._raw_replace, atomic.time.sleep = real_replace, real_sleep
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = Path(tmp) / "src.txt", Path(tmp) / "dst.txt"
+        src.write_text("new", encoding="utf-8")
+        dst.write_text("old", encoding="utf-8")
+        atomic.replace(src, dst)
+        check("and it is still an ordinary replace", dst.read_text(encoding="utf-8") == "new")
+        check("with the temp file consumed", not src.exists())
+
+        a, b = Path(tmp) / "a.txt", Path(tmp) / "sub" / "b.txt"
+        a.write_text("x", encoding="utf-8")
+        b.parent.mkdir()
+        atomic.move(a, b)
+        check("move still moves", b.exists() and not a.exists())
+
+    # The write paths that matter must actually go through it. A helper
+    # nothing calls is the failure this whole session was about.
+    import inspect
+    from sb import cards as _cards, intake as _intake, vault as _vault
+    check("Vault.write replaces through atomic",
+          "atomic.replace" in inspect.getsource(_vault.Vault.write))
+    check("Vault.save moves through atomic",
+          "atomic.move" in inspect.getsource(_vault.Vault.save))
+    check("repair_filenames moves through atomic",
+          "atomic.move" in inspect.getsource(_vault.Vault.repair_filenames))
+    check("deck saves replace through atomic",
+          "atomic.replace" in inspect.getsource(_cards.DeckStore.save))
+    check("the Drop folder files through atomic",
+          "atomic.move" in inspect.getsource(_intake.file_away))
+
+
+def _study_engine(tmp, name="v"):
+    cfg = Config(vault=Path(tmp) / name)
+    cfg.llm.provider = "heuristic"
+    cfg.calendar.sink = "ics"
+    return Config, cfg, Engine(cfg)
+
+
+def test_calibration():
+    """Roadmap 2.2 — did you know that you knew it?
+
+    The scheduler has always known whether lj was right. Koriat & Bjork's
+    illusion of competence is invisible to it, because FSRS only ever sees the
+    grade. What this adds is the prediction made *before* the reveal, and the
+    gap between the two.
+    """
+    section("calibration: predicted vs actual")
+    from sb import calibration as cal
+
+    check("the tap names become probabilities", cal.clamp("sure") == 0.9)
+    check("0..100 is accepted", cal.clamp(85) == 0.85)
+    check("0..1 is accepted", cal.clamp(0.42) == 0.42)
+    check("out of range is clamped, not rejected", cal.clamp(140) == 1.0)
+    check("nonsense is absent, not zero", cal.clamp("banana") is None)
+    check("absent stays absent", cal.clamp(None) is None)
+    check("Hard counts as a miss", not cal.is_correct(2))
+    check("Good counts as recall", cal.is_correct(3))
+
+    # Perfectly calibrated: sure-and-right, unsure-and-wrong.
+    perfect = [{"confidence": 1.0, "grade": 4}] * 10 + [{"confidence": 0.0, "grade": 1}] * 10
+    curve = cal.curve(perfect)
+    check("a perfect predictor scores 0", curve.brier == 0.0, curve.brier)
+    check("with no overconfidence", curve.overconfidence == 0.0, curve.overconfidence)
+
+    # The human shape: sure, and wrong half the time.
+    overconfident = [
+        {"confidence": 0.9, "grade": 4, "note_id": "n", "card": f"c{i}"} for i in range(10)
+    ] + [
+        {"confidence": 0.9, "grade": 1, "note_id": "n", "card": f"c{i}"} for i in range(10)
+    ]
+    curve2 = cal.curve(overconfident)
+    check("overconfidence is measured", curve2.overconfidence > 0.3, curve2.overconfidence)
+    check("and the band is counted", curve2.overconfident == 10, curve2.overconfident)
+    check("a guess of 50% everywhere scores about 0.25",
+          abs(cal.curve([{"confidence": 0.5, "grade": g} for g in (1, 4)] * 10).brier - 0.25) < 1e-6)
+    check("reviews with no prediction are not data",
+          cal.curve([{"grade": 4}, {"grade": 1}]).n == 0)
+    check("and that is said, not hidden", "Tap how sure" in cal.curve([{"grade": 4}]).message)
+
+    hot = cal.overconfident_cards(overconfident)
+    check("repeat confident misses collapse to one card with a count",
+          len(hot) == 10 and all(h["times"] == 1 for h in hot), len(hot))
+    twice = [{"confidence": 0.95, "grade": 1, "note_id": "n", "card": "c1"}] * 3
+    check("a card missed confidently three times says three",
+          cal.overconfident_cards(twice)[0]["times"] == 3)
+    check("being right but unsure is not in the queue",
+          not cal.overconfident_cards([{"confidence": 0.1, "grade": 4, "note_id": "n", "card": "x"}]))
+
+    section("calibration: through the tutor")
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+        nid = engine.capture("Econ revision", "resource")["note"]["id"]
+        engine.add_card(nid, "What is opportunity cost?", "the next best alternative")
+        deck = engine.deck(nid)
+        cid = deck.cards[0].id
+
+        out = engine.study_answer(nid, cid, grade=1, confidence="sure")
+        check("the prediction is recorded", out["confidence"] == 0.9, out["confidence"])
+        check("and being sure and wrong is flagged", out["overconfident"] is True)
+        check("a missed card asks why", out["ask_why"] is True)
+        logged = list(engine.decks.reviews())
+        check("it rides on the review line, not a second store",
+              logged and logged[-1]["confidence"] == 0.9, logged[-1] if logged else None)
+
+        out2 = engine.study_answer(nid, cid, grade=4)
+        check("a session that never predicts still works", out2["confidence"] is None)
+        check("and a card answered well is not interrupted", out2["ask_why"] is False)
+
+        stats = engine.study_stats()
+        check("the progress tab carries the curve", "calibration" in stats)
+        check("and the cards to look at", "overconfident_cards" in stats)
+
+
+def test_self_explanation():
+    """Roadmap 2.3 — lj explains first, the model marks it, nothing is staked."""
+    section("self-explanation (the generation effect, prompted)")
+    check("Again asks", tutor.wants_self_explanation(1))
+    check("Hard asks", tutor.wants_self_explanation(2))
+    check("Good does not", not tutor.wants_self_explanation(3))
+    check("Easy does not", not tutor.wants_self_explanation(4))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+        nid = engine.capture(
+            "Opportunity cost is the value of the next best alternative you gave up.",
+            "resource",
+        )["note"]["id"]
+        engine.add_card(nid, "What is opportunity cost?", "the next best alternative given up",
+                        source="Opportunity cost is the value of the next best alternative you gave up.")
+        cid = engine.deck(nid).cards[0].id
+
+        good = engine.study_self_explain(nid, cid, "because choosing one thing means giving up the next best alternative")
+        check("an explanation that covers the answer scores well",
+              good["score"] > 0.3, good["score"])
+        poor = engine.study_self_explain(nid, cid, "dunno")
+        check("one that does not, does not", poor["score"] < good["score"], (poor["score"], good["score"]))
+        empty = engine.study_self_explain(nid, cid, "   ")
+        check("nothing written is 'off', not a crash", empty["verdict"] == "off")
+        check("the tutor's own explanation comes after, not before", "answer" in good)
+
+        card = engine.deck(nid).card(cid)
+        check("nothing was scheduled by explaining", card.reps == 0 and card.stability == 0)
+        lines = list(engine.decks.explanations())
+        check("it is logged to its own file, never the review log", len(lines) == 3, len(lines))
+        check("so the streak and any future FSRS fit are untouched",
+              not list(engine.decks.reviews()))
+
+
+def test_habits_rewritten():
+    """Roadmap 2.4 — the causal levers, not the occurrence count."""
+    section("habits: implementation intentions")
+    from sb import habits
+    from sb.models import HabitEvent, HabitMeta
+
+    h = HabitMeta(cue="I pour my morning coffee", behaviour="read one paper", place="the kitchen table")
+    check("Gollwitzer's sentence is rendered, not stored",
+          habits.intention_sentence(h) ==
+          "When I pour my morning coffee, I will read one paper at the kitchen table.",
+          habits.intention_sentence(h))
+    check("a half-written plan renders nothing",
+          habits.intention_sentence(HabitMeta(cue="x")) == "")
+    check("the Area's title stands in for the behaviour",
+          "go to the gym" in habits.intention_sentence(HabitMeta(cue="I finish work"), fallback="go to the gym"))
+    check("and the blanks are named", habits.intention_missing(HabitMeta()) == ["cue", "behaviour", "place"])
+
+    section("habits: never miss twice")
+    today = dt.date(2026, 8, 26)          # a Wednesday
+    def weeks_ago(n, day=0):
+        return today - dt.timedelta(days=today.weekday()) - dt.timedelta(weeks=n) + dt.timedelta(days=day)
+
+    kept = HabitMeta(target_count=2, log=[
+        HabitEvent(on=weeks_ago(w, d)) for w in (1, 2, 3) for d in (0, 2)
+    ])
+    report = habits.misses(kept, on=today)
+    check("a habit being kept has no misses", report.consecutive_misses == 0, report.consecutive_misses)
+    check("and no alert", not report.alert)
+
+    one = HabitMeta(target_count=2, log=[HabitEvent(on=weeks_ago(w, d)) for w in (2, 3) for d in (0, 2)])
+    r1 = habits.misses(one, on=today)
+    check("one missed week is one miss", r1.consecutive_misses == 1, r1.consecutive_misses)
+    check("and is explicitly not a failure", not r1.alert and "never miss twice" in r1.message, r1.message)
+
+    two = HabitMeta(target_count=2, log=[HabitEvent(on=weeks_ago(3, d)) for d in (0, 2)])
+    r2 = habits.misses(two, on=today)
+    check("two in a row is the alert", r2.consecutive_misses == 2 and r2.alert, r2.consecutive_misses)
+    check("and it says to shrink the target, not restart",
+          "shrink" in r2.message.lower(), r2.message)
+    check("the unfinished current week is never counted as a miss",
+          habits.misses(HabitMeta(target_count=5, log=[HabitEvent(on=today)]), on=today).consecutive_misses == 0)
+
+    section("habits: context stability")
+    steady = HabitMeta(log=[
+        HabitEvent(on=today - dt.timedelta(days=i), at="07:15", place="the garage") for i in range(6)
+    ])
+    st = habits.stability(steady)
+    check("same time every day is stable", st.time_stability == 1.0, st.time_stability)
+    check("same place too", st.place_stability == 1.0, st.place_stability)
+    scattered = HabitMeta(log=[
+        HabitEvent(on=today - dt.timedelta(days=i), at=t, place=p)
+        for i, (t, p) in enumerate([("06:00", "gym"), ("13:00", "home"), ("21:00", "office"),
+                                    ("07:00", "gym"), ("19:00", "park"), ("11:00", "home")])
+    ])
+    sc = habits.stability(scattered)
+    check("scattered is not", (sc.time_stability or 1) < 0.6, sc.time_stability)
+    check("and it says what that costs", "automates" in sc.message, sc.message)
+    check("too few occurrences says so, rather than guessing",
+          not habits.stability(HabitMeta(log=[HabitEvent(on=today)])).enough)
+
+    section("habits: through the engine")
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+        aid = engine.capture("Strength training", "area")["note"]["id"]
+        out = engine.set_habit(aid, cue="I finish breakfast", behaviour="do 20 minutes",
+                               place="the garage", anchor="breakfast",
+                               easier="bag packed the night before", harder="phone left upstairs")
+        check("the intention comes back", out["habit"]["intention"].startswith("When I finish breakfast"))
+        note = engine.note(aid)
+        check("and is rendered into the note, above the target",
+              note.body.index("When I finish breakfast") < note.body.index("Target"), note.body[:400])
+        check("the friction is in the note too", "Made easier" in note.body and "Made harder" in note.body)
+
+        event = calevents.area_event(note, cfg)
+        check("and in the calendar reminder, where the cue actually fires",
+              "When I finish breakfast" in event.description, event.description[:200])
+        check("with the anchor", "Right after: breakfast" in event.description)
+
+        engine.log_habit(aid, at="07:30", place="the garage")
+        engine.log_habit(aid, at="07:30", place="the garage")
+        check("logging the same slot twice does not inflate the count",
+              len(engine.note(aid).habit.log) == 1)
+
+        ci = engine.habit_checkin(aid, "change", 2)
+        check("the check-in still accepts a count change", engine.note(aid).habit.target_count == 2)
+        check("but leads with the misses", "misses" in ci["habit"])
+        check("and names what is still blank", "intention_missing" in ci["habit"])
+        check("only Areas have habits",
+              _raises(lambda: engine.habit_checkin(
+                  engine.capture("a project", "project")["note"]["id"], "continue")))
+
+    section("habits: the old shape still reads")
+    old = HabitMeta(**{"target_count": 2, "log": ["2026-08-01", dt.date(2026, 8, 3)]})
+    check("a bare list of dates is coerced, not rejected", len(old.log) == 2, old.log)
+    check("and comes back as dates", old.dates == [dt.date(2026, 8, 1), dt.date(2026, 8, 3)])
+
+
+def _raises(fn):
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
+def test_forecasting():
+    """Roadmap 2.5 — the planning fallacy, corrected from lj's own history."""
+    section("estimates scored against reality")
+    from sb import forecasting as fc
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+        nid = engine.capture(
+            "Write the essay by Friday\n- outline it\n- draft it\n- edit it", "project"
+        )["note"]["id"]
+        note = engine.note(nid)
+        first = note.project.steps[0].id
+
+        engine.start_step(nid, first)
+        out = engine.toggle_step(nid, first, minutes=120)
+        check("a finished step records what it really took",
+              engine.note(nid).project.steps[0].actual_minutes == 120)
+        check("and the plan is not overwritten by it",
+              engine.note(nid).project.steps[0].minutes != 120)
+        check("the response carries the comparison", out["accuracy"]["ratio"] > 1)
+
+        engine.toggle_step(nid, first)
+        check("reopening throws the measurement away rather than keeping a lie",
+              engine.note(nid).project.steps[0].actual_minutes is None)
+
+        untimed = engine.note(nid).project.steps[1].id
+        engine.toggle_step(nid, untimed)
+        check("a step finished without a clock stays untimed",
+              engine.note(nid).project.steps[1].actual_minutes is None)
+
+    section("reference classes")
+    notes = []
+    for i in range(6):
+        n = Note(id=f"n{i}", title=f"P{i}", bucket=Bucket.PROJECT)
+        n.project = ProjectMeta(level=3, steps=[
+            Step(id="s1", text="x", minutes=30, done=True, actual_minutes=60)
+        ])
+        notes.append(n)
+    table = fc.classes(fc.observations(notes))
+    check("six timed steps is enough for a class", table["all"].enough)
+    check("and the ratio is the median, not the mean", table["all"].median_ratio == 2.0)
+    forecast = fc.adjust(60, 3, table)
+    check("a new estimate is scaled by it", forecast.minutes == 120, forecast.minutes)
+    check("and says so, rather than doing it quietly",
+          "60 × 2.0" in forecast.explanation, forecast.explanation)
+
+    outlier = notes + [Note(id="x", title="X", bucket=Bucket.PROJECT, project=ProjectMeta(
+        level=3, steps=[Step(id="s", text="left running", minutes=5, done=True, actual_minutes=900)]))]
+    table2 = fc.classes(fc.observations(outlier))
+    check("a timer left running overnight does not move the multiplier",
+          table2["all"].multiplier == table["all"].multiplier, table2["all"].multiplier)
+    check("the multiplier is capped so one bad day cannot ruin the calendar",
+          fc.build_class("t", [fc.Observation("n", "t", "s", 5, 50, 3)] * 6).multiplier <= fc.MAX_MULTIPLIER)
+    check("too little history changes nothing", fc.adjust(60, 3, fc.classes([])).minutes == 60)
+    check("and says what it is waiting for",
+          "needs" in fc.adjust(60, 3, fc.classes([])).explanation)
+
+    section("the outside view, applied at capture")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+        for i in range(6):
+            made = engine.capture(f"Task {i}\n- do the thing", "project")["note"]["id"]
+            n = engine.note(made)
+            sid = n.project.steps[0].id
+            engine.toggle_step(made, sid, minutes=n.project.steps[0].minutes * 2)
+        fresh = engine.capture("Another task\n- do the thing", "project")
+        check("a new project is planned against reality, not optimism",
+              fresh["forecast"]["applied"] is True, fresh["forecast"])
+        check("and the steps are resized, not just the headline",
+              engine.note(fresh["note"]["id"]).project.steps[0].minutes > 30)
+
+        cfg.planner.apply_personal_multiplier = False
+        off = Engine(cfg).capture("Yet another\n- do the thing", "project")
+        check("it can be switched off", off["forecast"]["applied"] is False)
+
+
+def test_weekly_review():
+    """Tier 3 — one page that closes the week and opens the next."""
+    section("the weekly review")
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+        nid = engine.capture("Ship the report by Friday\n- draft it\n- send it", "project")["note"]["id"]
+        sid = engine.note(nid).project.steps[0].id
+        engine.toggle_step(nid, sid, minutes=40)
+
+        aid = engine.capture("Read every evening", "area")["note"]["id"]
+        engine.set_habit(aid, "weekly", 3)
+
+        late = engine.note(nid)
+        late.project.deadline = dt.date.today() - dt.timedelta(days=3)
+        late.project.steps[1].scheduled = dt.datetime.now().astimezone() - dt.timedelta(days=2)
+        engine.vault.save(late)
+
+        review = engine.weekly_review()
+        check("what closed is there", len(review["closed"]["steps"]) == 1, review["closed"]["steps"])
+        check("with the minutes it really took", review["closed"]["steps"][0]["actual"] == 40)
+        check("what slipped is there", len(review["slipped"]["projects"]) == 1)
+        check("including the overdue step", len(review["slipped"]["steps"]) == 1)
+        check("a habit with no plan written is surfaced",
+              any(h["missing"] for h in review["slipped"]["habits"]), review["slipped"]["habits"])
+        check("what is next is there", "actions" in review["next"])
+        check("the check-in is queued rather than firing on its own timer",
+              len(review["next"]["habit_checkins"]) == 1)
+        check("and the reflection half is attached",
+              all(k in review for k in ("estimates", "calibration", "atomicity")))
+        check("it changes nothing by being read",
+              engine.note(nid).project.status != ProjectStatus.DONE)
+
+
+def test_atomicity_lint():
+    """Tier 3 — the invariant phase 6's free linking tier quietly depends on."""
+    section("atomicity lint")
+    from sb import lint
+
+    good = Note(id="a", title="Opportunity Cost", bucket=Bucket.RESOURCE,
+                body="Opportunity cost is the next best alternative. See [[Sunk Cost]].")
+    other = Note(id="b", title="Sunk Cost", bucket=Bucket.RESOURCE,
+                 body="A cost already paid. Compare [[Opportunity Cost]].")
+    report = lint.check([good, other])
+    check("two atomic, linked notes are clean", report.as_dict()["clean"], report.by_rule)
+
+    fat = Note(id="c", title="Notes", bucket=Bucket.RESOURCE,
+               body="## One\n\ntext\n\n## Two\n\ntext\n\n## Three\n\ntext\n")
+    rules = lint.check([fat]).by_rule
+    check("three ideas in one note is caught", rules.get("multiple-ideas") == 1, rules)
+    check("a title that names nothing is caught", rules.get("vague-title") == 1, rules)
+    check("an orphan is caught", rules.get("orphan") == 1, rules)
+
+    dupes = [Note(id=f"d{i}", title="Elasticity", bucket=Bucket.RESOURCE,
+                  body="[[x]] text") for i in range(2)]
+    check("two notes with one name is caught",
+          lint.check(dupes).by_rule.get("duplicate-title") == 2)
+    check("our own Related section does not cure an orphan",
+          lint.check([Note(id="e", title="Alone", bucket=Bucket.RESOURCE,
+                           body="text\n\n## Related\n\n- [[Something]]\n")]).by_rule.get("orphan") == 1)
+    check("Projects and Areas are not asked to hold one idea",
+          lint.check([Note(id="f", title="Notes", bucket=Bucket.PROJECT, body="## A\n\nx\n\n## B\n\ny\n\n## C\n\nz")]).checked == 0)
+
+
+def test_retention_dial():
+    """Tier 3 — what 0.9 costs, in minutes a day."""
+    section("retention vs workload")
+    from sb import retention
+
+    deck = _deck_with("n", "Econ", 20)
+    curve = retention.curve([deck], current=0.9, seconds=10.0)
+    points = {p["retention"]: p for p in curve["points"]}
+    check("the whole dial is projected", len(points) == len(retention.GRID))
+    check("higher retention costs more time",
+          points[0.95]["minutes_per_day"] > points[0.85]["minutes_per_day"],
+          (points[0.95]["minutes_per_day"], points[0.85]["minutes_per_day"]))
+    check("and the cost accelerates at the top",
+          (points[0.97]["minutes_per_day"] - points[0.92]["minutes_per_day"]) >
+          (points[0.92]["minutes_per_day"] - points[0.87]["minutes_per_day"])),
+    check("the current setting is marked", points[0.9]["is_current"])
+    check("an optimum is picked", curve["optimal"] is not None)
+    check("and Ye's result holds — it is at or below 0.9",
+          curve["optimal"] <= 0.9, curve["optimal"])
+    check("an empty collection says so instead of drawing a flat line",
+          "Nothing scheduled" in retention.curve([], current=0.9)["message"])
+    check("the pace comes from the log once there is enough of it",
+          retention.seconds_per_review([{"seconds": 8} for _ in range(40)]) == 8.0)
+    check("and from the default before that",
+          retention.seconds_per_review([{"seconds": 8}]) == retention.DEFAULT_SECONDS_PER_REVIEW)
+
+
+def test_interleaving_and_worked_examples():
+    """Tier 3 — Rohrer & Taylor's actual finding, and Sweller's scaffold."""
+    section("interleaving across problem types")
+    decks = []
+    for subject in ("Econ",):
+        deck = cardsmod.Deck(note_id="econ", subject=subject)
+        for topic in ("elasticity", "surplus"):
+            for i in range(4):
+                card = deck.add(front=f"{topic} q{i}?", back="a", topic=topic, status="active")
+                card.stability, card.difficulty, card.reps = 10.0, 5.0, 2
+                card.due = dt.date.today()
+                card.last_review = dt.datetime.now().astimezone() - dt.timedelta(days=10)
+        decks.append(deck)
+
+    cfg = Config()
+    session = tutor.build_session(decks, cfg, seed=7)
+    topics = [q.card.topic for q in session.queue]
+    runs = sum(1 for a, b in zip(topics, topics[1:]) if a == b)
+    check("consecutive cards rarely share a problem type", runs <= 2, topics)
+
+    blocked = cardsmod.Deck(note_id="econ", subject="Econ")
+    for topic in ("elasticity", "surplus"):
+        for i in range(4):
+            card = blocked.add(front=f"{topic} q{i}?", back="a", status="active")
+            card.stability, card.difficulty, card.reps = 10.0, 5.0, 2
+            card.due = dt.date.today()
+            card.last_review = dt.datetime.now().astimezone() - dt.timedelta(days=10)
+    check("an unlabelled deck behaves exactly as before",
+          len(tutor.build_session([blocked], cfg, seed=7).queue) == 8)
+
+    section("worked-example fading")
+    deck = cardsmod.Deck(note_id="x", subject="Algebra")
+    card = deck.add(front="Solve 2x+4=10", back="x=3", status="active",
+                    worked="Subtract 4 from both sides. That leaves 2x=6. Divide by two. So x=3.")
+    check("a brand-new card gets the whole example",
+          tutor.worked_example_for(card, deck, cfg)["show"] == "full")
+    card.reps = 1
+    partial = tutor.worked_example_for(card, deck, cfg)
+    check("then only the opening of it", partial["show"] == "partial")
+    check("with the last step left to do", "finish it from here" in partial["text"])
+    card.reps = 9
+    check("and then nothing", tutor.worked_example_for(card, deck, cfg)["show"] == "none")
+
+    card.reps = 0
+    for i in range(9):
+        mature = deck.add(front=f"q{i}", back="a", status="active")
+        mature.stability, mature.reps = 90.0, 6
+    check("expertise reversal: a deck you know withdraws it even from a new card",
+          tutor.worked_example_for(card, deck, cfg)["show"] == "none")
+    check("a card with no worked example shows nothing and does not error",
+          tutor.worked_example_for(deck.cards[-1], deck, cfg)["show"] == "none")
+
+    section("the deck file round-trips both")
+    round_tripped = cardsmod.loads(cardsmod.dump(deck))
+    first = round_tripped.card(card.id)
+    check("the worked example survives disk", "Divide by two" in first.worked, first.worked)
+    check("and the problem type does",
+          cardsmod.loads(cardsmod.dump(decks[0])).cards[0].topic == "elasticity")
+
+
+def test_threshold_calibration():
+    """Roadmap 1.2 — a cutoff you can defend."""
+    section("thresholds from labelled examples")
+    from sb import threshold
+
+    # A well-behaved signal: correct above 0.7, wrong below it.
+    labels = [(0.9, True)] * 20 + [(0.75, True)] * 10 + [(0.5, False)] * 15 + [(0.3, False)] * 15
+    sweep = threshold.sweep(labels, name="connect", current=0.62)
+    check("enough labels to mean something", sweep.enough)
+    check("a cutoff is recommended", sweep.recommended is not None, sweep.recommended)
+    check("and it clears the precision target",
+          next(p for p in sweep.points if p.cutoff == sweep.recommended).precision >= 0.9)
+    check("it is the *lowest* such cutoff, so lj is asked least often",
+          all(p.precision is None or p.precision < 0.9 or p.cutoff >= sweep.recommended
+              for p in sweep.points if p.accepted), sweep.recommended)
+    check("and the current setting is judged against it, in words",
+          any(w in sweep.message for w in ("should be lower", "should be higher", "is right")),
+          sweep.message)
+    check("0.62 is too cautious for this signal, and it says so",
+          sweep.recommended < 0.62 and "asked more often than you need" in sweep.message,
+          sweep.message)
+
+    noise = [(0.9, i % 2 == 0) for i in range(60)]
+    check("a signal that is not there cannot be fixed by a cutoff",
+          threshold.sweep(noise).recommended is None)
+    check("and it says the rules are the problem",
+          "scoring rules" in threshold.sweep(noise).message)
+    check("too few labels recommends nothing and says why",
+          "before this means much" in threshold.sweep([(0.9, True)] * 3).message)
+
+    section("labels are recorded where they survive")
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+        check("labels do not live in the disposable folder",
+              "_system" not in str(engine.labels.root), str(engine.labels.root))
+        engine.labels.record_intake("n1", "project", "project", 0.55)
+        engine.labels.record_intake("n2", "area", "resource", 0.51)
+        pairs = engine.labels.intake_pairs()
+        check("a confirmation is a labelled pair", len(pairs) == 2, pairs)
+        check("agreeing is correct, disagreeing is not",
+              pairs[0][1] is True and pairs[1][1] is False, pairs)
+        engine.labels.record_link("n1", "Sunk Cost", 0.7, True)
+        check("so is keeping a suggested link", engine.labels.link_pairs() == [(0.7, True)])
+        check("and both floors are swept together",
+              set(engine.thresholds()) == {"intake", "connect"})
+
+
+def test_fsrs_fitting():
+    """Tier 4 — deferred, with the trigger enforced rather than suggested."""
+    section("fitting FSRS to lj")
+    from sb import fit
+
+    def review(stability, elapsed, grade):
+        return {"grade": grade, "before": {"s": stability, "elapsed_days": elapsed}}
+
+    check("a first review has nothing to predict from, so it is not a free win",
+          fit.samples([{"grade": 3, "before": {"s": 0, "elapsed_days": 0}}]) == [])
+    check("a real one is usable", len(fit.samples([review(10, 5, 3)])) == 1)
+
+    thin = fit.fit([review(10, 5, 3)] * 50)
+    check("below the trigger nothing is fitted", thin["weights"] == list(fsrs.DEFAULT_W))
+    check("and the defaults are left in place", not thin["enough"])
+    check("with the reason stated in reviews, not in jargon",
+          str(fit.MIN_REVIEWS) in thin["message"], thin["message"])
+
+    # A memory that holds far longer than the defaults assume: still recalled
+    # at four times the interval the default weights would have chosen.
+    strong = [review(10, 40, 4) for _ in range(600)] + [review(10, 40, 3) for _ in range(500)]
+    fitted = fit.fit(strong)
+    check("above the trigger it fits", fitted["enough"])
+    check("and beats the defaults on the same data",
+          fitted["loss"] < fitted["baseline_loss"], (fitted["loss"], fitted["baseline_loss"]))
+    check("stretching intervals, as that history implies", fitted["scale"] > 1.0, fitted["scale"])
+    check("staying inside the published bounds",
+          all(lo <= w <= hi for w, (lo, hi) in zip(fitted["weights"][:4], fit.BOUNDS[:4])))
+    check("log loss is a proper scoring rule — truth beats confidence",
+          fit.log_loss(fsrs.DEFAULT_W, fit.samples([review(10, 10, 3), review(10, 10, 1)])) > 0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, engine = _study_engine(tmp)
+        for rec in strong:
+            engine.decks.log_review(rec)
+        out = engine.fit_weights(write=True)
+        check("the fit runs from the review log with no migration", out["n"] >= fit.MIN_REVIEWS)
+        check("and is written beside the history it came from",
+              out.get("written", "").endswith(fit.WEIGHTS_FILE), out.get("written"))
+        check("the tutor picks it up", tutor.weights(cfg) != list(fsrs.DEFAULT_W))
+        cfg.study.weights = list(fsrs.DEFAULT_W)
+        check("but a number typed in config always wins",
+              tutor.weights(cfg) == list(fsrs.DEFAULT_W))
+
+        thin_engine = Engine(Config(vault=Path(tmp) / "thin"))
+        refused = thin_engine.fit_weights(write=True)
+        check("writing is refused below the trigger", refused.get("written") == "")
+        check("and it says why", "not enough reviews" in refused.get("refused", ""))
+
+
+def test_numpy_trigger():
+    """Tier 4 — numpy on a trigger, and identical numbers either way."""
+    section("index acceleration")
+    from array import array
+    from sb import index as idx
+
+    query = array("f", [1.0, 0.0, 0.0])
+    vectors = [array("f", [1.0, 0.0, 0.0]), array("f", [0.0, 1.0, 0.0])]
+    scores = idx.cosines(query, vectors, 3)
+    check("a small index scores in pure Python", scores == [1.0, 0.0], scores)
+    check("a mismatched row scores zero, never a wrong neighbour",
+          idx.cosines(query, [array("f", [1.0, 0.0])], 3) == [0.0])
+    check("no vectors is no scores", idx.cosines(query, [], 3) == [])
+
+    real = idx.NUMPY_AT_CHUNKS
+    try:
+        idx.NUMPY_AT_CHUNKS = 1
+        fast = idx.cosines(query, vectors, 3)
+        check("and both paths compute the same number", fast == scores, (fast, scores))
+    finally:
+        idx.NUMPY_AT_CHUNKS = real
+    check("the trigger is the documented one", real == 5000, real)
+
+
+def test_study_by_folder():
+    """A folder is a subject with sub-topics — picking one picks all of it."""
+    section("study by folder")
+
+    # -- the rule, in isolation -------------------------------------------
+    check("a folder selects itself",
+          tutor.in_folders("30-Resources/Statics", ["30-Resources/Statics"]))
+    check("and everything under it",
+          tutor.in_folders("30-Resources/Statics/Ch4", ["30-Resources"]))
+    check("but not a sibling",
+          not tutor.in_folders("30-Resources/Thermo", ["30-Resources/Statics"]))
+    check("nor a folder that merely starts with the same letters",
+          not tutor.in_folders("30-Resources-old/Statics", ["30-Resources"]))
+    check("no scopes means no filter", tutor.in_folders("anywhere", []))
+    check("windows separators and stray slashes normalise",
+          tutor.in_folders("30-Resources\\Statics", ["/30-Resources/"]))
+    check("the vault root matches everything",
+          tutor.in_folders("30-Resources/Statics", [""]))
+
+    # -- and through build_session -----------------------------------------
+    cfg = Config()
+    cfg.study.new_cards_per_day = 50
+    statics = _deck_with("n-statics", "Statics", 4, due_offset=-1)
+    thermo = _deck_with("n-thermo", "Thermo", 4, due_offset=-1)
+    spanish = _deck_with("n-es", "Spanish", 4, due_offset=-1)
+    decks = [statics, thermo, spanish]
+    where = {
+        "n-statics": "30-Resources/Engineering/Statics",
+        "n-thermo": "30-Resources/Engineering/Thermo",
+        "n-es": "30-Resources/Languages",
+    }
+
+    s1 = tutor.build_session(decks, cfg, folders=["30-Resources/Engineering"],
+                             folder_of=where)
+    check("a parent folder gathers its children",
+          {q.deck.subject for q in s1.queue} == {"Statics", "Thermo"},
+          {q.deck.subject for q in s1.queue})
+
+    s2 = tutor.build_session(decks, cfg, folders=["30-Resources/Languages"],
+                             folder_of=where)
+    check("a leaf folder is exactly itself",
+          {q.deck.subject for q in s2.queue} == {"Spanish"})
+
+    s3 = tutor.build_session(decks, cfg, folders=["30-Resources/Engineering"],
+                             subjects=["n-thermo"], folder_of=where)
+    check("folder and subject filters stack",
+          {q.deck.subject for q in s3.queue} == {"Thermo"})
+
+    s4 = tutor.build_session(decks, cfg, folders=["20-Projects"], folder_of=where)
+    check("an empty folder yields an empty session", not s4.queue)
+    check("and says so rather than looking broken",
+          "Nothing due" in s4.message, s4.message)
+
+    check("no folders given is unchanged behaviour",
+          len(tutor.build_session(decks, cfg).queue) == 12)
+
+    # -- the vault resolves ids to folders ---------------------------------
+    import shutil
+    from starlette.testclient import TestClient
+    from sb.api import build_app
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg2 = Config(vault=Path(tmp) / "v")
+        cfg2.llm.provider = "heuristic"
+        engine = Engine(cfg2)
+        nid = engine.capture("read chapter four on trusses", "resource")["note"]["id"]
+        path, note = engine.vault.get(nid)
+
+        folders = engine.vault.folders_by_id()
+        check("a note in a bucket root reports the bucket",
+              folders.get(nid) == "30-Resources", folders.get(nid))
+
+        # Move it into a sub-topic the way Obsidian would, and the folder
+        # follows without anything being written to the deck.
+        sub = path.parent / "Engineering" / "Statics"
+        sub.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(sub / path.name))
+        engine.vault.invalidate()
+        check("moving the note moves its folder",
+              engine.vault.folders_by_id().get(nid) == "30-Resources/Engineering/Statics",
+              engine.vault.folders_by_id().get(nid))
+
+        # -- overview rolls counts up into ancestors -----------------------
+        deck = cardsmod.Deck(note_id=nid, subject=note.title, bucket="resource")
+        deck.add(front="what carries the load?", back="the truss", status="active",
+                 due=dt.date.today() - dt.timedelta(days=1), stability=3.0, reps=1,
+                 last_review=dt.datetime.now())
+        engine.decks.save(deck)
+
+        overview = engine.study_overview()
+        by_path = {f["path"]: f for f in overview["folders"]}
+        check("the leaf folder is offered",
+              "30-Resources/Engineering/Statics" in by_path, sorted(by_path))
+        check("so is every ancestor", "30-Resources" in by_path and
+              "30-Resources/Engineering" in by_path, sorted(by_path))
+        check("and the count rolls up",
+              by_path["30-Resources"]["due"] == by_path[
+                  "30-Resources/Engineering/Statics"]["due"] == 1,
+              {k: v["due"] for k, v in by_path.items()})
+        check("the deck carries its folder to the UI",
+              overview["decks"][0]["folder"] == "30-Resources/Engineering/Statics",
+              overview["decks"][0].get("folder"))
+
+        # -- and the session honours it ------------------------------------
+        hit = engine.study_session(folders=["30-Resources/Engineering"])
+        check("a session scoped to the parent finds the card", len(hit["queue"]) == 1)
+        miss = engine.study_session(folders=["20-Projects"])
+        check("a session scoped elsewhere finds nothing", not miss["queue"])
+
+        # -- over HTTP -----------------------------------------------------
+        client = TestClient(build_app(cfg2))
+        r = client.post("/api/study/session",
+                        json={"folders": ["30-Resources/Engineering/Statics"]})
+        check("POST carries the folder scope", r.status_code == 200, r.status_code)
+        check("and returns the scoped queue", len(r.json()["queue"]) == 1, r.json())
+        r2 = client.get("/api/study/overview")
+        check("overview ships the folder tree",
+              any(f["path"] == "30-Resources/Engineering"
+                  for f in r2.json()["folders"]))
+
+
+def test_obsidian_plugin_ships():
+    """Tier 4 — the capture plugin is a file on disk, not a plan."""
+    section("the Obsidian capture plugin")
+    root = Path(__file__).resolve().parent.parent / ".obsidian" / "plugins" / "second-brain-capture"
+    manifest = root / "manifest.json"
+    main = root / "main.js"
+    check("the manifest ships", manifest.exists())
+    check("and the plugin itself", main.exists())
+    if manifest.exists():
+        meta = json.loads(manifest.read_text(encoding="utf-8"))
+        check("with an id Obsidian will load", meta.get("id") == "second-brain-capture")
+        check("and works on mobile too", meta.get("isDesktopOnly") is False)
+    if main.exists():
+        source = main.read_text(encoding="utf-8")
+        check("it posts to the same endpoint the dashboard uses", "/api/capture" in source)
+        check("it offers the blueprint's three buttons",
+              all(b in source for b in ("project", "area", "resource")))
+        check("and a capture is not lost when the app is closed",
+              "dropFile" in source and "createFolder" in source)
+        check("no build step: it is loadable as it stands", "require(" in source)
+
+
+def test_doctor_states_the_distance():
+    """Every trigger says how far off it is.
+
+    Four numbers here start as guesses and are meant to become measurements:
+    the FSRS weights, the two auto-accept floors, and the estimate multiplier.
+    Each waits on data lj has not produced yet. A feature that unlocks on a
+    trigger is indistinguishable from a broken one unless the distance is
+    stated, so `doctor` states all of them.
+    """
+    section("doctor reports the triggers")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "v")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+        aid = engine.capture("Read every evening", "area")["note"]["id"]
+        nid = engine.capture("Ship it\n- draft it", "project")["note"]["id"]
+        engine.toggle_step(nid, engine.note(nid).project.steps[0].id)
+
+        check("the footer's health call does not pay for any of this",
+              "progress" not in engine.health(), sorted(engine.health()))
+        p = engine.health(progress=True)["progress"]
+        check("the FSRS trigger is named, not implied",
+              p["fsrs"]["need"] == 1000 and p["fsrs"]["have"] == 0, p["fsrs"])
+        check("and nothing is pretending to be fitted", not p["fsrs"]["using_fitted"])
+        check("calibration says how many predictions it wants",
+              p["calibration"]["need"] > 0 and p["calibration"]["have"] == 0)
+        check("both floors report their labelled counts",
+              set(p["thresholds"]) == {"intake", "connect", "need"}, p["thresholds"])
+        check("a step finished without a clock is counted, not ignored",
+              p["estimates"]["untimed"] == 1, p["estimates"])
+        check("an area with no implementation intention is surfaced",
+              p["habits"]["without_plan"] == 1, p["habits"])
+        check("the numpy trigger is stated with the current size",
+              p["numpy"]["at"] == 5000, p["numpy"])
+        check("and whether the plugin is on disk", isinstance(p["plugin"], bool))
+
+        engine.set_habit(aid, cue="I finish dinner", behaviour="read", place="the sofa")
+        check("filling the plan in clears it",
+              engine.health(progress=True)["progress"]["habits"]["without_plan"] == 0)
+
+
 def test_connect_sections():
     section("connect — the Related section")
     from sb import connect as connectmod
@@ -3307,6 +4356,415 @@ def test_rename_never_clobbers():
               and engine.vault.find(bnote.id) is not None)
 
 
+def test_relink_is_idempotent_not_destructive():
+    """Re-running must refresh links, not delete them.
+
+    The trap: our own `## Related` section is part of the body, so
+    deduplicating against the whole body makes every tier treat its own
+    previous output as "already linked". Nothing new is found, and writing an
+    empty result strips the section — silently destroying the last run's work.
+    """
+    section("connect — re-running preserves links")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+        from sb import connect as C
+        from sb.models import Note as N
+
+        engine.vault.write(N(id="g1", title="Econ Assignment 3", bucket="project",
+                             body="# Econ Assignment 3\n"))
+        for t in ("Opportunity Cost", "Sunk Cost", "Marginal Utility"):
+            engine.vault.write(N(
+                id=f"a-{t.lower().replace(' ', '-')}", title=t, bucket="resource",
+                body=f"# {t}\n\n*From:* [[Econ Assignment 3]]\n\n## Definition\n\n{t} matters.\n"))
+
+        first = engine.connect_all(reindex=False)
+        check("the first pass links the siblings", first["linked"] > 0)
+
+        def related_count():
+            return sum(1 for n in engine.notes() if "## Related" in n.body)
+
+        had = related_count()
+        check("sections were written", had >= 3)
+
+        # The destructive path: ignore the skip cache and do it all again.
+        second = engine.connect_all(reindex=False, changed_only=False)
+        check("re-linking everything keeps the same links",
+              second["linked"] == first["linked"], f"{second['linked']} vs {first['linked']}")
+        check("and every section survives", related_count() == had)
+
+        # A single-note re-run is the same trap by another route.
+        note = [n for n in engine.notes() if n.title == "Opportunity Cost"][0]
+        before = note.body
+        engine.connect(note.id)
+        after = engine.note(note.id)
+        check("a per-note re-run keeps its section", "## Related" in after.body)
+        check("and does not stack it", after.body.count("## Related") == 1)
+        check("and is stable", after.body.strip() == before.strip())
+
+        # Our own suggestion must not come back as evidence of a relationship.
+        seen = C.own_links(after)
+        check("our own Related links are excluded from the note's own links",
+              "sunk-cost" not in seen or "sunk-cost" in C.existing_links(
+                  C.strip_related(after.body)))
+
+
+def _fake_docx(path: Path, paragraphs) -> Path:
+    """A .docx carrying the parts python-docx insists on, so one fixture
+    exercises both readers: the library when it is installed, the zip reader
+    when it is not."""
+    import zipfile
+
+    body = []
+    for style, text in paragraphs:
+        props = ""
+        if style.startswith("Heading"):
+            props = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>'
+        elif style == "List":
+            props = '<w:pPr><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr>'
+        escaped = text.replace("&", "&amp;").replace("<", "&lt;")
+        body.append(f"<w:p>{props}<w:r><w:t>{escaped}</w:t></w:r></w:p>")
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>" + "".join(body) + "</w:body></w:document>"
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-'
+        'officedocument.wordprocessingml.document.main+xml"/></Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/'
+        '2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'
+    )
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document)
+    return path
+
+
+def _age(path: Path) -> None:
+    """Backdate a file past the settle window — a real dropped file is already
+    a few seconds old by the time anything looks at it."""
+    import os
+
+    os.utime(path, (0, 0))
+
+
+def _raises(fn, *args) -> bool:
+    try:
+        fn(*args)
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def test_intake_classification():
+    section("drop folder: weighing the evidence")
+    today = dt.date(2026, 8, 25)
+
+    project = intakemod.classify(
+        "Submit the WWII essay by 2026-09-04.\n- [ ] outline\n- [ ] draft",
+        "History essay", today=today,
+    )
+    check("a dated task is a project", project.bucket == "project", project.bucket)
+    check("filed without asking", project.confidence >= intakemod.AUTO_FLOOR,
+          project.confidence)
+
+    area = intakemod.classify(
+        "Go to the gym every morning before class. This is a routine, not a one-off.",
+        "Workout", today=today,
+    )
+    check("a recurring commitment is an area", area.bucket == "area", area.bucket)
+    check("filed without asking", area.confidence >= intakemod.AUTO_FLOOR, area.confidence)
+
+    resource = intakemod.classify(
+        "The citric acid cycle is defined as a series of reactions. For example, "
+        "acetyl-CoA condenses with oxaloacetate. See chapter 9. "
+        "https://en.wikipedia.org/wiki/Citric_acid_cycle\n\n"
+        + "It consists of eight steps that regenerate oxaloacetate. " * 20,
+        "Krebs cycle notes", today=today,
+    )
+    check("reference material is a resource", resource.bucket == "resource", resource.bucket)
+    check("filed without asking", resource.confidence >= intakemod.AUTO_FLOOR,
+          resource.confidence)
+
+    # The margin term earning its place: evidence for two buckets at once is
+    # not a confident call, however much of it there is.
+    torn = intakemod.classify(
+        "Maybe start a better morning routine at some point — read that chapter first.",
+        "Morning routine ideas", today=today,
+    )
+    check("a note pulling two ways is not filed on a guess",
+          torn.confidence < intakemod.AUTO_FLOOR, torn.confidence)
+    check("but it still says what it thinks",
+          torn.bucket in intakemod.BUCKETS and bool(torn.reason), torn.as_dict())
+
+    scores = intakemod.score("Finish the lab report by Friday", "Lab report", today)["scores"]
+    check("the tally is inspectable", scores["project"] > scores["resource"], scores)
+
+    # A note this system rendered, dropped back in, must not be classified by
+    # our own boilerplate — the failure phase 1 hit with the colour table.
+    ours = intakemod.score(
+        "## Steps\n\n## Materials\n\n## Related\n\nNo due date\n",
+        "Exported note", today,
+    )
+    check("our own rendered scaffolding is not evidence",
+          max(ours["scores"].values()) == 0, ours["scores"])
+
+
+def test_intake_reads_files():
+    section("drop folder: reading what was dropped")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        docx = _fake_docx(root / "Bio lecture 4.docx", [
+            ("Heading1", "Mitosis & meiosis"),
+            ("Normal", "Mitosis is defined as division producing two identical cells."),
+            ("List", "Prophase"),
+            ("List", "Metaphase"),
+        ])
+        read = intakemod.read_file(docx)
+        check("a .docx reads", read.ok, read.error)
+        check("its heading becomes the title", read.title == "Mitosis & meiosis", read.title)
+        check("headings survive as headings", "# Mitosis" in read.text, read.text[:80])
+        check("bullets survive as bullets", "- Prophase" in read.text, read.text)
+        check("entities are unescaped", "&amp;" not in read.text)
+
+        # python-docx is optional; the zip reader is what runs without it, and
+        # it has to produce the same shape from the same file.
+        zipped = intakemod._docx_zip_text(docx)
+        check("the no-library reader agrees", "- Metaphase" in zipped and
+              "# Mitosis & meiosis" in zipped, zipped)
+
+        txt = root / "quick note.txt"
+        txt.write_text("Call the dentist about the filling", encoding="utf-8")
+        plain = intakemod.read_file(txt)
+        check("a .txt reads", plain.ok)
+        check("the filename becomes the title", plain.title == "Quick note", plain.title)
+
+        exported = root / "old.md"
+        exported.write_text(
+            "---\nid: 20260101T000000-x\ntitle: Already ours\n---\n\nbody text here\n",
+            encoding="utf-8",
+        )
+        back = intakemod.read_file(exported)
+        check("frontmatter is stripped", "id:" not in back.text, back.text)
+        check("but its title is kept", back.title == "Already ours", back.title)
+        check("and it is recognised as ours", back.already_ours)
+
+        binary = root / "photo.png"
+        binary.write_bytes(b"\x89PNG\r\n")
+        check("an unsupported type is refused, not crashed",
+              bool(intakemod.read_file(binary).error))
+
+        fresh = root / "still writing.md"
+        fresh.write_text("half a th", encoding="utf-8")
+        check("a file still being written waits", not intakemod.candidates(root, 30.0))
+        _age(fresh)
+        names = [p.name for p in intakemod.candidates(root, 5.0)]
+        check("and is picked up once it settles", "still writing.md" in names, names)
+        check("Word's lock files are ignored", not any(n.startswith("~$") for n in names))
+        check("the readme we wrote is not a note", "README.md" not in names)
+
+
+def test_intake_files_the_folder():
+    section("drop folder: end to end")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.use_model = False
+        engine = Engine(cfg)
+        drop = cfg.drop_dir
+
+        check("the folder exists before anything is dropped", drop.is_dir())
+        check("and explains itself", (drop / "README.md").exists())
+
+        (drop / "essay.md").write_text(
+            "# History essay\n\nSubmit the WWII essay by 2026-09-04.\n"
+            "- [ ] outline it\n- [ ] write the draft\n- [ ] proofread\n",
+            encoding="utf-8",
+        )
+        (drop / "gym.txt").write_text(
+            "Go to the gym every morning before class. Keep it up — a routine, "
+            "not a one-off.", encoding="utf-8",
+        )
+        (drop / "krebs.md").write_text(
+            "# Krebs cycle\n\nThe citric acid cycle is defined as a series of "
+            "reactions. For example, acetyl-CoA condenses with oxaloacetate. "
+            "See chapter 9. https://en.wikipedia.org/wiki/Citric_acid_cycle\n\n"
+            + "It consists of eight steps that regenerate oxaloacetate. " * 20,
+            encoding="utf-8",
+        )
+        (drop / "vague.md").write_text(
+            "Maybe start a better morning routine at some point — read that "
+            "chapter first.", encoding="utf-8",
+        )
+        (drop / "broken.docx").write_bytes(b"not really a docx")
+        for p in list(drop.glob("*.*")):
+            _age(p)
+
+        dry = engine.intake(dry_run=True)
+        check("a dry run says what it would do", dry["scanned"] == 5, dry["scanned"])
+        check("and moves nothing", (drop / "essay.md").exists())
+        check("and writes no notes", engine.vault.counts()["project"] == 0)
+
+        r = engine.intake()
+        by_file = {x["file"]: x for x in r["results"]}
+        check("everything readable was read", r["scanned"] == 5, r)
+        check("the essay filed as a project", by_file["essay.md"]["bucket"] == "project",
+              by_file["essay.md"])
+        check("the gym note filed as an area", by_file["gym.txt"]["bucket"] == "area",
+              by_file["gym.txt"])
+        check("the chapter notes filed as a resource",
+              by_file["krebs.md"]["bucket"] == "resource", by_file["krebs.md"])
+        check("the vague one was not filed on a guess",
+              by_file["vague.md"]["bucket"] == "inbox", by_file["vague.md"])
+        check("the unreadable one is reported, not swallowed",
+              by_file["broken.docx"]["status"] == "unreadable", by_file["broken.docx"])
+        check("no model was needed for any of it", r["model_calls"] == 0, r["model_calls"])
+
+        counts = engine.vault.counts()
+        check("three notes were filed", r["filed"] == 3, r)
+        check("one is waiting to be asked about", counts["inbox"] == 1, counts)
+
+        # A dropped Project must come out identical to a captured one: parsed,
+        # planned and on the calendar. Anything less is a filing cabinet.
+        essay = engine.note(by_file["essay.md"]["note_id"])
+        check("the project was parsed", essay.project is not None)
+        check("its deadline was read", str(essay.project.deadline) == "2026-09-04",
+              essay.project.deadline)
+        check("its steps were found", len(essay.project.steps) == 3, essay.project.steps)
+        check("and scheduled", all(s.scheduled for s in essay.project.steps))
+        check("the calendar was rewritten", cfg.ics_path.exists())
+        check("the essay is on it", "History essay" in cfg.ics_path.read_text())
+
+        gym = engine.note(by_file["gym.txt"]["note_id"])
+        check("the area got a habit", gym.habit is not None)
+        check("and a recurring block", gym.schedule is not None and gym.schedule.enabled)
+        krebs = engine.note(by_file["krebs.md"]["note_id"])
+        check("the resource got a review date", bool(krebs.review and krebs.review.next))
+
+        check("the note records where it came from", essay.intake.file == "essay.md")
+        check("and why it was filed there", bool(essay.intake.reason))
+        check("and that it was automatic", essay.intake.filed_automatically is True)
+        reread = Vault(cfg.vault).get(essay.id)[1]
+        check("all of which round-trips through disk",
+              bool(reread.intake and reread.intake.file == "essay.md"), reread.intake)
+
+        filed = {p.name.split("--")[0] for p in (drop / intakemod.FILED_DIR).iterdir()}
+        check("originals are kept, not deleted",
+              filed == {"essay", "gym", "krebs", "vague"}, filed)
+        problem = [p.name for p in (drop / intakemod.PROBLEM_DIR).iterdir()]
+        check("what could not be read is set aside", len(problem) == 1, problem)
+        check("the drop folder is clear afterwards", not intakemod.candidates(drop, 0.0))
+
+        again = engine.intake()
+        check("running it again does nothing", again["scanned"] == 0, again)
+        check("and nothing is filed twice", engine.vault.counts()["project"] == 1,
+              engine.vault.counts())
+
+
+def test_intake_confirmation():
+    section("drop folder: confirming what it could not call")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.use_model = False
+        engine = Engine(cfg)
+
+        (cfg.drop_dir / "vague.md").write_text(
+            "Maybe start a better morning routine at some point — read that "
+            "chapter first.\n- pick a wake time\n- read chapter 2\n",
+            encoding="utf-8",
+        )
+        _age(cfg.drop_dir / "vague.md")
+        engine.intake()
+
+        inbox = engine.dashboard()["inbox"]
+        check("the dashboard asks about it", len(inbox) == 1, inbox)
+        row = inbox[0]
+        check("carrying its suggestion", row["suggested"] in intakemod.BUCKETS, row)
+        check("and its confidence", 0 < row["confidence"] < 1, row)
+        check("and the reason for it", bool(row["reason"]), row)
+        check("and enough text to recognise it by", bool(row["excerpt"]), row)
+
+        r = engine.classify_note(row["note_id"], "project")
+        note = engine.note(row["note_id"])
+        check("confirming files it", note.bucket == Bucket.PROJECT, note.bucket)
+        check("the file physically moved",
+              "20-Projects" in str(Vault(cfg.vault).get(note.id)[0]))
+        # Why classify_note exists next to move(): a confirmed note gets the
+        # treatment it would have got had it been filed automatically.
+        check("and it was parsed, not just moved", note.project is not None)
+        check("with steps", bool(note.project.steps), note.project)
+        check("and planned onto the calendar",
+              any(s.scheduled for s in note.project.steps), note.project.steps)
+        check("the answer is recorded as yours", note.intake.decided_by == "manual",
+              note.intake)
+        check("and logged", any(h.event == "classified" for h in note.history))
+        check("the inbox is empty again", engine.dashboard()["inbox"] == [])
+        check("the response carries the plan", "plan" in r, list(r))
+        check("archive is not a filing answer", _raises(engine.classify_note, note.id, "archive"))
+
+
+def test_intake_api():
+    section("drop folder: over HTTP")
+    from starlette.testclient import TestClient
+
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.use_model = False
+        cfg.intake.watch = False  # a background thread inside a test is a flake
+        app = build_app(cfg)
+        with TestClient(app) as client:
+            drop = cfg.drop_dir
+            (drop / "essay.md").write_text(
+                "Submit the WWII essay by 2026-09-04.\n- [ ] outline\n- [ ] draft\n",
+                encoding="utf-8",
+            )
+            (drop / "vague.md").write_text("Maybe do something about that", encoding="utf-8")
+            for p in drop.glob("*.md"):
+                _age(p)
+
+            # No body at all — the shape the button sends, and the shape that
+            # was a 400 for seven other handlers before phase 7.
+            r = client.post("/api/intake")
+            check("POST with no body works", r.status_code == 200, r.text)
+            out = r.json()
+            check("it reports what it did", out["filed"] == 1 and out["asking"] == 1, out)
+
+            d = client.get("/api/dashboard").json()
+            check("the dashboard shows the question", len(d["inbox"]) == 1, d["inbox"])
+            note_id = d["inbox"][0]["note_id"]
+
+            r = client.post(f"/api/notes/{note_id}/classify", json={"bucket": "resource"})
+            check("classify answers it", r.status_code == 200, r.text)
+            check("and the note moved", r.json()["note"]["bucket"] == "resource")
+
+            r = client.post(f"/api/notes/{note_id}/classify", json={"bucket": "nonsense"})
+            check("a nonsense bucket is a 400, not a 500", r.status_code == 400, r.status_code)
+
+            h = client.get("/api/health").json()
+            check("health reports the drop folder",
+                  h["drop"]["path"].endswith("Drop"), h.get("drop"))
+            check("and that nothing is left waiting", h["drop"]["waiting"] == 0, h["drop"])
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -3322,18 +4780,32 @@ def main():
         test_index_chunking, test_index_build, test_index_search,
         test_ask, test_ask_api,
         # -- the tutor
-        test_fsrs, test_deck_roundtrip, test_card_generation, test_session_mix,
+        test_fsrs, test_deck_roundtrip, test_card_generation, test_card_quality,
+        test_session_mix, test_study_by_folder,
         test_recall_grading, test_progress_and_mastery, test_study_api,
         test_graduation_prompt,
+        # -- the learning-science tier
+        test_calibration, test_self_explanation, test_habits_rewritten,
+        test_forecasting, test_weekly_review, test_atomicity_lint,
+        test_retention_dial, test_interleaving_and_worked_examples,
+        test_threshold_calibration,
+        # -- deferred work, on its triggers
+        test_fsrs_fitting, test_numpy_trigger, test_obsidian_plugin_ships,
+        test_doctor_states_the_distance,
         # -- templates: preservation, materials, link-following
         test_body_preservation, test_materials_kinds,
         test_materials_absorbed, test_link_expansion,
         # -- not scanning the vault, and smart connections
         test_link_resolution_is_cheap, test_capture_reads_once,
+        test_link_at_write_time, test_atomic_rename_is_patient_on_windows,
         test_connect_sections, test_connect_tiers_are_free_first,
         test_title_matching_guards, test_connect_bands_the_model,
         test_connect_avoids_the_model, test_connect_engine_pass,
+        test_relink_is_idempotent_not_destructive,
         test_filename_repair, test_find_by_id_is_cheap, test_rename_never_clobbers,
+        # -- the drop folder
+        test_intake_classification, test_intake_reads_files,
+        test_intake_files_the_folder, test_intake_confirmation, test_intake_api,
     ]:
         try:
             fn()

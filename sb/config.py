@@ -97,6 +97,11 @@ class PlannerConfig(BaseModel):
     # you can slide by twenty minutes should not push a deadline.
     respect_area_blocks: bool = False
 
+    # Reference-class forecasting (sb/forecasting.py). Scale a new estimate by
+    # how long lj's own steps have actually taken. Off means estimates are
+    # taken at face value, which is the planning fallacy with extra steps.
+    apply_personal_multiplier: bool = True
+
     def start_time(self) -> dt.time:
         return dt.time.fromisoformat(self.work_start)
 
@@ -123,7 +128,11 @@ class CalendarConfig(BaseModel):
     #   "google" Google Tasks (shows in the Tasks strip of Google Calendar)
     #   "both"   both, "none" to turn due-date tasks off entirely
     task_sink: str = "auto"
-    google_tasklist: str = "Second Brain"  # created on first sync if missing
+    google_tasklist: str = "Second Brain"
+    #: Roadmap 1.3. Read completions back from Google Tasks before pushing.
+    #: The vault wins on content; Google wins on completion, because ticking
+    #: is the only edit lj can make on a phone. Off makes sync one-way again.
+    read_back_completions: bool = True  # created on first sync if missing
     # Google Tasks has no colour API, so the category emoji in the title is
     # the only colour signal a task gets. Events get a real colour as well.
     emoji_prefix: bool = True
@@ -160,6 +169,10 @@ class StudyConfig(BaseModel):
     #: Personal FSRS weights, if you ever fit them from _decks/_reviews.jsonl.
     #: Empty means the published FSRS-5 defaults.
     weights: List[float] = Field(default_factory=list)
+    #: Use weights fitted from `_decks/_reviews.jsonl` when this list is empty.
+    #: A number typed here always wins — it is a decision; a fit is a
+    #: suggestion. See sb/fit.py, and the ~1,000-review trigger it enforces.
+    use_fitted_weights: bool = True
 
     # Daily volume. Caps exist so a backlog is a slope, not a wall.
     new_cards_per_day: int = 10
@@ -173,6 +186,26 @@ class StudyConfig(BaseModel):
     generate_max_cards: int = 20
     generate_per_passage: int = 3
 
+    # Card quality (sb/quality.py) — Woźniak's minimum information principle.
+    # A drafted answer longer than this, or one that holds a list, is rewritten
+    # as cloze cards over the note's own sentence, or dropped if nothing in the
+    # note can cite it. Raise it to be filtered less; set
+    # `enforce_card_quality: false` to keep every card the model returns.
+    max_answer_words: int = 15
+    enforce_card_quality: bool = True
+
+    # Metacognitive calibration (sb/calibration.py). How far back the
+    # "you were sure and wrong" priority queue looks. A miss from four months
+    # ago is a card that has since been relearned, not a belief still held.
+    overconfidence_window_days: int = 45
+
+    # Worked-example fading (Sweller). A card with a `Worked.` block shows it
+    # in full on the first attempt, as an opening fragment for the next few,
+    # and not at all once the deck is this far matured — the expertise-reversal
+    # effect, where the same scaffold that helps a novice hinders an expert.
+    worked_example_fade_reps: int = 3
+    expertise_reversal_at: float = 0.6
+
     # Graduation (blueprint §4). A card counts as learned when it has survived
     # `review.graduation_min_reps` spaced attempts *and* the model predicts it
     # will still be there this many days from now.
@@ -185,11 +218,56 @@ class StudyConfig(BaseModel):
     study_minutes: int = 20
 
 
+class IntakeConfig(BaseModel):
+    """The Drop folder: notes lj already wrote, filed automatically.
+
+    `auto_floor` is the only dial here that changes behaviour rather than
+    timing. Raise it and more notes wait in the Inbox for a click; lower it
+    and more are filed on the system's own judgement. It is not 0.5 because a
+    bare majority is not a decision worth making on someone else's behalf —
+    see the confidence note in sb/intake.py.
+    """
+
+    folder: str = "Drop"
+    auto_floor: float = 0.6
+    #: Ask the model only about the notes the rules could not call. Off does
+    #: not disable intake — an undecided note simply goes to the Inbox
+    #: without a second opinion first.
+    use_model: bool = True
+    #: A file Word is still writing is not a file to read. Ignore anything
+    #: touched more recently than this.
+    settle_seconds: float = 5.0
+    #: Watch the folder while the app is open, so dropping a file *is* the
+    #: whole interaction. The dashboard button does the same on demand.
+    watch: bool = True
+    poll_seconds: float = 20.0
+    max_per_run: int = 25
+
+
 class ReviewConfig(BaseModel):
     resource_cycle_days: int = 90
     habit_checkin_weekday: int = 6  # Sunday
     graduation_mastery_threshold: float = 0.85
     graduation_min_reps: int = 4
+
+
+class ConnectConfig(BaseModel):
+    """Linking notes to notes (sb/connect.py).
+
+    `link_on_write` is roadmap Tier 1.1. The free tiers — a note's own
+    parent/child facts and literal `[[title]]`-able mentions of other notes —
+    need nothing but the vault listing the caller already holds, so running
+    them while the note is being written costs one regex build, no extra file
+    read and no model call. What deliberately does *not* run at write time is
+    the embedding index and the model tie-break: the note is not in the index
+    yet, and nothing typed into a capture box should wait on Ollama.
+
+    `max_links_on_write` is under `connect.MAX_LINKS` on purpose, so the
+    periodic pass still has room to add what the index finds.
+    """
+
+    link_on_write: bool = True
+    max_links_on_write: int = 4
 
 
 class Config(BaseModel):
@@ -202,10 +280,19 @@ class Config(BaseModel):
     areas: AreasConfig = Field(default_factory=AreasConfig)
     review: ReviewConfig = Field(default_factory=ReviewConfig)
     study: StudyConfig = Field(default_factory=StudyConfig)
+    intake: IntakeConfig = Field(default_factory=IntakeConfig)
+    connect: ConnectConfig = Field(default_factory=ConnectConfig)
 
     @property
     def system_dir(self) -> Path:
         return self.vault / "_system"
+
+    @property
+    def drop_dir(self) -> Path:
+        """Where lj puts notes they already wrote. Not disposable and not
+        machine state, so it sits beside the PARA folders rather than under
+        `_system/` — it is a place a person opens."""
+        return self.vault / (self.intake.folder or "Drop")
 
     @property
     def deck_dir(self) -> Path:

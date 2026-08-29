@@ -112,6 +112,26 @@
     margin-left: auto;
   }
 
+  /* ---- link notes ---- */
+  #connectbox { border-left: 3px solid var(--resource); }
+  .cost { float: right; font: 11px var(--mono); color: var(--faint); text-transform: none; letter-spacing: 0; }
+  .clink { border-top: 1px solid var(--line); padding: 10px 0; font-size: 14px; }
+  .clink .from { font-weight: 600; }
+  .clink ul { margin: 5px 0 0; padding-left: 16px; color: var(--muted); font-size: 13px; }
+  .clink li { padding: 1px 0; }
+  .clink .why { color: var(--faint); }
+  /* The tier a link came from — the whole point is that `judged` is rare. */
+  .src { font: 10px var(--mono); border: 1px solid var(--line); border-radius: 3px;
+         padding: 0 4px; margin-left: 6px; color: var(--faint); vertical-align: 1px; }
+  .src.structural { color: var(--area);     border-color: var(--area); }
+  .src.title      { color: var(--resource); border-color: var(--resource); }
+  .src.similar    { color: var(--muted); }
+  .src.judged     { color: var(--accent);   border-color: var(--accent); }
+  .connect-foot { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
+  .connect-foot .hint { flex: 1; }
+  button.ghost { font-size: 12.5px; padding: 5px 10px; color: var(--muted); }
+  button[aria-busy="true"] { opacity: .6; cursor: progress; }
+
   /* ---- due tasks ---- */
   .tasks { list-style: none; margin: 0; padding: 0; }
   .tasks li { display: flex; gap: 9px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); font-size: 14px; }
@@ -126,6 +146,10 @@
   .area.paused { opacity: .55; }
   .area-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
   .area-head strong { font-weight: 600; font-size: 14.5px; }
+  .intention { margin: 8px 0 4px; }
+  .intention strong { font-weight: 600; }
+  button.tiny { padding: 1px 7px; font-size: 11px; border-radius: 5px; }
+  .hint.over { color: var(--danger); }
   .area-ctl { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
   .area-ctl input[type=time], .area-ctl input[type=number] {
     font: inherit; font-size: 12.5px; padding: 3px 6px; border-radius: 6px;
@@ -149,6 +173,25 @@
     padding: 3px 7px; font: 11px var(--mono); border-radius: 6px; min-width: 30px;
   }
   .days button.on { background: var(--area); border-color: var(--area); color: #fff; }
+
+  /* ---- the Drop folder ---- */
+  #dropbox { border-left: 3px solid var(--area); }
+  #inboxbox { border-left: 3px solid var(--warn); }
+  .droprow { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; padding: 9px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  .droprow:first-child { border-top: none; padding-top: 0; }
+  .droprow strong { font-weight: 600; font-size: 14.5px; }
+  .droprow .file { font: 11.5px var(--mono); color: var(--faint); }
+  .droprow .why { color: var(--muted); font-size: 12.5px; flex-basis: 100%; }
+  .droprow .excerpt { color: var(--faint); font-size: 12.5px; flex-basis: 100%; }
+  .bucketpill { font: 11px var(--mono); border-radius: 3px; padding: 1px 6px; border: 1px solid var(--line); color: var(--muted); }
+  .bucketpill.area     { color: var(--area);     border-color: var(--area); }
+  .bucketpill.project  { color: var(--project);  border-color: var(--project); }
+  .bucketpill.resource { color: var(--resource); border-color: var(--resource); }
+  .bucketpill.inbox    { color: var(--warn);     border-color: var(--warn); }
+  .conf { font: 11px var(--mono); color: var(--faint); }
+  .fileacts { display: flex; gap: 6px; flex: none; margin-left: auto; }
+  .fileacts button { padding: 4px 10px; font-size: 12.5px; }
+  .fileacts button.suggested { border-color: var(--accent); color: var(--accent); }
 
   /* ---- reviews / archive ---- */
   #reviewbox { border-left: 3px solid var(--resource); }
@@ -198,8 +241,11 @@
     <span class="sub" id="vaultpath"></span>
     <span class="spacer"></span>
     <button id="studybtn" title="Flashcards, spaced repetition, the tutor">Study<span id="duebadge"></span></button>
+    <button id="reviewbtn" title="What closed, what slipped, what is next — the whole week in one place">Weekly review</button>
     <button id="refresh" title="Reload from vault">Refresh</button>
     <button id="syncal" title="Rewrite the calendar from vault state">Sync calendar</button>
+    <button id="connectbtn" title="Find related notes and link them. Cheap tiers first — the model is only asked about links nothing else could find.">Link notes</button>
+    <button id="intakebtn" title="Read the Drop folder and file what's in it. Runs by itself too, while this is open.">File dropped notes<span id="dropbadge"></span></button>
   </header>
 
   <div class="capture">
@@ -215,6 +261,25 @@
     </div>
   </div>
 
+  <section id="inboxbox" class="hide">
+    <h2>Where does this go?</h2>
+    <div id="inboxlist"></div>
+    <p class="hint" style="margin:10px 0 0">
+      These came in through the <code>Drop</code> folder and the guess wasn’t confident
+      enough to file on. One click and the note gets the full treatment — a Project is
+      parsed, planned and put on the calendar.
+    </p>
+  </section>
+
+  <section id="dropbox" class="hide">
+    <h2>Filed from Drop <span id="dropcost" class="cost"></span></h2>
+    <div id="droplist"></div>
+    <p class="hint" style="margin:10px 0 0">
+      Your original files moved to <code>Drop/_filed/</code> — nothing is deleted, so a
+      wrong call is always undoable.
+    </p>
+  </section>
+
   <section id="datesbox" class="hide">
     <h2>Confirm these dates</h2>
     <div id="dateslist"></div>
@@ -222,6 +287,18 @@
       These are on the calendar already — a forgotten confirmation shouldn’t mean no
       reminder. But nobody agrees what “next Friday” means, so they are worth a glance.
     </p>
+  </section>
+
+  <section id="connectbox" class="hide">
+    <h2>Links added <span id="connectcost" class="cost"></span></h2>
+    <div id="connectlist"></div>
+    <div class="connect-foot">
+      <p class="hint" style="margin:0">
+        Written straight into each note’s <code>## Related</code> section and marked as
+        suggested — delete any you don’t want. Unchanged notes are skipped.
+      </p>
+      <button id="connectall" class="ghost" title="Ignore the skip-unchanged cache and reconsider every note">Re-link everything</button>
+    </div>
   </section>
 
   <section id="reviewbox" class="hide">
@@ -350,6 +427,115 @@ function duePicker(noteId, p) {
             title="${guess ? "Guessed" + (p.deadline_phrase ? " from “" + esc(p.deadline_phrase) + "”" : "") + " — not confirmed" : "Due date"}">`;
 }
 
+// ---- the Drop folder -------------------------------------------------------
+// Two panels with different jobs: one asks a question that is still open, the
+// other reports what already happened. Keeping them apart means the question
+// never scrolls away under a list of successes.
+
+const BUCKETS = ["area", "project", "resource"];
+
+function bucketPill(b) {
+  return `<span class="bucketpill ${esc(b)}">${esc(b)}</span>`;
+}
+
+function renderInbox(items) {
+  const box = $("#inboxbox");
+  if (!items || !items.length) { box.classList.add("hide"); return; }
+  box.classList.remove("hide");
+  $("#inboxlist").innerHTML = items.map(n => `
+    <div class="droprow">
+      ${swatch(n.category)}
+      <strong>${esc(n.title)}</strong>
+      ${n.file ? `<span class="file">${esc(n.file)}</span>` : ""}
+      ${n.suggested ? `<span class="conf">looks like ${esc(n.suggested)} · ${Math.round((n.confidence || 0) * 100)}% sure</span>` : ""}
+      <span class="fileacts">
+        ${BUCKETS.map(b => `<button class="${b === n.suggested ? "suggested" : ""}"
+            data-file-note="${esc(n.note_id)}" data-into="${b}"
+            title="${b === n.suggested ? "What the system would have picked" : "File it here instead"}"
+          >${b[0].toUpperCase() + b.slice(1)}</button>`).join("")}
+      </span>
+      ${n.reason ? `<span class="why">${esc(n.reason)}</span>` : ""}
+      ${n.excerpt ? `<span class="excerpt">${esc(n.excerpt)}</span>` : ""}
+    </div>`).join("");
+}
+
+function renderIntake(out) {
+  const box = $("#dropbox");
+  const bits = [`${out.scanned} read`];
+  if (out.filed) bits.push(`${out.filed} filed`);
+  if (out.asking) bits.push(`${out.asking} asked about`);
+  if (out.unreadable) bits.push(`${out.unreadable} unreadable`);
+  bits.push(`${out.model_calls} model call${out.model_calls === 1 ? "" : "s"}`);
+  $("#dropcost").textContent = bits.join(" · ");
+
+  const rows = (out.results || []).map(r => {
+    if (r.status === "unreadable") {
+      return `<div class="droprow">
+        <strong>${esc(r.file)}</strong>
+        <span class="bucketpill">couldn’t read</span>
+        <span class="why">${esc(r.error)} — moved to Drop/_problem/</span>
+      </div>`;
+    }
+    return `<div class="droprow">
+      ${swatch(r.category)}
+      <strong>${esc(r.title)}</strong>
+      <span class="file">${esc(r.file)}</span>
+      ${bucketPill(r.bucket || r.suggested)}
+      <span class="conf">${Math.round((r.confidence || 0) * 100)}% · ${esc(r.decided_by)}</span>
+      ${r.status === "asking" ? `<span class="pill">waiting on you</span>` : ""}
+      ${r.degraded ? `<span class="pill">rule-based parse</span>` : ""}
+      <span class="why">${esc(r.reason)}</span>
+    </div>`;
+  });
+
+  $("#droplist").innerHTML = rows.length
+    ? rows.join("")
+    : `<p class="empty">Nothing in the Drop folder${out.waiting ? " — " + out.waiting + " still being written" : ""}. Put a .md, .txt or .docx in there and it gets filed.</p>`;
+  box.classList.remove("hide");
+}
+
+async function runIntake(btn) {
+  btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
+  const original = btn.textContent;
+  btn.textContent = "Filing…";
+  try {
+    const out = await api("/api/intake", {method: "POST"});
+    renderIntake(out);
+    if (out.busy) toast("Already running", "The folder watcher is filing these right now.");
+    else if (!out.scanned) toast("Drop folder is empty", "Put a note in it and press this again.");
+    else toast(`${out.filed} filed`, out.asking
+      ? `${out.asking} weren’t clear enough to call — they’re in the Inbox above.`
+      : "Everything was clear enough to file.");
+    load();
+  } catch (e) {
+    toast("Filing failed", e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.removeAttribute("aria-busy");
+    btn.textContent = original;
+  }
+}
+
+document.addEventListener("click", async e => {
+  const b = e.target.closest("[data-file-note]");
+  if (!b) return;
+  const bucket = b.dataset.into;
+  document.querySelectorAll("[data-file-note]").forEach(x => x.disabled = true);
+  try {
+    const r = await api(`/api/notes/${b.dataset.fileNote}/classify`,
+                        {method: "POST", body: JSON.stringify({bucket})});
+    const p = r.note.project;
+    toast(`Filed as ${bucket}`, p
+      ? `${(p.steps || []).length} steps · ~${p.estimate_minutes}m${p.deadline ? " · due " + p.deadline : ""}`
+      : r.note.title);
+    load();
+  } catch (err) {
+    toast("Could not file it", err.message, "err");
+    document.querySelectorAll("[data-file-note]").forEach(x => x.disabled = false);
+  }
+});
+
 function renderDates(items) {
   const box = $("#datesbox");
   if (!items || !items.length) { box.classList.add("hide"); return; }
@@ -417,6 +603,9 @@ function renderAreas(list) {
   if (!list.length) { el.innerHTML = `<p class="empty">No areas yet. Capture one above.</p>`; return; }
   el.innerHTML = list.map(a => {
     const s = a.schedule || {};
+    const h = a.habit || {};
+    const miss = h.misses || {};
+    const stab = h.stability || {};
     const weekly = a.cadence === "weekly";
     const days = weekly ? `
       <div class="days">${DAYNAMES.map((n, i) => `
@@ -432,6 +621,35 @@ function renderAreas(list) {
           ${catSelect(a.id, a.category)}
         </div>
         <div class="meta">${a.next ? "next " + fmtWhen(a.next) : "not scheduled"}</div>
+
+        <!-- Gollwitzer 1999: the if-then plan is d≈0.65, the largest single
+             effect in the habit literature, and it is one sentence. It goes
+             above the target count because the target count is the weakest
+             thing on this card. -->
+        <div class="intention">
+          ${h.intention
+            ? `<strong>${esc(h.intention)}</strong>`
+            : `<span class="hint">No plan yet — “when X, I will Y at Z” is the single biggest lever there is.</span>`}
+          <div class="area-ctl" style="margin-top:6px">
+            <input type="text" placeholder="When… (a cue, not a time of day)" value="${esc(h.cue || "")}" data-habit="${esc(a.id)}" data-field="cue">
+            <input type="text" placeholder="I will… (leave blank to use the title)" value="${esc(h.behaviour || "")}" data-habit="${esc(a.id)}" data-field="behaviour">
+            <input type="text" placeholder="at… (where)" value="${esc(h.place || "")}" data-habit="${esc(a.id)}" data-field="place">
+          </div>
+          <div class="area-ctl">
+            <input type="text" placeholder="Right after… (an existing routine)" value="${esc(h.anchor || "")}" data-habit="${esc(a.id)}" data-field="anchor">
+            <input type="text" placeholder="Made easier…" value="${esc(h.easier || "")}" data-habit="${esc(a.id)}" data-field="easier">
+            <input type="text" placeholder="Made harder…" value="${esc(h.harder || "")}" data-habit="${esc(a.id)}" data-field="harder">
+          </div>
+        </div>
+
+        <div class="area-ctl">
+          <button data-habit-done="${esc(a.id)}" class="primary">Did it</button>
+          <!-- Consecutive misses, never a streak. Lally et al.: one miss does
+               not impair formation, so a counter that resets to zero on the
+               first one is punishing the wrong moment. -->
+          <span class="hint ${miss.alert ? "over" : ""}">${esc(miss.message || "")}</span>
+          ${stab.enough ? `<span class="hint">${esc(stab.message || "")}</span>` : ""}
+        </div>
         <div class="area-ctl">
           <input type="time" value="${esc(s.time || "18:00")}" data-area-time="${esc(a.id)}">
           <input type="number" min="5" max="720" step="5" value="${s.duration_minutes ?? 30}" data-area-min="${esc(a.id)}">
@@ -467,6 +685,10 @@ function renderProjects(list) {
     const steps = (p.steps || []).map(s => `
       <li>
         <input type="checkbox" ${s.done ? "checked" : ""} data-note="${esc(n.id)}" data-step="${esc(s.id)}">
+        ${s.done
+          ? (s.actual_minutes ? `<span class="pill" title="planned ${s.minutes}m">took ${s.actual_minutes}m</span>` : "")
+          : `<button class="tiny" data-start-note="${esc(n.id)}" data-start-step="${esc(s.id)}"
+               title="Start the clock. Without it there is nothing to score the estimate against.">${s.started_at ? "running" : "start"}</button>`}
         <span class="${s.done ? "done" : ""}">${esc(s.text)} <span class="when">${s.minutes}m${s.scheduled && !s.done ? " · " + fmtWhen(s.scheduled) : ""}</span></span>
       </li>`).join("");
     return `
@@ -489,6 +711,7 @@ function renderProjects(list) {
         <div class="rowacts">
           <button data-act="reparse" data-note="${esc(n.id)}">Re-parse</button>
           <button data-act="replan"  data-note="${esc(n.id)}">Re-plan</button>
+          <button data-act="connect" data-note="${esc(n.id)}">Link</button>
           <button data-act="graduate" data-note="${esc(n.id)}">→ Resource</button>
         </div>
       </div>`;
@@ -545,6 +768,7 @@ async function load() {
     const d = await api("/api/dashboard");
     $("#vaultpath").textContent = d.vault;
     CATS = Object.fromEntries((d.categories || []).map(c => [c.key, c]));
+    renderInbox(d.inbox || []);
     renderDates(d.pending_dates || []);
     renderReviews(d.reviews || []);
     renderArchive(d.archive);
@@ -559,9 +783,14 @@ async function load() {
   try {
     const h = await api("/api/health");
     const on = h.llm.available;
+    // A file sitting unfiled in Drop/ is the one bit of state the dashboard
+    // cannot show anywhere else — it isn't a note yet.
+    const waiting = (h.drop && h.drop.waiting) || 0;
+    $("#dropbadge").textContent = waiting ? ` · ${waiting}` : "";
     $("#footer").innerHTML =
       `<span><i class="dot ${on ? "on" : "off"}"></i>${esc(h.llm.provider)} · ${esc(h.llm.model)} ${on ? "ready" : "offline (rule-based fallback)"}</span>` +
-      `<span><i class="dot on"></i>events: ${esc(h.calendar.sink)} · tasks: ${esc(h.calendar.task_sink)} · <a href="/calendar.ics">calendar.ics</a></span>`;
+      `<span><i class="dot on"></i>events: ${esc(h.calendar.sink)} · tasks: ${esc(h.calendar.task_sink)} · <a href="/calendar.ics">calendar.ics</a></span>` +
+      (h.drop ? `<span><i class="dot ${h.drop.watch ? "on" : "off"}"></i>drop: ${h.drop.watch ? "watching" : "manual"} · ${esc(h.drop.path)}</span>` : "");
   } catch (e) { /* footer is cosmetic */ }
 }
 
@@ -580,11 +809,14 @@ async function capture(bucket) {
       const bits = [];
       if (p.deadline) bits.push("due " + p.deadline);
       bits.push(`${(p.steps || []).length} steps`, `~${p.estimate_minutes}m`, `L${p.level}`);
+      if (r.links && r.links.linked) bits.push(`${r.links.linked} links`);
       toast(r.note.title, bits.join(" · ") + (r.plan ? " — " + r.plan.message : ""),
             r.parser && r.parser.degraded ? "warn" : "");
       if (r.parser && r.parser.degraded) setTimeout(() => toast("Rule-based parse", r.parser.note, "warn"), 5600);
     } else {
-      toast("Filed as " + bucket, r.note.title);
+      const linked = r.links && r.links.linked
+        ? " · linked to " + r.links.titles.slice(0, 3).join(", ") : "";
+      toast("Filed as " + bucket, r.note.title + linked);
     }
     load();
   } catch (e) { toast("Capture failed", e.message, "err"); }
@@ -618,12 +850,8 @@ async function setDeadline(id, patch, msg) {
 // often. The endpoint wants both fields, so whichever half is not being
 // changed is sent back unchanged.
 async function setHabit(id, patch, msg) {
-  const row = [...document.querySelectorAll(".area")].find(r =>
-    r.querySelector(`[data-cadence="${id}"]`));
-  const body = Object.assign({
-    cadence: row ? row.querySelector("select[data-cadence]").value : "weekly",
-    target_count: row ? Number(row.querySelector(".target span").textContent.replace("×", "")) : 3,
-  }, patch);
+  // Every field is optional at the endpoint now, so only the patch travels.
+  const body = Object.assign({}, patch);
   try {
     await api(`/api/notes/${id}/habit`, {method: "POST", body: JSON.stringify(body)});
     toast("Habit updated", msg);
@@ -667,6 +895,15 @@ document.addEventListener("change", async e => {
                     count + "× per " + cad.value);
   }
 
+  const field = e.target.closest("input[data-habit]");
+  if (field) {
+    // Only the field that changed is sent: filling in a cue must not require
+    // restating a schedule you are not touching.
+    const patch = {};
+    patch[field.dataset.field] = field.value;
+    return setHabit(field.dataset.habit, patch, "plan updated");
+  }
+
   const time = e.target.closest("input[data-area-time]");
   if (time) return setSchedule(time.dataset.areaTime, {time: time.value}, "starts at " + time.value);
   const mins = e.target.closest("input[data-area-min]");
@@ -674,6 +911,16 @@ document.addEventListener("change", async e => {
 });
 
 document.addEventListener("click", async e => {
+  const start = e.target.closest("button[data-start-note]");
+  if (start) {
+    try {
+      await api(`/api/notes/${start.dataset.startNote}/steps/${start.dataset.startStep}/start`, {method: "POST"});
+      toast("Clock started", "Tick it off when you stop and the estimate gets scored.");
+      load();
+    } catch (err) { toast("Could not start it", err.message, "err"); }
+    return;
+  }
+
   const day = e.target.closest("button[data-day]");
   if (day) {
     // Toggling a day pins the series: the habit target no longer chooses for you.
@@ -692,6 +939,17 @@ document.addEventListener("click", async e => {
     if (next === current) return;
     return setHabit(tgt.dataset.target, {target_count: next},
                     next + "× per " + row.querySelector("select[data-cadence]").value);
+  }
+
+  const done = e.target.closest("button[data-habit-done]");
+  if (done) {
+    try {
+      const r = await api(`/api/notes/${done.dataset.habitDone}/habit/done`, {method: "POST"});
+      const m = (r.habit && r.habit.misses) || {};
+      toast("Logged", m.message || "One more.");
+      load();
+    } catch (err) { toast("Could not log it", err.message, "err"); }
+    return;
   }
 
   const pause = e.target.closest("button[data-area-toggle]");
@@ -743,13 +1001,86 @@ document.addEventListener("click", async e => {
   try {
     if (b.dataset.act === "reparse") { const r = await api(`/api/notes/${id}/reparse`, {method: "POST"}); toast("Re-parsed", r.plan.message); }
     if (b.dataset.act === "replan")  { const r = await api(`/api/notes/${id}/replan`,  {method: "POST"}); toast("Re-planned", r.message); }
+    if (b.dataset.act === "connect") {
+      const r = await api(`/api/notes/${id}/connect`, {method: "POST"});
+      renderConnect({scanned: 1, skipped: 0, changed: r.changed ? 1 : 0,
+                     linked: r.links.length, model_calls: r.used_model ? 1 : 0, results: [r]});
+      toast("Linked", r.links.length
+        ? `${r.links.length} link${r.links.length === 1 ? "" : "s"} added to “${r.title}”.`
+        : `Nothing related enough to link from “${r.title}”.`);
+    }
     if (b.dataset.act === "graduate"){ await api(`/api/notes/${id}/move`, {method: "POST", body: JSON.stringify({bucket: "resource"})}); toast("Graduated", "Moved to Resources."); }
     load();
   } catch (err) { toast("Action failed", err.message, "err"); }
   finally { b.disabled = false; }
 });
 
+// ---- link notes -------------------------------------------------------
+// The run can take a while when the model is involved, so the button owns a
+// busy state rather than leaving the page looking dead. Everything else on
+// the dashboard is a read; this one writes to every note it touches.
+
+function renderConnect(out) {
+  const withLinks = (out.results || []).filter(r => (r.links || []).length);
+  const box = $("#connectbox");
+
+  const bits = [`${out.scanned} scanned`];
+  if (out.skipped) bits.push(`${out.skipped} unchanged`);
+  bits.push(`${out.linked} link${out.linked === 1 ? "" : "s"}`);
+  bits.push(`${out.model_calls} model call${out.model_calls === 1 ? "" : "s"}`);
+  $("#connectcost").textContent = bits.join(" · ");
+
+  if (!withLinks.length) {
+    $("#connectlist").innerHTML = `<p class="empty">${
+      out.skipped === out.scanned
+        ? "Nothing has changed since the last run."
+        : "No new connections found — nothing here is related enough to link."
+    }</p>`;
+    box.classList.remove("hide");
+    return;
+  }
+
+  $("#connectlist").innerHTML = withLinks.map(r => `
+    <div class="clink">
+      <span class="from">${esc(r.title)}</span>
+      <ul>${r.links.map(l => `
+        <li>${esc(l.title)}<span class="src ${esc(l.source)}">${esc(l.source)}</span>
+        ${l.why ? `<span class="why"> — ${esc(l.why)}</span>` : ""}</li>`).join("")}
+      </ul>
+    </div>`).join("");
+  box.classList.remove("hide");
+}
+
+async function runConnect(btn, body, label) {
+  btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
+  const original = btn.textContent;
+  btn.textContent = "Linking…";
+  try {
+    const out = await api("/api/connect", {method: "POST", body: JSON.stringify(body)});
+    renderConnect(out);
+    const how = out.model_calls
+      ? `${out.model_calls} needed the model.`
+      : `No model calls needed.`;
+    toast(label, `${out.linked} link${out.linked === 1 ? "" : "s"} across ${out.changed} note${out.changed === 1 ? "" : "s"}. ${how}`);
+    load();
+  } catch (e) {
+    toast("Linking failed", e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.removeAttribute("aria-busy");
+    btn.textContent = original;
+  }
+}
+
+$("#connectbtn").addEventListener("click", e => runConnect(e.currentTarget, {}, "Notes linked"));
+$("#connectall").addEventListener("click", e =>
+  runConnect(e.currentTarget, {changed_only: false}, "Everything re-linked"));
+
+$("#intakebtn").addEventListener("click", e => runIntake(e.currentTarget));
+
 $("#studybtn").addEventListener("click", () => (location.href = "/study"));
+$("#reviewbtn").addEventListener("click", () => (location.href = "/review"));
 $("#refresh").addEventListener("click", load);
 $("#syncal").addEventListener("click", async () => {
   try { const r = await api("/api/calendar/sync", {method: "POST"}); toast("Calendar synced", JSON.stringify(r.result)); }
