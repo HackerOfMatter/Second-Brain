@@ -406,7 +406,7 @@ def test_google_token_validation():
         creds = root / "credentials.json"
         token = root / "token.json"
         CID = "282723140113-current.apps.googleusercontent.com"
-        creds.write_text(json.dumps({"installed": {"client_id": CID, "client_secret": "s"}}))
+        creds.write_text(json.dumps({"installed": {"client_id": CID, "client_secret": "s"}}), encoding="utf-8")
 
         check("missing token is a reason, not a crash",
               "no token yet" in (ga.usable_token(token, creds) or ""))
@@ -415,7 +415,7 @@ def test_google_token_validation():
             base = {"token": "t", "refresh_token": "r", "client_id": CID,
                     "client_secret": "s", "scopes": list(ga.SCOPES)}
             base.update(over)
-            token.write_text(json.dumps(base))
+            token.write_text(json.dumps(base), encoding="utf-8")
 
         write()
         check("a good token is usable", ga.usable_token(token, creds) is None)
@@ -443,14 +443,14 @@ def test_google_token_validation():
         check("token without refresh token rejected",
               "refresh token" in (ga.usable_token(token, creds) or ""))
 
-        token.write_text("{not json")
+        token.write_text("{not json", encoding="utf-8")
         check("unreadable token rejected",
               "unreadable" in (ga.usable_token(token, creds) or ""))
 
         check("client_id read from installed block", ga.client_id_of(creds) == CID)
-        creds.write_text(json.dumps({"web": {"client_id": "W"}}))
+        creds.write_text(json.dumps({"web": {"client_id": "W"}}), encoding="utf-8")
         check("client_id read from web block", ga.client_id_of(creds) == "W")
-        creds.write_text("nonsense")
+        creds.write_text("nonsense", encoding="utf-8")
         check("unreadable credentials -> no id", ga.client_id_of(creds) is None)
         write()
         check("unknown current client does not reject a token",
@@ -717,7 +717,7 @@ def test_vault_and_engine():
         check("body keeps capture", "Learn Rust generics" in reread.body)
 
         check("ics written", cfg.ics_path.exists())
-        ics = cfg.ics_path.read_text()
+        ics = cfg.ics_path.read_text(encoding="utf-8")
         check("ics has a due task, not an event", "BEGIN:VTODO" in ics)
         check("task names the project", "Learn Rust generics" in ics)
         check("no DUE: banner event", "SUMMARY:DUE\\:" not in ics)
@@ -750,7 +750,7 @@ def test_vault_and_engine():
         check("area gets a schedule", a["note"]["schedule"]["duration_minutes"] == 30)
         check("area body says it recurs", "recurs on the calendar" in engine.note(area_id).body)
 
-        ics2 = cfg.ics_path.read_text()
+        ics2 = cfg.ics_path.read_text(encoding="utf-8")
         check("area recurs in the ics", "RRULE:FREQ=WEEKLY" in ics2)
         check("weekly schedule review present", "Schedule review" in ics2)
 
@@ -774,10 +774,10 @@ def test_vault_and_engine():
         check("schedule time changed", moved.schedule.time == "06:45")
         check("schedule days pinned", moved.schedule.days == [0, 3])
         check("schedule change logged", any(h.event == "schedule" for h in moved.history))
-        check("new rrule synced", "BYDAY=MO,TH" in cfg.ics_path.read_text())
+        check("new rrule synced", "BYDAY=MO,TH" in cfg.ics_path.read_text(encoding="utf-8"))
 
         engine.set_schedule(area_id, enabled=False)
-        check("paused area leaves the calendar", "BYDAY=MO,TH" not in cfg.ics_path.read_text())
+        check("paused area leaves the calendar", "BYDAY=MO,TH" not in cfg.ics_path.read_text(encoding="utf-8"))
         engine.set_schedule(area_id, enabled=True)
 
         engine.set_category(area_id, "fun")
@@ -4648,7 +4648,7 @@ def test_intake_files_the_folder():
         check("its steps were found", len(essay.project.steps) == 3, essay.project.steps)
         check("and scheduled", all(s.scheduled for s in essay.project.steps))
         check("the calendar was rewritten", cfg.ics_path.exists())
-        check("the essay is on it", "History essay" in cfg.ics_path.read_text())
+        check("the essay is on it", "History essay" in cfg.ics_path.read_text(encoding="utf-8"))
 
         gym = engine.note(by_file["gym.txt"]["note_id"])
         check("the area got a habit", gym.habit is not None)
