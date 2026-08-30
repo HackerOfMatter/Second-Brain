@@ -1,0 +1,37 @@
+{
+	"nodes": [
+		{"id": "ch5_root", "x": 0, "y": 2000, "width": 300, "height": 80, "type": "text", "text": "# Chapter 5: Government, Muni, and Corporate Securities"},
+		
+		{"id": "gov_securities", "x": -450, "y": 2200, "width": 250, "height": 60, "type": "text", "text": "## U.S. Govt & Agencies"},
+		{"id": "treasuries", "x": -600, "y": 2350, "width": 200, "height": 60, "type": "text", "text": "[[Treasury Obligations]]"},
+		{"id": "mbs_node", "x": -300, "y": 2350, "width": 200, "height": 60, "type": "text", "text": "[[MBS & Prepayment Risk]]"},
+
+		{"id": "muni_securities", "x": -50, "y": 2200, "width": 250, "height": 60, "type": "text", "text": "## Municipal Securities"},
+		{"id": "go_rev", "x": -200, "y": 2350, "width": 200, "height": 60, "type": "text", "text": "[[GO vs Revenue Bonds]]"},
+		{"id": "muni_short", "x": 100, "y": 2350, "width": 200, "height": 60, "type": "text", "text": "[[ARS and VRDOs]]"},
+		{"id": "muni_primary", "x": -50, "y": 2450, "width": 250, "height": 60, "type": "text", "text": "[[Muni Primary Market]]"},
+
+		{"id": "corp_securities", "x": 350, "y": 2200, "width": 250, "height": 60, "type": "text", "text": "## Corporate & International"},
+		{"id": "corp_types", "x": 350, "y": 2350, "width": 200, "height": 60, "type": "text", "text": "[[Secured vs Debentures]]"},
+		{"id": "intl_bonds", "x": 350, "y": 2450, "width": 200, "height": 60, "type": "text", "text": "[[Eurodollar vs Yankee]]"},
+
+		{"id": "money_tax", "x": 700, "y": 2200, "width": 250, "height": 60, "type": "text", "text": "## Money Market & Tax"},
+		{"id": "mm_node", "x": 700, "y": 2350, "width": 200, "height": 60, "type": "text", "text": "[[Money Market Securities]]"},
+		{"id": "tax_impl", "x": 700, "y": 2450, "width": 200, "height": 60, "type": "text", "text": "[[Taxation of Bond Interest]]"}
+	],
+	"edges": [
+		{"id": "e_ch5_1", "fromNode": "ch5_root", "fromSide": "bottom", "toNode": "gov_securities", "toSide": "top"},
+		{"id": "e_ch5_2", "fromNode": "ch5_root", "fromSide": "bottom", "toNode": "muni_securities", "toSide": "top"},
+		{"id": "e_ch5_3", "fromNode": "ch5_root", "fromSide": "bottom", "toNode": "corp_securities", "toSide": "top"},
+		{"id": "e_ch5_4", "fromNode": "ch5_root", "fromSide": "bottom", "toNode": "money_tax", "toSide": "top"},
+		{"id": "e_gov_1", "fromNode": "gov_securities", "fromSide": "bottom", "toNode": "treasuries", "toSide": "top"},
+		{"id": "e_gov_2", "fromNode": "gov_securities", "fromSide": "bottom", "toNode": "mbs_node", "toSide": "top"},
+		{"id": "e_muni_1", "fromNode": "muni_securities", "fromSide": "bottom", "toNode": "go_rev", "toSide": "top"},
+		{"id": "e_muni_2", "fromNode": "muni_securities", "fromSide": "bottom", "toNode": "muni_short", "toSide": "top"},
+		{"id": "e_muni_3", "fromNode": "muni_securities", "fromSide": "bottom", "toNode": "muni_primary", "toSide": "top"},
+		{"id": "e_corp_1", "fromNode": "corp_securities", "fromSide": "bottom", "toNode": "corp_types", "toSide": "top"},
+		{"id": "e_corp_2", "fromNode": "corp_securities", "fromSide": "bottom", "toNode": "intl_bonds", "toSide": "top"},
+		{"id": "e_tax_1", "fromNode": "money_tax", "fromSide": "bottom", "toNode": "mm_node", "toSide": "top"},
+		{"id": "e_tax_2", "fromNode": "money_tax", "fromSide": "bottom", "toNode": "tax_impl", "toSide": "top"}
+	]
+}

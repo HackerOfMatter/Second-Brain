@@ -1,0 +1,41 @@
+{
+	"nodes": [
+		{"id": "root", "x": 0, "y": 0, "width": 300, "height": 80, "type": "text", "text": "# Chapter 1: Market Participants, Structure, and Transactions"},
+		
+		{"id": "bd_entity", "x": -400, "y": 200, "width": 250, "height": 60, "type": "text", "text": "## The Broker-Dealer (BD) Entity"},
+		{"id": "bd_sectors", "x": -550, "y": 350, "width": 200, "height": 60, "type": "text", "text": "[[BD Functions by Sector]]"},
+		{"id": "bd_capacity", "x": -250, "y": 350, "width": 200, "height": 60, "type": "text", "text": "[[Capacity & Compensation]]"},
+
+		{"id": "investors", "x": -100, "y": 200, "width": 250, "height": 60, "type": "text", "text": "## The Investors"},
+		{"id": "investor_class", "x": -100, "y": 350, "width": 200, "height": 60, "type": "text", "text": "[[Investor Classifications]]"},
+
+		{"id": "markets", "x": 200, "y": 200, "width": 250, "height": 60, "type": "text", "text": "## Market Venues & Structure"},
+		{"id": "market_compare", "x": 50, "y": 350, "width": 200, "height": 60, "type": "text", "text": "[[Primary vs Secondary]]"},
+		{"id": "platforms", "x": 350, "y": 350, "width": 200, "height": 60, "type": "text", "text": "[[Platform Types]]"},
+		{"id": "reg_sectors", "x": 50, "y": 450, "width": 200, "height": 60, "type": "text", "text": "[[Regulatory Sectors]]"},
+		{"id": "alt_markets", "x": 350, "y": 450, "width": 200, "height": 60, "type": "text", "text": "[[Third & Fourth Markets]]"},
+
+		{"id": "lifecycle", "x": 500, "y": 200, "width": 250, "height": 60, "type": "text", "text": "## Transaction Lifecycle"},
+		{"id": "step_process", "x": 650, "y": 350, "width": 200, "height": 60, "type": "text", "text": "[[The Step-by-Step Process]]"},
+		{"id": "post_trade", "x": 650, "y": 450, "width": 200, "height": 60, "type": "text", "text": "[[Post-Trade Infrastructure]]"},
+		{"id": "firm_roles", "x": 650, "y": 550, "width": 200, "height": 60, "type": "text", "text": "[[Clearing vs Introducing Firms]]"}
+	],
+	"edges": [
+		{"id": "e1", "fromNode": "root", "fromSide": "bottom", "toNode": "bd_entity", "toSide": "top"},
+		{"id": "e2", "fromNode": "root", "fromSide": "bottom", "toNode": "investors", "toSide": "top"},
+		{"id": "e3", "fromNode": "root", "fromSide": "bottom", "toNode": "markets", "toSide": "top"},
+		{"id": "e4", "fromNode": "root", "fromSide": "bottom", "toNode": "lifecycle", "toSide": "top"},
+		{"id": "e5", "fromNode": "bd_entity", "fromSide": "bottom", "toNode": "bd_sectors", "toSide": "top"},
+		{"id": "e6", "fromNode": "bd_entity", "fromSide": "bottom", "toNode": "bd_capacity", "toSide": "top"},
+		{"id": "e7", "fromNode": "investors", "fromSide": "bottom", "toNode": "investor_class", "toSide": "top"},
+		{"id": "e8", "fromNode": "markets", "fromSide": "bottom", "toNode": "market_compare", "toSide": "top"},
+		{"id": "e9", "fromNode": "markets", "fromSide": "bottom", "toNode": "platforms", "toSide": "top"},
+		{"id": "e10", "fromNode": "markets", "fromSide": "bottom", "toNode": "reg_sectors", "toSide": "top"},
+		{"id": "e11", "fromNode": "markets", "fromSide": "bottom", "toNode": "alt_markets", "toSide": "top"},
+		{"id": "e12", "fromNode": "lifecycle", "fromSide": "bottom", "toNode": "step_process", "toSide": "top"},
+		{"id": "e13", "fromNode": "lifecycle", "fromSide": "bottom", "toNode": "post_trade", "toSide": "top"},
+		{"id": "e14", "fromNode": "lifecycle", "fromSide": "bottom", "toNode": "firm_roles", "toSide": "top"}
+	]
+}
+
+

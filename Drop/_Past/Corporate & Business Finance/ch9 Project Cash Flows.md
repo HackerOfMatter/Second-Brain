@@ -1,0 +1,104 @@
+# {{Course Name}} — {{Topic / Lecture Title}}
+> 📅 2025-10-23 | 🧑‍🏫 Instructor: {{Name}}  
+> [[Course Index]] ← course hub | [[Business Concepts MOC]] ← master concept map
+> After
+> 	Atomic Notes —> Case Links —> Tag links
+
+---
+
+## 🧭 Executive Summary
+- **Core concept:**  
+- **Why it matters:**  
+- **Real-world relevance:** (company, market, or accounting example)  
+- **Likely use:** (exam, homework, project, case study)  
+
+---
+
+## 🧩 Key Concepts & Terms
+| Term / Concept         | Definition / Meaning    | Example or Context |
+| ---------------------- | ----------------------- | ------------------ |
+| [[Relevant Cash Flow]] | Sta                     |                    |
+| Stand alone principle  |                         |                    |
+| Incremental Cash FLow  | Corporate CF - w/out CF |                    |
+| [[Pro Forma]]          |                         |                    |
+| [[OCF]]                |                         |                    |
+| IRR                    |                         |                    |
+| Depreciation           | Non-cash expence        |                    |
+
+_(Tip: Link each major term to its atomic note → e.g., [[Bond Amortization]] or [[Agency Problem]])_
+
+---
+
+## 📊 Frameworks, Models, or Equations
+> Use this for ratios, decision models, or processes.
+
+| Model / Formula | Components | How to Interpret | Example |
+| --------------- | ---------- | ---------------- | ------- |
+|                 |            |                  |         |
+
+**Common formulas to record clearly:**
+- ROI =  
+- Current Ratio =  
+- Break-even Point =  
+
+_(Add source / textbook page if needed)_
+
+---
+
+## 🪜 Step-by-Step Application (Class Walkthrough)
+> Capture the professor’s worked example or logic.
+
+1. **Given / Known:**  
+2. **Formula or Framework:**  
+3. **Substitution:**  
+4. **Solution:**  
+5. **Interpretation (what it means):**  
+
+> 💡 *Write the takeaway in plain English:*  
+> “This ratio shows how efficiently the company converts assets into profit.”
+
+---
+
+## 🔍 Conceptual Deep Dive
+- **Assumptions behind the model:**  
+- **What changes if X variable shifts:**  
+- **Common pitfalls / student errors:**  
+- **Link to related topic:** [[ ]]  
+
+---
+
+## 📚 Real-World Example / Case Connection
+- Company / Case:  
+- Key takeaway:  
+- Financial decision or ethical dilemma:  
+
+_(You can later tag this to build your own business case database.)_
+
+---
+
+## 🧠 Reflection / Metacognition
+- **I understand this best when…**  
+- **Still unclear:**  
+- **This connects to:** [[ ]]  
+- **Could I explain this to someone?** (yes / needs review)
+
+---
+
+## 📝 Homework / Practice Tracker
+| Problem | Description | Concept / Formula Used | Done? |
+|----------|--------------|------------------------|-------|
+|          |              |                        | [ ]   |
+|          |              |                        | [ ]   |
+
+---
+
+## 🔄 Quick Review (Retrieval Section)
+- **1 key question:**  
+- **1 sample calculation / ratio to recall:**  
+- **1 misconception to avoid:**  
+- **1 mini-summary:**  
+
+---
+
+## 🏷️ Tags
+#{{course}} #business #finance #concept #review #practice

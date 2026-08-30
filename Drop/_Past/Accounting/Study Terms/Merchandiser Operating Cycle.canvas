@@ -1,0 +1,15 @@
+{
+	"nodes":[
+		{"id":"4008b81b4508393c","x":-400,"y":-20,"width":250,"height":60,"color":"3","type":"text","text":"Credit Sales"},
+		{"id":"77f0e67102dd9f31","x":-308,"y":-420,"width":110,"height":60,"color":"4","type":"text","text":"Cash"},
+		{"id":"126d9992af1f2af2","x":-140,"y":-213,"width":250,"height":60,"color":"6","type":"text","text":"Merchandise Inventory"},
+		{"id":"1463bf04ca0aaefc","x":-650,"y":-243,"width":250,"height":60,"color":"1","type":"text","text":"Account Recievable"},
+		{"id":"9869f34f28e2671f","x":-672,"y":285,"width":250,"height":60,"type":"text","text":"[[Merchandiser]]"}
+	],
+	"edges":[
+		{"id":"e53ecfdb623261da","fromNode":"77f0e67102dd9f31","fromSide":"right","toNode":"126d9992af1f2af2","toSide":"top","label":"Purchases"},
+		{"id":"e4bd85e46aed3984","fromNode":"126d9992af1f2af2","fromSide":"bottom","toNode":"4008b81b4508393c","toSide":"right"},
+		{"id":"1185d1dae73e8ebf","fromNode":"4008b81b4508393c","fromSide":"left","toNode":"1463bf04ca0aaefc","toSide":"bottom"},
+		{"id":"e6b2cd488483fc55","fromNode":"1463bf04ca0aaefc","fromSide":"top","toNode":"77f0e67102dd9f31","toSide":"left","label":"Cash Recieved"}
+	]
+}
