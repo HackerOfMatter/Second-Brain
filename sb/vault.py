@@ -497,8 +497,20 @@ class Vault:
         old_path, old_note = hit
         expected_dir = self.dir_for(note.bucket)
         renamed = old_note.title.strip() != note.title.strip()
-        if old_path.parent != expected_dir or renamed:
-            new_path = self.path_for(note)
+        # A note filed into a sub-topic — 30-Resources/Accounting/Study Terms —
+        # is still in its bucket, and saving it must not drag it up to the
+        # bucket root. It used to: the test was `old_path.parent !=
+        # expected_dir`, which is true of every subfolder, so the first save
+        # after adoption flattened the whole subject tree and took the
+        # study-by-folder grouping (`folders_by_id`) with it. Only a genuine
+        # bucket change relocates a note now; a rename keeps it where it lives.
+        in_bucket = expected_dir in old_path.parents
+        if not in_bucket or renamed:
+            new_path = (
+                old_path.with_name(self.path_for(note).name)
+                if in_bucket
+                else self.path_for(note)
+            )
             # Never move onto a file that already exists. Two notes sharing an
             # id is invalid input, but the failure mode without this check is
             # silent: one note's file overwrites another's and the second note

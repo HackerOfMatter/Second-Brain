@@ -517,6 +517,91 @@ def cmd_fit(args) -> int:
     return 0
 
 
+def cmd_adopt(args) -> int:
+    """Adopt a folder of notes lj already wrote (see sb/adopt.py).
+
+    Dry by default. `adopt <folder>` reports and writes nothing; only
+    `--write` touches the vault. The pile this exists for is lj's only copy
+    of 674 notes, and a command that adopts on its first invocation is one
+    keystroke away from doing it to the wrong folder.
+    """
+    from sb import adopt as adoptmod
+    from sb.frontmatter import dump
+
+    cfg = load(args.config)
+    engine = Engine(cfg)
+    vault = engine.vault
+
+    if args.undo:
+        manifest = adoptmod.load_manifest(vault, args.undo)
+        result = adoptmod.undo(vault, manifest, dry_run=not args.write)
+        if result["refused"]:
+            print("refused: the originals are not where the manifest left them")
+            for row in result["refused"]["missing"]:
+                print(f"  missing  {row}")
+            for row in result["refused"]["changed"]:
+                print(f"  changed  {row}")
+            return 1
+        verb = "would remove" if result["dry_run"] else "removed"
+        print(f"undo {manifest['run']}: {verb} {len(result['removed'])} file(s)")
+        for row in result["kept"]:
+            print(f"  kept  {row['dest']}  ({row['why']})")
+        if result["dry_run"]:
+            print("  nothing removed — re-run with --write")
+        return 0
+
+    plan = adoptmod.plan(vault, Path(args.folder), limit=args.limit)
+    print(f"{plan.source_rel}  ->  {plan.dest_rel}")
+    print(f"  {len(plan.decisions)} markdown file(s) considered"
+          + ("  (--limit applied)" if plan.limited else ""))
+
+    for d in plan.adopting:
+        flag = "  ~provisional created" if d.provisional else ""
+        print(f"  + {d.dest_rel}")
+        print(f"      from {d.rel}  ({d.words}w, created from {d.created_from}{flag})")
+        if d.dropped and args.verbose:
+            for key, why in d.dropped.items():
+                print(f"      - dropped {key}: {why}")
+
+    for reason, n in plan.skips_by_reason().items():
+        print(f"  ?? {n:3d} skipped — {reason}")
+        if args.verbose:
+            for d in plan.skipping:
+                if d.reason == reason:
+                    print(f"        {d.rel}")
+
+    if plan.assets:
+        print(f"  ++ {len(plan.assets)} linked attachment(s) carried across")
+    if plan.missing_assets:
+        print(f"  !! {len(plan.missing_assets)} linked attachment(s) not in this folder"
+              " — those links were already broken")
+    if plan.unreferenced_assets:
+        print(f"  .. {len(plan.unreferenced_assets)} attachment(s) nothing links to, left behind")
+
+    if plan.adopting:
+        sample = plan.adopting[0]
+        note = adoptmod.build_note(sample, "dry-run", cfg.review.resource_cycle_days)
+        print(f"\n  the frontmatter this writes, for {sample.rel}:")
+        for line in dump(note.frontmatter(), "").splitlines():
+            print(f"      {line}")
+
+    print(f"\n  {len(plan.adopting)} would be adopted · {len(plan.skipping)} skipped")
+    if not args.write:
+        print("  nothing written — re-run with --write")
+        return 0
+
+    result = adoptmod.apply(vault, plan, cfg.review.resource_cycle_days)
+    print(f"  adopted {result['adopted']} · assets {result['assets']}"
+          + (f" · manifest {result['manifest']}" if result["manifest"]
+             else " · nothing to record"))
+    intact = result["originals_intact"]
+    print(f"  originals: {intact['checked']} re-hashed, "
+          + ("all intact" if intact["ok"] else f"MISSING {intact['missing']} CHANGED {intact['changed']}"))
+    for row in result["failures"]:
+        print(f"  !! {row['source']}  {row['error']}")
+    return 0 if intact["ok"] and not result["failures"] else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="second-brain", description=__doc__)
     ap.add_argument("--config", type=Path, default=None, help="path to config.yaml")
@@ -557,6 +642,19 @@ def main() -> int:
                    help="say where each file would go without moving anything")
     i.add_argument("--limit", type=int, default=None)
     i.set_defaults(func=cmd_intake)
+
+    a = sub.add_parser("adopt", help="adopt a folder of notes into 30-Resources")
+    a.add_argument("folder", nargs="?", help="folder to adopt, relative to the vault root")
+    a.add_argument("--write", action="store_true",
+                   help="actually write; without it this only reports")
+    a.add_argument("--dry-run", action="store_true",
+                   help="the default: report and write nothing")
+    a.add_argument("--limit", type=int, default=None, help="only the first N files")
+    a.add_argument("--verbose", "-v", action="store_true",
+                   help="name every skipped file and every dropped key")
+    a.add_argument("--undo", metavar="RUN", nargs="?", const="latest",
+                   help="undo an adoption run (default: the latest)")
+    a.set_defaults(func=cmd_adopt)
 
     c = sub.add_parser("capture", help="capture from the command line")
     c.add_argument("text")
