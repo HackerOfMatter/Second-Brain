@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import webbrowser
 from pathlib import Path
@@ -517,6 +518,31 @@ def cmd_fit(args) -> int:
     return 0
 
 
+def cmd_reteval(args) -> int:
+    """Score retrieval against a checked-in question set (sb/reteval.py).
+
+    Read-only: it builds nothing and writes nothing to the vault, so it is
+    safe to run against the live index at any moment, including while the
+    server is up.
+    """
+    from sb import reteval
+
+    cfg = load(args.config)
+    engine = Engine(cfg)
+    if not engine.index.exists():
+        print("no index yet — run `python run.py serve` once, or ask a question.")
+        return 1
+    qset = reteval.load_set(args.set)
+    result = reteval.run(engine.index, qset, depth=args.depth)
+    print(reteval.format_report(result))
+    if args.json:
+        Path(args.json).write_text(
+            json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"\nwritten to {args.json}")
+    return 0
+
+
 def cmd_adopt(args) -> int:
     """Adopt a folder of notes lj already wrote (see sb/adopt.py).
 
@@ -642,6 +668,13 @@ def main() -> int:
                    help="say where each file would go without moving anything")
     i.add_argument("--limit", type=int, default=None)
     i.set_defaults(func=cmd_intake)
+
+    e = sub.add_parser("eval-retrieval", help="score search against a fixed question set")
+    e.add_argument("--set", default="accounting_retrieval",
+                   help="evaluation set name (sb/evalsets/) or path to a .json")
+    e.add_argument("--depth", type=int, default=10, help="how deep to look for a hit")
+    e.add_argument("--json", default=None, help="also write the full result here")
+    e.set_defaults(func=cmd_reteval)
 
     a = sub.add_parser("adopt", help="adopt a folder of notes into 30-Resources")
     a.add_argument("folder", nargs="?", help="folder to adopt, relative to the vault root")

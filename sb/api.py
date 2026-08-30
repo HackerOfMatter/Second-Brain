@@ -28,6 +28,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from . import digest as digestmod
+from . import freshness
 from .config import Config, load
 from .engine import Engine
 
@@ -690,6 +691,11 @@ def build_app(cfg: Config | None = None) -> Starlette:
         # dropped that argument, and lifespan works on every version either
         # machine is likely to have.
         start_drop_watcher(engine)
+        # A note edited in Obsidian is searchable without anyone pressing
+        # anything (sprint 4, K3). Separate thread from the Drop watcher on
+        # purpose: they poll at different rates, and a Drop folder that cannot
+        # be read must not stop the index following lj's edits.
+        freshness.start(engine)
         yield
 
     app = Starlette(routes=routes, lifespan=lifespan)

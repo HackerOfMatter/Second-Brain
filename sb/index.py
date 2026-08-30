@@ -86,6 +86,20 @@ SCORE_FLOOR = 0.28
 #: breaks ties rather than driving the ranking.
 KEYWORD_WEIGHT = 0.15
 
+#: The floor for a keyword-only search, where `SCORE_FLOOR` does not apply
+#: because there are no cosines to compare it against.
+#:
+#: Sprint 4 lane K measured the old value (0.08) against twenty real questions
+#: on lj's accounting notes: it let a single common word through, so "what are
+#: the three sections of the statement of cash flows?" — a subject lj has never
+#: written a note on — came back with ten passages whose only claim was the
+#: word "cash". With scores now weighted by term rarity (`_query_weights`), a
+#: score reads as "the share of the question's *information* this passage
+#: covers", and a third of it is the point below which a match is one common
+#: word rather than a subject. Tuned on twenty questions, not two hundred: it
+#: is a floor that stops nonsense, not a precision dial.
+KEYWORD_FLOOR = 0.34
+
 STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "is", "are", "it", "that",
     "this", "for", "on", "with", "as", "by", "be", "was", "were", "at", "from",
@@ -199,6 +213,8 @@ class Index:
         self.cfg = cfg
         self.dir = cfg.system_dir / "index"
         self._cache: Optional[Tuple[float, List[Dict[str, Any]], List[array], int]] = None
+        #: (chunk-file stamp, per-passage term sets, document frequencies)
+        self._terms_cache: Optional[Tuple[float, List[set], Dict[str, int]]] = None
 
     # -- paths ---------------------------------------------------------------
 
@@ -265,6 +281,30 @@ class Index:
 
         self._cache = (stamp, chunks, vectors, dim)
         return chunks, vectors, dim
+
+    def _corpus_terms(self) -> Tuple[List[set], Dict[str, int]]:
+        """Every passage's terms, and how many passages each term appears in.
+
+        Two things at once, both cached with the chunk file. The term sets
+        mean a search tokenises the corpus once per *index*, where it used to
+        re-tokenise every candidate passage once per *question*. The document
+        frequencies are what make a rare word count for more than a common one
+        — without them "shrinkage", which appears in one note, scores exactly
+        as much as "cash", which appears in twenty.
+        """
+        chunks, _, _ = self.load()
+        stamp = self.chunks_path.stat().st_mtime if self.exists() else 0.0
+        if self._terms_cache and self._terms_cache[0] == stamp \
+                and len(self._terms_cache[1]) == len(chunks):
+            return self._terms_cache[1], self._terms_cache[2]
+
+        sets = [_terms(c.get("text", "")) for c in chunks]
+        df: Dict[str, int] = {}
+        for terms in sets:
+            for term in terms:
+                df[term] = df.get(term, 0) + 1
+        self._terms_cache = (stamp, sets, df)
+        return sets, df
 
     def status(self) -> Dict[str, Any]:
         chunks, vectors, dim = self.load()
@@ -411,6 +451,7 @@ class Index:
             encoding="utf-8",
         )
         self._cache = None
+        self._terms_cache = None
         stats["chunks"] = len(rows)
         stats["semantic"] = complete
         if not complete and "warning" not in stats:
@@ -451,7 +492,8 @@ class Index:
         if not candidates:
             return []
 
-        query_terms = _terms(question)
+        term_sets, doc_freq = self._corpus_terms()
+        weights = _query_weights(_terms(question), doc_freq, len(term_sets))
         query_vec = self._embed_query(question) if vectors else None
 
         # One vectorised pass over the whole matrix when the vault is big
@@ -462,13 +504,14 @@ class Index:
 
         scored: List[Tuple[float, float, int]] = []
         for i in candidates:
-            keyword = _keyword_score(query_terms, chunks[i].get("text", ""))
+            found = term_sets[i] if i < len(term_sets) else _terms(chunks[i].get("text", ""))
+            keyword = _keyword_score(weights, found)
             cosine = cosine_by_index[i] if i < len(cosine_by_index) else 0.0
             score = cosine + KEYWORD_WEIGHT * keyword if query_vec is not None else keyword
             scored.append((score, cosine, i))
 
         scored.sort(key=lambda s: -s[0])
-        floor = SCORE_FLOOR if query_vec is not None else 0.08
+        floor = SCORE_FLOOR if query_vec is not None else KEYWORD_FLOOR
 
         out: List[Dict[str, Any]] = []
         per_note_count: Dict[str, int] = {}
@@ -595,9 +638,44 @@ def _terms(text: str) -> set:
     }
 
 
-def _keyword_score(terms: Iterable[str], text: str) -> float:
-    terms = set(terms)
-    if not terms:
+def _query_weights(
+    terms: Iterable[str], doc_freq: Dict[str, int], passages: int
+) -> Dict[str, float]:
+    """How much each word of the question is worth, by how rare it is.
+
+    Plain inverse document frequency, smoothed. Two consequences, and both
+    were measured on lj's accounting notes rather than assumed
+    (`sb/reteval.py`):
+
+    **A rare word decides the ranking.** "what is shrinkage and what causes
+    it?" used to score the one note about shrinkage exactly level with two
+    passages whose only match was the word "causes", and the tie was broken by
+    note id — so the right answer came third. Weighted by rarity it comes
+    first, because "shrinkage" is worth twenty times "causes" here.
+
+    **A word the corpus has never seen is dropped rather than counted
+    against.** It cannot be matched by any passage, so including it in the
+    denominator would penalise every question containing a word lj happens not
+    to have written down — which is most real questions. Dropped from both
+    sides, the score keeps its meaning: the share of the *findable* part of
+    the question that this passage covers. A question made entirely of unknown
+    words weighs nothing at all, scores zero everywhere, and returns nothing,
+    which is the correct answer to a question about a subject with no notes.
+    """
+    n = max(1, int(passages))
+    out: Dict[str, float] = {}
+    for term in set(terms):
+        df = doc_freq.get(term, 0)
+        if not df:
+            continue
+        out[term] = math.log((n + 1) / (df + 1)) + 1.0
+    return out
+
+
+def _keyword_score(weights: Dict[str, float], found: Iterable[str]) -> float:
+    """The share of the question's weight this passage covers, 0..1."""
+    total = sum(weights.values())
+    if not total:
         return 0.0
-    found = _terms(text)
-    return len(terms & found) / len(terms)
+    found = set(found)
+    return sum(w for term, w in weights.items() if term in found) / total

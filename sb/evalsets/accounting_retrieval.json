@@ -1,0 +1,191 @@
+{
+  "name": "accounting-study-terms",
+  "corpus": "30-Resources/Accounting/Study Terms",
+  "written": "2026-08-30",
+  "about": "Twenty questions a student would actually ask of the 67 accounting study-term notes lj adopted in commit 201bb05, written after reading all 67. Sixteen are answerable and name the note(s) that genuinely answer them; four are deliberately unanswerable - a retriever that returns something for every question is failing, and only a set containing questions with no right answer can catch that. Expectations are note ids because lj's titles carry typos ('Perpetual inventory Systerm') that a title match would silently miss.",
+  "questions": [
+    {
+      "id": "q01",
+      "kind": "answerable",
+      "question": "if an invoice says 2/10 n/30 how much do I take off and how long do I have to pay?",
+      "expect": [
+        "20250707T032546-2-10-n-30"
+      ],
+      "note": "the only note that states the 2% / 10 days / 30 days numbers"
+    },
+    {
+      "id": "q02",
+      "kind": "answerable",
+      "question": "which shipping term makes the seller pay the freight, and when does the buyer take ownership?",
+      "expect": [
+        "20250705T184726-fob-destination"
+      ],
+      "note": "FOB Destination: seller pays, ownership transfers on arrival"
+    },
+    {
+      "id": "q03",
+      "kind": "answerable",
+      "question": "goods are on a truck right now - whose inventory are they in if we bought them free on board at the factory?",
+      "expect": [
+        "20250705T184704-fob-shipping-point"
+      ],
+      "note": "paraphrases FOB shipping point without using the phrase"
+    },
+    {
+      "id": "q04",
+      "kind": "answerable",
+      "question": "what is the quick ratio formula and what value counts as healthy?",
+      "expect": [
+        "20250705T191652-acid-test-ratio",
+        "20250707T065242-ratio-compare",
+        "20250702T155732-ratios"
+      ],
+      "note": "'quick ratio' is the synonym lj's notes mostly call acid-test"
+    },
+    {
+      "id": "q05",
+      "kind": "answerable",
+      "question": "how do I work out gross margin ratio and what does the percentage mean?",
+      "expect": [
+        "20250705T192022-gross-margin-ratio",
+        "20250707T065242-ratio-compare"
+      ],
+      "note": "formula plus the 'dollar left over to cover expenses' reading"
+    },
+    {
+      "id": "q06",
+      "kind": "answerable",
+      "question": "under first in first out which units get charged to cost of goods sold?",
+      "expect": [
+        "20250707T204526-fifo"
+      ],
+      "note": "spells out FIFO rather than using the acronym"
+    },
+    {
+      "id": "q07",
+      "kind": "answerable",
+      "question": "when prices are rising which inventory costing method leaves the highest net income?",
+      "expect": [
+        "20250707T203924-costing-methods-compare"
+      ],
+      "note": "only the comparison table answers the rising-prices case"
+    },
+    {
+      "id": "q08",
+      "kind": "answerable",
+      "question": "what do I do when the market value of inventory drops below what I paid?",
+      "expect": [
+        "20250707T205220-lcm"
+      ],
+      "note": "lower of cost or market, asked the way it comes up in homework"
+    },
+    {
+      "id": "q09",
+      "kind": "answerable",
+      "question": "what is the difference between recording a purchase at the full invoice amount and recording it already discounted?",
+      "expect": [
+        "20250705T203320-net-method-vs-gross-method",
+        "20250705T203106-gross-method",
+        "20250705T203144-net-method"
+      ],
+      "note": "gross vs net method, described rather than named"
+    },
+    {
+      "id": "q10",
+      "kind": "answerable",
+      "question": "does a periodic system record cost of goods sold at every sale or only at the end of the period?",
+      "expect": [
+        "20250705T181842-periodic-inventory-system",
+        "20250705T181754-perpetual-inventory-systerm",
+        "20250707T032546-perpetual-inventory-system"
+      ],
+      "note": "three notes each hold half of this; any of them answers it"
+    },
+    {
+      "id": "q11",
+      "kind": "answerable",
+      "question": "how do I get cost of goods sold from beginning inventory, purchases and ending inventory?",
+      "expect": [
+        "20250707T212352-cost-of-goods-sold",
+        "20260825T173720-goods-available-for-sale"
+      ],
+      "note": "the COGS identity"
+    },
+    {
+      "id": "q12",
+      "kind": "answerable",
+      "question": "what gets added and subtracted to reach net purchases?",
+      "expect": [
+        "20250707T193856-net-purchase"
+      ],
+      "note": "purchases + freight in - returns/allowances - discounts"
+    },
+    {
+      "id": "q13",
+      "kind": "answerable",
+      "question": "what is shrinkage and what causes it?",
+      "expect": [
+        "20250705T190820-shrinkage"
+      ],
+      "note": "the easiest question in the set: title words appear verbatim"
+    },
+    {
+      "id": "q14",
+      "kind": "answerable",
+      "question": "the customer is unhappy but wants to keep the item for a partial refund - what is that called?",
+      "expect": [
+        "20250705T190310-sales-allowance",
+        "20250705T190148-sales-return"
+      ],
+      "note": "allowance vs return; the return note is the near-miss distractor"
+    },
+    {
+      "id": "q15",
+      "kind": "answerable",
+      "question": "what is the order of the steps in the accounting cycle, from journal to balance sheet?",
+      "expect": [
+        "20250701T195246-9-steps-of-accounting"
+      ],
+      "note": "the only note that lists the cycle in order"
+    },
+    {
+      "id": "q16",
+      "kind": "answerable",
+      "question": "who does a wholesaler sell to compared with a retailer?",
+      "expect": [
+        "20250705T175834-wholsale",
+        "20250705T180040-retailer",
+        "20250705T185014-merchandiser"
+      ],
+      "note": "both halves are one line each in two tiny notes"
+    },
+    {
+      "id": "q17",
+      "kind": "unanswerable",
+      "question": "how do I compute straight-line depreciation on a piece of equipment?",
+      "expect": [],
+      "note": "nothing in Resources covers depreciation methods - only a dangling [[Depreciated Expence]] link"
+    },
+    {
+      "id": "q18",
+      "kind": "unanswerable",
+      "question": "what are the three sections of the statement of cash flows?",
+      "expect": [],
+      "note": "'cash flow' appears nowhere in 30-Resources"
+    },
+    {
+      "id": "q19",
+      "kind": "unanswerable",
+      "question": "what journal entry records payroll taxes withheld from an employee?",
+      "expect": [],
+      "note": "'payroll' appears nowhere in 30-Resources"
+    },
+    {
+      "id": "q20",
+      "kind": "unanswerable",
+      "question": "how is a partnership taxed differently from a sole proprietorship?",
+      "expect": [],
+      "note": "neither word appears anywhere in 30-Resources"
+    }
+  ]
+}
