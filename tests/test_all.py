@@ -6067,6 +6067,248 @@ def test_progress_panel_is_streak_free():
 
 
 
+def _past(tmp, name, text, mtime=None):
+    """Write one of lj's pre-schema notes into a staging folder."""
+    path = Path(tmp) / "Drop" / "_Past" / "Accounting" / "Study Terms" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    if mtime:
+        import os
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_adopt_derives_only_what_is_there():
+    """The pilot's whole claim: every field points at something in the file.
+
+    The corpus this was built against is 93 real notes in
+    `Drop/_Past/Accounting/Study Terms`, and its shape is the reason for every
+    rule below — a third carry `Date: '[[<% tp.date.now("YYYY-MM-DD") %>]]'`,
+    a Templater placeholder that never rendered, and a fifth are empty files.
+    """
+    from sb import adopt as adoptmod
+    section("adopt: derived, not invented")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp))
+        cfg.llm.provider = "heuristic"
+        engine = Engine(cfg)
+        vault = engine.vault
+
+        stamp = dt.datetime(2025, 7, 5, 14, 39).timestamp()
+        _past(tmp, "Accounts recievable.md",
+              "---\ntype: \nReviewed: \ntags:\n---\n\n# At a Glance\n- Asset\n"
+              "- Revenue recorded but not collected\n", mtime=stamp)
+        _past(tmp, "Cost Side.md",
+              "---\ntags:\n  - Accounting\nDate: '[[<% tp.date.now(\"YYYY-MM-DD\") %>]]'\n"
+              "type: Transaction\n---\n\nThe debit half of the entry.\n", mtime=stamp)
+        _past(tmp, "Perpetual inventory System.md",
+              "---\ntitle: Perpetual Inventory System\ncreated: 2025-06-30\n"
+              "tags: [inventory, accounting]\n---\n\nStock is updated per sale.\n")
+        _past(tmp, "Accrued Liabilities.md", "")
+        _past(tmp, "Retained Earnings.md", "---\ntags:\n---\n")
+        _past(tmp, "Drawing.excalidraw.md",
+              "---\nexcalidraw-plugin: parsed\ntags: [excalidraw]\n---\n\n# Excalidraw Data\n")
+
+        plan = adoptmod.plan(vault, Path("Drop/_Past/Accounting/Study Terms"))
+        by_name = {d.source.name: d for d in plan.decisions}
+
+        check("the subject folders become the destination",
+              plan.dest_rel == "30-Resources/Accounting/Study Terms", plan.dest_rel)
+        check("a file with a body is adopted", by_name["Accounts recievable.md"].adopting)
+        check("an empty file is not adopted — there is no note in it",
+              not by_name["Accrued Liabilities.md"].adopting)
+        check("nor is one that is frontmatter and nothing else",
+              not by_name["Retained Earnings.md"].adopting)
+        check("and both say why", "no body" in by_name["Retained Earnings.md"].reason,
+              by_name["Retained Earnings.md"].reason)
+        check("a drawing is not prose and is left alone",
+              not by_name["Drawing.excalidraw.md"].adopting)
+
+        # -- title ---------------------------------------------------------
+        check("the filename is the title, because in this corpus it is the term",
+              by_name["Accounts recievable.md"].title == "Accounts recievable")
+        check("unless the note names itself",
+              by_name["Perpetual inventory System.md"].title == "Perpetual Inventory System")
+
+        # -- created: the un-derivable field -------------------------------
+        real = by_name["Perpetual inventory System.md"]
+        check("a date lj actually wrote is used",
+              real.created.date() == dt.date(2025, 6, 30), real.created)
+        check("and is not flagged provisional", not real.provisional)
+
+        placeholder = by_name["Cost Side.md"]
+        check("an unrendered template placeholder is not a date",
+              placeholder.created_from == "file-mtime", placeholder.created_from)
+        check("so the fallback is named rather than passed off as lj's",
+              placeholder.provisional == ["created"], placeholder.provisional)
+        check("and the placeholder itself is dropped, not written through",
+              "Date" in placeholder.dropped, placeholder.dropped)
+
+        # -- tags and lj's own keys ----------------------------------------
+        check("the folder path becomes tags, outermost first",
+              placeholder.tags[:2] == ["accounting", "study-terms"], placeholder.tags)
+        check("lj's own tags come too",
+              "accounting" in real.tags and "inventory" in real.tags, real.tags)
+        check("a key holding something real survives",
+              placeholder.kept.get("type") == "Transaction", placeholder.kept)
+        check("a key holding nothing does not",
+              "Reviewed" in by_name["Accounts recievable.md"].dropped)
+
+        # -- and none of it has been written yet ---------------------------
+        check("planning writes nothing", not (Path(tmp) / "30-Resources" /
+                                              "Accounting").exists())
+
+        result = adoptmod.apply(vault, plan, cfg.review.resource_cycle_days)
+        check("the run adopts exactly what it planned", result["adopted"] == 3, result)
+        check("and nothing failed", not result["failures"], result["failures"])
+        check("the originals are re-hashed, not assumed",
+              result["originals_intact"]["ok"] and
+              result["originals_intact"]["checked"] == 3, result["originals_intact"])
+        check("every original is still on disk",
+              (Path(tmp) / "Drop/_Past/Accounting/Study Terms/Cost Side.md").exists())
+
+        notes = {n.title: n for _, n in vault.notes(Bucket.RESOURCE)}
+        check("the vault can now read them", len(notes) == 3, sorted(notes))
+        got = notes["Cost Side"]
+        check("the body is carried over untouched",
+              got.body.strip() == "The debit half of the entry.", got.body)
+        check("as a Resource, with a review cycle like any other",
+              got.bucket == Bucket.RESOURCE and got.review is not None)
+        check("the source is recorded on the note itself",
+              got.adopted["source"].endswith("Cost Side.md"), got.adopted)
+        check("with the hash of what was copied", len(got.adopted["sha256"]) == 64)
+        check("and the provisional field named there too",
+              got.adopted["provisional"] == ["created"], got.adopted)
+        check("nothing invented a category — taxonomy still gets to decide",
+              got.category is None)
+        check("the note lands in its subject folder",
+              vault.folders_by_id()[got.id] == "30-Resources/Accounting/Study Terms",
+              vault.folders_by_id().get(got.id))
+
+        # -- the Drop watcher must not see any of this ---------------------
+        check("the staging folder is invisible to the intake watcher",
+              not intakemod.candidates(cfg.drop_dir, settle_seconds=0.0),
+              intakemod.candidates(cfg.drop_dir, settle_seconds=0.0))
+
+
+def test_adopt_is_idempotent_and_reversible():
+    """Run it twice, get one copy. Undo it, get the vault back."""
+    from sb import adopt as adoptmod
+    section("adopt: twice is once, and it comes back")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp))
+        cfg.llm.provider = "heuristic"
+        engine = Engine(cfg)
+        vault = engine.vault
+        src = "Drop/_Past/Accounting/Study Terms"
+
+        for i in range(4):
+            _past(tmp, f"Term {i}.md", f"---\ntags:\n---\n\nDefinition of term {i}.\n")
+        _past(tmp, "Credit Terms.png", "not really a png")
+        _past(tmp, "Cash discount.md",
+              "\nSee [[Credit Terms.png]] and [[Nowhere.png]] for the worked example.\n")
+
+        first_plan = adoptmod.plan(vault, Path(src))
+        check("a link that was already broken is reported, not invented",
+              first_plan.missing_assets == ["Nowhere.png"], first_plan.missing_assets)
+        first = adoptmod.apply(vault, first_plan, cfg.review.resource_cycle_days)
+        check("the first run adopts everything readable", first["adopted"] == 5, first)
+        check("a linked image travels with the note that links it",
+              first["assets"] == 1, first)
+
+        second_plan = adoptmod.plan(vault, Path(src))
+        check("a second plan proposes nothing", not second_plan.adopting,
+              [d.rel for d in second_plan.adopting])
+        check("because it recognises its own work",
+              all(d.reason == "already adopted" for d in second_plan.skipping
+                  if d.source.suffix == ".md"))
+        second = adoptmod.apply(vault, second_plan, cfg.review.resource_cycle_days)
+        check("so running it twice writes nothing new", second["adopted"] == 0)
+        check("and there is exactly one copy of each note",
+              len(vault.notes(Bucket.RESOURCE)) == 5,
+              len(vault.notes(Bucket.RESOURCE)))
+        check("a run with nothing to record leaves no manifest behind",
+              second["manifest"] == "", second["manifest"])
+
+        # -- limit ---------------------------------------------------------
+        with tempfile.TemporaryDirectory() as tmp2:
+            cfg2 = Config(vault=Path(tmp2))
+            cfg2.llm.provider = "heuristic"
+            v2 = Engine(cfg2).vault
+            for i in range(4):
+                _past(tmp2, f"Term {i}.md", f"\nDefinition of term {i}.\n")
+            limited = adoptmod.plan(v2, Path(src), limit=2)
+            check("--limit stops early and says so",
+                  len(limited.adopting) == 2 and limited.limited, limited.limited)
+
+        # -- undo ----------------------------------------------------------
+        manifest = adoptmod.load_manifest(vault, "latest")
+        check("the run left a manifest to undo it with",
+              len(manifest["notes"]) == 5, manifest["notes"])
+
+        dry = adoptmod.undo(vault, manifest, dry_run=True)
+        check("a dry undo names what it would remove", len(dry["removed"]) == 6, dry)
+        check("and removes nothing", len(vault.notes(Bucket.RESOURCE)) == 5)
+
+        edited = vault.root / manifest["notes"][0]["dest"]
+        text = edited.read_text(encoding="utf-8").replace("id: ", "id: x", 1)
+        edited.write_text(text, encoding="utf-8")
+        guarded = adoptmod.undo(vault, manifest)
+        check("undo will not delete a file that is no longer the note it wrote",
+              any(k["why"] == "different note lives here now" for k in guarded["kept"]),
+              guarded["kept"])
+        check("everything else came out", len(guarded["removed"]) == 5, guarded["removed"])
+        edited.unlink()
+
+        check("the originals were never the thing being deleted",
+              len(list((Path(tmp) / src).glob("*.md"))) == 5,
+              sorted(p.name for p in (Path(tmp) / src).glob("*.md")))
+
+        # -- undo refuses when it cannot prove the original is back --------
+        again = adoptmod.apply(vault, adoptmod.plan(vault, Path(src)),
+                               cfg.review.resource_cycle_days)
+        manifest2 = adoptmod.load_manifest(vault, again["run"])
+        original = Path(tmp) / manifest2["notes"][0]["source"]
+        original.write_text("something else entirely", encoding="utf-8")
+        refused = adoptmod.undo(vault, manifest2)
+        check("undo refuses once an original has changed under it",
+              refused["refused"] and not refused["removed"], refused)
+        check("and says which one", refused["refused"]["changed"] ==
+              [manifest2["notes"][0]["source"]], refused["refused"])
+
+
+def test_bucket_subfolders_survive_a_save():
+    """A sub-topic folder is the tutor's deck grouping — saving must not flatten it."""
+    section("a note filed into a sub-topic stays there")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        vault = Vault(Path(tmp) / "v")
+        vault.ensure_structure()
+        note = Note.capture("carried load in a truss", Bucket.RESOURCE, title="Trusses")
+        sub = vault.dir_for(Bucket.RESOURCE) / "Engineering" / "Statics"
+        sub.mkdir(parents=True)
+        vault.write(note, sub / "trusses--x.md")
+
+        saved = vault.save(note)
+        check("an ordinary save leaves it in its folder",
+              saved.parent == sub, saved)
+        check("so study-by-folder still finds it",
+              vault.folders_by_id()[note.id] == "30-Resources/Engineering/Statics",
+              vault.folders_by_id().get(note.id))
+
+        note.title = "Trusses and load paths"
+        renamed = vault.save(note)
+        check("a rename renames the file without moving it out",
+              renamed.parent == sub and renamed.name.startswith("trusses-and-load-paths"),
+              renamed)
+
+        moved = vault.move(note, Bucket.ARCHIVE, "archived")
+        check("but a real bucket change still relocates it",
+              moved.parent == vault.dir_for(Bucket.ARCHIVE), moved)
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -6120,6 +6362,9 @@ def main():
         test_reminders_carry_the_intention, test_study_reminder_fires_once,
         # -- sprint 3, lane G: the daily surface
         test_today_screen, test_inbox_zero_flow, test_progress_panel_is_streak_free,
+        # -- sprint 4: adopting the notes lj already wrote
+        test_adopt_derives_only_what_is_there, test_adopt_is_idempotent_and_reversible,
+        test_bucket_subfolders_survive_a_save,
     ]:
         try:
             fn()
