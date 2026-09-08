@@ -33,6 +33,8 @@ from . import (
     quality,
     reminders as remindersmod,
     retention,
+    segment,
+    tasksplit,
     threshold,
     taxonomy,
     tutor,
@@ -223,6 +225,233 @@ class Engine:
             self.vault.log_line("connect", f"link-on-write failed  {note.id}  {exc!r}")
             return dict(blank, error=type(exc).__name__)
         return {"linked": len(result.links), "titles": [l.title for l in result.links]}
+
+    # -- capture in bulk (sb/segment.py, sb/tasksplit.py) --------------------
+
+    def capture_plan(
+        self,
+        text: str,
+        bucket: str = "project",
+        *,
+        due: Optional[str] = None,
+        mode: str = "auto",
+    ) -> Dict[str, Any]:
+        """What one paste would become — proposed, not written.
+
+        The three capture buttons make exactly one note each, which is the
+        right shape for one thought and the wrong shape for the two ways real
+        material arrives: a page of lecture notes covering nine topics, and a
+        sentence holding three separate jobs. Both used to become one
+        unlinkable, unquizzable note.
+
+        This is the half that decides; `capture_commit` is the half that
+        writes. They are separate on purpose — a splitter that files straight
+        to the vault is a splitter whose mistakes you clean up afterwards,
+        and a boundary is far cheaper to move on screen than a note is to
+        merge back.
+
+        `mode`:
+          * `tasks` — several Projects out of one prompt (sb/tasksplit.py)
+          * `notes` — several atomic notes out of long text (sb/segment.py)
+          * `one`   — no split; what the buttons already did
+          * `auto`  — `tasks` for a Project or an Area, `notes` otherwise
+        """
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("empty capture")
+        target = Bucket(bucket)
+        shape = mode if mode in ("tasks", "notes", "one") else (
+            "tasks" if target in (Bucket.PROJECT, Bucket.AREA) else "notes"
+        )
+        picked = _as_date(due)
+        # One probe for the whole plan. Both splitters degrade to their rule
+        # tiers without a model, so this decides how loud the answer is, not
+        # whether there is one.
+        outage = self._model_outage("parse" if shape == "tasks" else "generate")
+
+        if shape == "one":
+            return {
+                "mode": "one",
+                "bucket": target.value,
+                "strategy": "whole",
+                "provider": "",
+                "degraded": False,
+                "note": "",
+                "words": len(text.split()),
+                "lossless": True,
+                "items": [self._plan_item(text, target, "", picked, 1, "whole")],
+            }
+
+        if shape == "tasks":
+            split = tasksplit.split_tasks(text, self.cfg, allow_model=not outage)
+            items = []
+            for task in split.tasks:
+                items.append(
+                    self._plan_item(
+                        task.text,
+                        target,
+                        task.title,
+                        picked,
+                        task.ordinal,
+                        task.boundary,
+                        inherited=task.inherited_date,
+                    )
+                )
+            return {
+                "mode": "tasks",
+                "bucket": target.value,
+                "strategy": split.strategy,
+                "provider": split.provider,
+                "degraded": split.degraded or bool(outage),
+                "note": split.note or (outage and f"No model — rules only. {outage}") or "",
+                "preamble": split.preamble,
+                "words": len(text.split()),
+                "lossless": True,
+                "items": items,
+            }
+
+        result = segment.segment(text, self.cfg, allow_model=not outage)
+        missing = segment.check_lossless(text, result.segments)
+        items = []
+        for seg in result.segments:
+            body = seg.body
+            if seg.heading_path:
+                # The breadcrumb is why a section under a title that has no
+                # prose of its own is not a lost line: the title is carried
+                # onto every child. `check_lossless` counts it for the same
+                # reason.
+                body = f"*From: {' › '.join(seg.heading_path)}*\n\n{body}"
+            items.append(
+                self._plan_item(
+                    body,
+                    target,
+                    seg.title,
+                    picked,
+                    seg.ordinal,
+                    seg.boundary,
+                    heading_path=seg.heading_path,
+                )
+            )
+        return {
+            "mode": "notes",
+            "bucket": target.value,
+            "strategy": result.strategy,
+            "provider": result.provider,
+            "degraded": result.degraded or bool(outage),
+            "note": result.note or (outage and f"No model — rules only. {outage}") or "",
+            "words": result.words,
+            # The one claim worth making loudly, and the one worth checking in
+            # the response rather than only in a test: every line you typed is
+            # in exactly one of these.
+            "lossless": not missing,
+            "lost_lines": missing[:10],
+            "items": items,
+        }
+
+    def _plan_item(
+        self,
+        body: str,
+        target: Bucket,
+        title: str,
+        picked: Optional[dt.date],
+        ordinal: int,
+        boundary: str,
+        *,
+        inherited: str = "",
+        heading_path: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """One proposed note, with the deadline it would get.
+
+        The date is resolved here rather than at write time so the preview
+        shows the same date the note will actually carry — a preview that
+        says "Friday" and files "next Friday" is worse than no preview.
+        """
+        guess = extract.parse_deadline_guess(body)
+        if not guess and inherited:
+            guess = extract.parse_deadline_guess(inherited)
+        due = picked or (guess.date if guess else None)
+        return {
+            "title": title or extract.derive_title(body),
+            "body": body,
+            "bucket": target.value,
+            "ordinal": ordinal,
+            "boundary": boundary,
+            "words": len(body.split()),
+            "heading_path": list(heading_path or []),
+            "due": due.isoformat() if due else "",
+            "due_phrase": "" if picked else (guess.phrase if guess else ""),
+            "due_source": "picked" if picked else (guess.kind if guess else ""),
+            "due_confirmed": bool(picked) or bool(guess and guess.confirmed),
+            "inherited_date": inherited,
+        }
+
+    def capture_commit(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        bucket: str = "",
+        due: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """File a reviewed plan. Each item becomes a real note.
+
+        One vault read for the whole batch, with the snapshot updated after
+        every write — the same pattern `intake()` uses, and for the same two
+        reasons: the planner schedules the second Project around the first
+        rather than double-booking it, and `_link_on_write` links each note to
+        the siblings already filed, so a chapter split into nine notes comes
+        out connected instead of as nine orphans.
+
+        A failure on one item is recorded and the rest still land. Losing four
+        captures because the third had a bad date is exactly the behaviour
+        that makes a capture box untrustworthy.
+        """
+        rows = [r for r in (items or []) if str(r.get("body") or "").strip()]
+        if not rows:
+            raise ValueError("nothing to file")
+
+        snapshot = self._snapshot()
+        created: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for row in rows:
+            title = str(row.get("title") or "").strip()
+            try:
+                target = Bucket(str(row.get("bucket") or bucket or "inbox"))
+                body = str(row.get("body") or "").strip()
+                note = Note.capture(
+                    body, target, title=title or extract.derive_title(body)
+                )
+                info = self._apply_bucket(
+                    note, target, snapshot, due=(row.get("due") or due or None)
+                )
+                path = self.vault.write(note)
+                self.vault.log_line(
+                    "capture", f"{note.bucket.value}  {note.id}  {note.title}"
+                )
+                snapshot = self._replacing(snapshot, note)
+                created.append(
+                    {
+                        **_note_dict(note),
+                        "path": str(path),
+                        "linked": (info.get("links") or {}).get("linked", 0),
+                        "scheduled": (info.get("plan") or {}).get("scheduled", 0),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - see the docstring
+                self.vault.log_line("capture", f"batch item failed  {title}  {exc!r}")
+                failed.append(
+                    {"title": title, "error": f"{type(exc).__name__}: {exc}"}
+                )
+        if created:
+            self._sync_calendar_quiet(snapshot)
+        return {
+            "created": created,
+            "failed": failed,
+            "count": len(created),
+            "note": (
+                f"Filed {len(created)}."
+                + (f" {len(failed)} failed and were not written." if failed else "")
+            ),
+        }
 
     # -- the Drop folder (sb/intake.py) --------------------------------------
 
@@ -2101,6 +2330,197 @@ class Engine:
         return self._deck_payload(deck)
 
     # -- tutor: studying ----------------------------------------------------
+
+    def generate_folder(
+        self,
+        folder: str = "",
+        *,
+        limit: Optional[int] = None,
+        max_cards: Optional[int] = None,
+        include_existing: bool = False,
+        min_words: int = 40,
+        dry_run: bool = False,
+        budget_seconds: float = 240.0,
+    ) -> Dict[str, Any]:
+        """Make cards for every note under `folder`, in one run.
+
+        The deck machinery has been finished for weeks and the vault has zero
+        cards in it, and the reason is arithmetic rather than design: cards
+        are generated one note at a time from a dropdown, and a subject folder
+        holds sixty notes. Sixty clicks is not a workflow anyone starts.
+
+        Three things keep this honest rather than merely fast:
+
+          * **One model probe for the whole run.** If nothing answers, every
+            candidate is queued in one pass and says so, instead of sixty
+            separate timeouts and sixty separate incidents.
+          * **A wall-clock budget.** This is reachable from a web request, and
+            a request that runs for eleven minutes is a hung app. When the
+            budget is spent it stops on a note boundary and reports what is
+            left, so running it again picks up exactly where it stopped.
+          * **Everything still lands as a draft.** Bulk generation changes how
+            many cards get *drafted*; it changes nothing about the rule that
+            no card reaches the scheduler unread.
+
+        `folder` is vault-relative and matches its subtree, so "30-Resources"
+        means everything filed under it. Empty means the whole vault.
+        """
+        started = _now()
+        scope = (folder or "").strip().strip("/")
+        where = self.vault.folders_by_id()
+        have = {d.note_id: d for d in self.decks.all()}
+
+        candidates: List[Note] = []
+        skipped: List[Dict[str, Any]] = []
+        for note in self.notes():
+            if note.bucket not in (Bucket.PROJECT, Bucket.RESOURCE):
+                continue
+            if scope and not tutor.in_folders(where.get(note.id, ""), [scope]):
+                continue
+            if note.bucket == Bucket.PROJECT and note.project and \
+                    note.project.status == ProjectStatus.DONE:
+                skipped.append(self._skip_row(note, "project already done"))
+                continue
+            words = len(note.body.split())
+            if words < min_words:
+                skipped.append(self._skip_row(note, f"only {words} words"))
+                continue
+            deck = have.get(note.id)
+            if deck is not None and deck.cards and not include_existing:
+                skipped.append(
+                    self._skip_row(note, f"already has {len(deck.cards)} cards")
+                )
+                continue
+            candidates.append(note)
+
+        candidates.sort(key=lambda n: (where.get(n.id, ""), n.title))
+        selected = candidates[: limit] if limit else candidates
+
+        if dry_run:
+            return {
+                "folder": scope,
+                "dry_run": True,
+                "candidates": len(candidates),
+                "attempted": 0,
+                "generated": 0,
+                "queued": 0,
+                "notes": [
+                    {
+                        "note_id": n.id,
+                        "title": n.title,
+                        "folder": where.get(n.id, ""),
+                        "words": len(n.body.split()),
+                    }
+                    for n in selected
+                ],
+                "skipped": skipped,
+                "stopped_early": False,
+                "seconds": 0.0,
+                "note": (
+                    f"{len(candidates)} note(s) would get cards"
+                    + (f", {len(selected)} in this run" if limit else "")
+                    + f". {len(skipped)} skipped."
+                ),
+            }
+
+        outage = self._model_outage("generate")
+        if outage:
+            for note in selected:
+                self.card_queue.add(
+                    note.id, title=note.title, max_cards=max_cards, reason=outage
+                )
+            if selected:
+                self.incidents.record(
+                    incidentsmod.OLLAMA,
+                    f"Queued {len(selected)} note(s) for card generation — {outage}.",
+                    hint="Start Ollama (`ollama serve`). The queue drains itself.",
+                    key="cards",
+                )
+                self.vault.log_line(
+                    "study", f"queued {len(selected)} notes from {scope or 'the vault'}"
+                )
+            return {
+                "folder": scope,
+                "dry_run": False,
+                "candidates": len(candidates),
+                "attempted": 0,
+                "generated": 0,
+                "queued": len(selected),
+                "notes": [],
+                "skipped": skipped,
+                "stopped_early": False,
+                "degraded": True,
+                "seconds": (_now() - started).total_seconds(),
+                "note": (
+                    f"Nothing generated — {outage}. {len(selected)} note(s) are "
+                    f"queued and will generate themselves when a model answers."
+                ),
+            }
+
+        rows: List[Dict[str, Any]] = []
+        total = 0
+        stopped_early = False
+        for note in selected:
+            if (_now() - started).total_seconds() > budget_seconds:
+                stopped_early = True
+                break
+            try:
+                out = self.generate_cards(note.id, max_cards=max_cards)
+            except Exception as exc:  # noqa: BLE001 - one bad note is not a failed run
+                self.vault.log_line("study", f"bulk generate failed  {note.id}  {exc!r}")
+                rows.append(
+                    {
+                        "note_id": note.id,
+                        "title": note.title,
+                        "folder": where.get(note.id, ""),
+                        "cards": 0,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            total += int(out.get("generated") or 0)
+            rows.append(
+                {
+                    "note_id": note.id,
+                    "title": note.title,
+                    "folder": where.get(note.id, ""),
+                    "cards": int(out.get("generated") or 0),
+                    "rejected": int(out.get("rejected") or 0),
+                    "rejections": out.get("rejections") or {},
+                    "provider": out.get("provider") or "",
+                    "degraded": bool(out.get("degraded")),
+                    "queued": bool(out.get("queued")),
+                }
+            )
+
+        done = len(rows)
+        remaining = len(candidates) - done
+        return {
+            "folder": scope,
+            "dry_run": False,
+            "candidates": len(candidates),
+            "attempted": done,
+            "generated": total,
+            "queued": sum(1 for r in rows if r.get("queued")),
+            "notes": rows,
+            "skipped": skipped,
+            "stopped_early": stopped_early,
+            "remaining": max(0, remaining),
+            "seconds": round((_now() - started).total_seconds(), 1),
+            "note": (
+                f"{total} card(s) drafted from {done} note(s)."
+                + (
+                    f" Stopped at the {int(budget_seconds)}s budget with "
+                    f"{max(0, remaining)} note(s) left — run it again to continue."
+                    if stopped_early
+                    else ""
+                )
+                + " Everything is a draft until you approve it."
+            ),
+        }
+
+    def _skip_row(self, note: Note, reason: str) -> Dict[str, Any]:
+        return {"note_id": note.id, "title": note.title, "reason": reason}
 
     def study_overview(self) -> Dict[str, Any]:
         """The study home screen: subjects, what is due, how it is going."""
