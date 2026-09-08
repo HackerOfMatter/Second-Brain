@@ -61,15 +61,38 @@ the subject — "elasticity", "unit conversion", "date", "definition". Reuse the
 same label for cards of the same kind. It is used to mix question types \
 within a session, so a generic label is worse than none.
 - If the passage is boilerplate, navigation, or too thin to test, return an \
-empty list. Returning nothing is a correct answer."""
+empty list. Returning nothing is a correct answer.
+
+"format" is how the card should be asked. Pick the one the material calls for:
+- "basic" — the default. Read the question, recall the answer, grade yourself.
+- "short" — the answer is one exact term, number or name worth *producing* \
+from memory rather than recognising. Use it where being able to say the word \
+is the skill.
+- "choice" — multiple choice. Use it ONLY when the passage itself supports \
+three wrong answers that are specific, plausible and about this material. Put \
+them in "wrong". Never write "all of the above" or "none of the above", never \
+a wrong answer that is obviously silly, and never make the right answer the \
+longest or the most qualified one — that gives it away without reading the \
+question. If you cannot write three real wrong answers from this passage, use \
+"basic" instead. At most one card in three should be "choice".
+- "explain" — the question asks *why* or *how* something works and the answer \
+is a short explanation, not a term. Use it for mechanisms, causes and \
+consequences. Keep the explanation under 40 words."""
 
 SCHEMA_HINT = """{
   "cards": [
     {"q": "question, self-contained", "a": "shortest complete answer",
      "why": "exact quote from the passage containing the answer",
-     "type": "two or three words naming the kind of question"}
+     "type": "two or three words naming the kind of question",
+     "format": "basic | short | choice | explain",
+     "wrong": ["only for format=choice: three plausible wrong answers"]}
   ]
 }"""
+
+#: Recognition is a weaker test than recall, so a deck made mostly of choice
+#: cards is a deck that feels easy and measures little. Cards past this share
+#: keep their question and lose their options.
+MAX_CHOICE_SHARE = 1 / 3
 
 #: Sections of a rendered note that are the system's own boilerplate, not
 #: material worth testing. Generating "What is this project's level?" cards
@@ -150,11 +173,20 @@ class GenerationResult:
     #: Why cards were dropped, by rule. Surfaced so a deck that comes back
     #: thin says which rule ate it instead of looking like a model failure.
     rejections: Dict[str, int] = field(default_factory=dict)
+    #: How many of each kind were made — basic, cloze, mcq, recall, explain.
+    #: A deck that came back all-basic because every option set failed its
+    #: gate should say so rather than look like the model never tried.
+    kinds: Dict[str, int] = field(default_factory=dict)
+    #: Choice cards that lost their options, by the rule that took them.
+    downgraded: Dict[str, int] = field(default_factory=dict)
     note: str = ""
 
     def _drop(self, rule: str) -> None:
         self.rejected += 1
         self.rejections[rule] = self.rejections.get(rule, 0) + 1
+
+    def _count(self, card: Card) -> None:
+        self.kinds[card.kind] = self.kinds.get(card.kind, 0) + 1
 
 
 # --------------------------------------------------------------------------
@@ -238,11 +270,14 @@ def generate(
         result.degraded = True
         return result
 
+    choices_made = 0
     provider = resolve_provider(cfg.llm, "generate")
     result.provider = provider.name
     if not getattr(provider, "is_llm", False):
         result.degraded = True
         result.cards = _heuristic_cards(passages, max_cards, seen)
+        for card in result.cards:
+            result._count(card)
         result.note = (
             "No model reachable — made cloze cards from definition sentences. "
             "Re-generate later for better questions."
@@ -270,6 +305,9 @@ def generate(
                 continue
             if rule == "repaired":
                 result.repaired += 1
+            elif rule.startswith("choice-"):
+                # The option set failed its gate and the question survived it.
+                result.downgraded[rule] = result.downgraded.get(rule, 0) + 1
             for card in made:
                 if len(result.cards) >= max_cards:
                     break
@@ -277,7 +315,18 @@ def generate(
                 if key in seen:
                     result._drop("duplicate")
                     continue
+                # Recognition is cheaper than recall, so the share is capped
+                # here rather than trusted to the prompt. Over the cap a
+                # choice card keeps its question and loses its options.
+                if card.choices and choices_made >= max(1, int(max_cards * MAX_CHOICE_SHARE)):
+                    card.choices = []
+                    result.downgraded["choice-over-share"] = (
+                        result.downgraded.get("choice-over-share", 0) + 1
+                    )
+                if card.choices:
+                    choices_made += 1
                 seen.add(key)
+                result._count(card)
                 result.cards.append(card)
 
     if not result.cards and not result.note:
@@ -347,12 +396,51 @@ def _validate(
 
     quote = why if _quote_is_real(why, passage) else ""
     topic = _topic(item)
+    fmt = _format(item)
 
-    def card(f: str, b: str, src: str) -> Card:
-        return Card(id="tmp", front=f, back=b, source=src, topic=topic, status="draft")
+    def card(f: str, b: str, src: str, *, choices=None, mode: str = "") -> Card:
+        return Card(
+            id="tmp", front=f, back=b, source=src, topic=topic, status="draft",
+            choices=list(choices or []), mode=mode,
+        )
+
+    # A choice card is decided before anything else, because its whole shape
+    # is different: the answer is *shown*, so the minimum-information rules
+    # about answer length are not the ones that matter. What matters is
+    # whether the options measure anything, and that is `assess_choices`.
+    if fmt == "choice":
+        options = _options(item, back)
+        verdict = quality.assess_choices(back, options)
+        if verdict.ok:
+            return [card(front, back, quote, choices=options)], ""
+        # A bad option set is not a bad card. The question and the answer came
+        # through the same checks every other card gets, so the options are
+        # dropped and the card ships as a plain one — losing a good question
+        # because its distractors were lazy is a worse trade than the one card
+        # of recognition practice it costs.
+        fmt = "basic"
+        downgrade = verdict.rule
+    else:
+        downgrade = ""
+
+    # An explanation is longer than a term by definition, so the answer-length
+    # and enumeration rules would reject every one of them. The rules that
+    # still apply are the ones about what a question may ask for.
+    if fmt == "explain":
+        if quality.is_list_question(front):
+            return [], "list-question"
+        if quality.words(back) > quality.MAX_EXPLAIN_WORDS:
+            return [], "length"
+        if quality.words(back) < 4:
+            # "Why does X happen?" answered in two words is a basic card that
+            # called itself an explanation.
+            return [card(front, back, quote)], downgrade
+        return [card(front, back, quote, mode="explain")], downgrade
+
+    mode = "recall" if fmt == "short" else ""
 
     if max_answer_words <= 0:  # quality enforcement switched off in config
-        return [card(front, back, quote)], ""
+        return [card(front, back, quote, mode=mode)], downgrade
 
     # Rule 5 first: a wordy definition is better asked as a blank than as a
     # question, and converting it usually also fixes the length.
@@ -363,7 +451,7 @@ def _validate(
 
     verdict = quality.assess(front, back, max_words=max_answer_words)
     if verdict.ok:
-        return [card(front, back, quote)], ""
+        return [card(front, back, quote, mode=mode)], downgrade
 
     # Rules 7 and 8: a list answer becomes one cloze per item, over the
     # note's own sentence. Unciteable means unrepairable.
@@ -373,6 +461,53 @@ def _validate(
             return [card(*triple) for triple in split], "repaired"
 
     return [], verdict.rule
+
+
+#: What the model may call a card. Anything else is a basic card, because a
+#: format nobody implements must not change how the card is asked.
+FORMATS = ("basic", "short", "choice", "explain")
+
+
+def _format(item: Dict[str, Any]) -> str:
+    raw = _text(item.get("format") or item.get("kind") or item.get("style")).lower()
+    raw = raw.strip().strip(".")
+    aliases = {
+        "multiple choice": "choice", "multiple-choice": "choice", "mcq": "choice",
+        "recall": "short", "free recall": "short", "term": "short",
+        "why": "explain", "explanation": "explain", "reasoning": "explain",
+        "qa": "basic", "q&a": "basic", "": "basic",
+    }
+    raw = aliases.get(raw, raw)
+    return raw if raw in FORMATS else "basic"
+
+
+def _options(item: Dict[str, Any], answer: str) -> List[str]:
+    """The option list for a choice card.
+
+    A model may hand back either the wrong answers alone or the whole list
+    with the answer somewhere inside it. Both are accepted; what is *not*
+    accepted is a list missing its answer, so the answer is appended when it
+    is not already there. `quality.assess_choices` then decides whether any of
+    it is worth showing.
+    """
+    raw = item.get("wrong")
+    if not isinstance(raw, list):
+        raw = item.get("distractors")
+    full = False
+    if not isinstance(raw, list):
+        raw = item.get("options") or item.get("choices")
+        full = True
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    for value in raw:
+        text = _text(value)
+        if text and not any(_norm(text) == _norm(o) for o in out):
+            out.append(text)
+    answer = _text(answer)
+    if answer and not any(_norm(answer) == _norm(o) for o in out):
+        out.append(answer)
+    return out[: quality.MAX_OPTIONS + 1]
 
 
 #: A label this generic tells the interleaver nothing, so it is dropped
@@ -494,6 +629,8 @@ def add_to_deck(
                 source=card.source,
                 topic=card.topic,
                 worked=card.worked,
+                choices=list(card.choices),
+                mode=card.mode,
                 status="draft",
             )
         )

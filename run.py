@@ -324,9 +324,38 @@ def cmd_doctor(args) -> int:
     return 0
 
 
+def _capture_split(engine, args) -> int:
+    """`--split`: show what the capture becomes, then file it unless it is a
+    dry run. The preview is printed either way, because a splitter you cannot
+    see the output of is a splitter you stop trusting."""
+    plan = engine.capture_plan(args.text, args.bucket)
+    kind = "project" if plan["mode"] == "tasks" else "note"
+    print(f"{len(plan['items'])} {kind}(s), split on {plan['strategy']} "
+          f"({plan['words']} words in)")
+    if plan.get("lossless") is False:
+        print("  !! some lines landed in no note:")
+        for line in plan.get("lost_lines", []):
+            print(f"     {line}")
+    for item in plan["items"]:
+        due = f"  due {item['due']}" if item["due"] else ""
+        print(f"  {item['ordinal']:>2}. {item['title']}{due}   ({item['words']} words)")
+    if plan.get("note"):
+        print(f"  {plan['note']}")
+    if args.dry_run:
+        print("\ndry run — nothing was written")
+        return 0
+    out = engine.capture_commit(plan["items"])
+    print(f"\n{out['note']}")
+    for row in out["failed"]:
+        print(f"  !! {row['title']}  {row['error']}")
+    return 1 if out["failed"] and not out["created"] else 0
+
+
 def cmd_capture(args) -> int:
     cfg = load(args.config)
     engine = Engine(cfg)
+    if getattr(args, "split", False) or getattr(args, "dry_run", False):
+        return _capture_split(engine, args)
     result = engine.capture(args.text, args.bucket)
     note = result["note"]
     print(f"{note['bucket']}: {note['title']}")
@@ -339,6 +368,43 @@ def cmd_capture(args) -> int:
             print(f"    - {s['text']} ({s['minutes']}m){when}")
     if result.get("parser", {}).get("degraded"):
         print(f"  ! {result['parser']['note']}")
+    return 0
+
+
+def cmd_cards(args) -> int:
+    """Draft cards for every note under a folder.
+
+    No time budget here, unlike the web route — this is the run you leave
+    going. `--dry-run` first is the habit worth having: it names every note it
+    would touch and every note it would skip, and skipping is where the
+    surprises are.
+    """
+    cfg = load(args.config)
+    engine = Engine(cfg)
+    r = engine.generate_folder(
+        args.folder,
+        limit=args.limit,
+        max_cards=args.max_cards,
+        include_existing=args.include_existing,
+        dry_run=args.dry_run,
+        budget_seconds=float(args.budget),
+    )
+    scope = r["folder"] or "the whole vault"
+    print(f"{scope}: {r['candidates']} note(s) need cards, {len(r['skipped'])} skipped")
+    for row in r["notes"]:
+        if args.dry_run:
+            print(f"  · {row['title']}  ({row['words']} words)  {row['folder']}")
+        elif row.get("error"):
+            print(f"  !! {row['title']}  {row['error']}")
+        else:
+            extra = f", {row['rejected']} dropped" if row.get("rejected") else ""
+            print(f"  + {row['cards']:>3} cards  {row['title']}{extra}")
+    if args.verbose:
+        for row in r["skipped"]:
+            print(f"  -  skip  {row['title']}  ({row['reason']})")
+    print(f"\n{r['note']}")
+    if r.get("stopped_early"):
+        return 0
     return 0
 
 
@@ -692,7 +758,25 @@ def main() -> int:
     c = sub.add_parser("capture", help="capture from the command line")
     c.add_argument("text")
     c.add_argument("--bucket", default="project", choices=["inbox", "area", "project", "resource"])
+    c.add_argument("--split", action="store_true",
+                   help="one prompt into several Projects, or long text into "
+                        "several notes")
+    c.add_argument("--dry-run", action="store_true",
+                   help="show the split and write nothing (implies --split)")
     c.set_defaults(func=cmd_capture)
+
+    g = sub.add_parser("cards", help="draft cards for every note under a folder")
+    g.add_argument("folder", nargs="?", default="",
+                   help="vault-relative, e.g. 30-Resources/Accounting (default: everything)")
+    g.add_argument("--limit", type=int, default=None, help="only the first N notes")
+    g.add_argument("--max-cards", type=int, default=None, help="cap per note")
+    g.add_argument("--include-existing", action="store_true",
+                   help="also add to notes that already have cards")
+    g.add_argument("--dry-run", action="store_true", help="say what it would do")
+    g.add_argument("--budget", type=int, default=100000,
+                   help="seconds before it stops on a note boundary")
+    g.add_argument("--verbose", "-v", action="store_true", help="name every skipped note")
+    g.set_defaults(func=cmd_cards)
 
     args = ap.parse_args()
     if not getattr(args, "func", None):

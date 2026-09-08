@@ -456,7 +456,13 @@ def _split_level(blocks: Sequence[Piece]) -> int:
 
     The shallowest level that occurs more than once — one `# Title` above
     twelve `## Topic`s is a document title, not twelve documents' worth of
-    boundary. If nothing repeats, cut at the shallowest level present.
+    boundary.
+
+    When *nothing* repeats the reasoning inverts: there is no level that reads
+    as a wrapper, so every heading is its own topic and the cut goes at the
+    deepest one. Cutting at the shallowest instead gave "# Chapter 4" with
+    "## Elasticity" inside it a single section named after the chapter, which
+    is the one-enormous-note failure this module exists to fix.
     """
     levels: Dict[int, int] = {}
     for b in blocks:
@@ -465,7 +471,7 @@ def _split_level(blocks: Sequence[Piece]) -> int:
     if not levels:
         return 0
     repeated = sorted(l for l, n in levels.items() if n > 1)
-    return repeated[0] if repeated else min(levels)
+    return repeated[0] if repeated else max(levels)
 
 
 def _split_on_headings(blocks: List[Piece]) -> List[Segment]:

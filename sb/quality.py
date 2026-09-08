@@ -62,6 +62,37 @@ MAX_SPLIT = 4
 MIN_ITEM_CHARS = 2
 MIN_CLOZE_CONTEXT = 24
 
+#: An explanation is allowed to be longer than a term, because that is what
+#: makes it an explanation. Still capped: past this it is a passage, and a
+#: passage is not a card whatever you call it.
+MAX_EXPLAIN_WORDS = 45
+
+#: Multiple choice, from the measurement literature on item flaws (Haladyna,
+#: Downing & Rodriguez, *A Review of Multiple-Choice Item-Writing Guidelines*,
+#: 2002). Three options is the floor at which guessing stops carrying the
+#: card; above five the extra distractors are filler nobody reads.
+MIN_OPTIONS = 3
+MAX_OPTIONS = 5
+
+#: The best-documented flaw there is: the correct option is longer than the
+#: rest, because the writer qualified it into correctness. A test-wise reader
+#: scores well above chance on that alone, which means the card is measuring
+#: test-wiseness rather than the material. Compared against the *median*
+#: distractor so one rambling wrong answer cannot excuse a long right one.
+LENGTH_TELL_MAX = 1.6
+LENGTH_TELL_MIN = 0.4
+#: The check is skipped only when *everything* is short — "12%" against "8%"
+#: is noise, not a tell. It is emphatically not skipped when the options are
+#: short and the answer is not: that is the tell at its most blatant.
+LENGTH_TELL_FLOOR_CHARS = 12
+
+#: Options that give the game away or ask a different question than the stem.
+_GIVEAWAY = re.compile(
+    r"\b(?:all|none|both|any) of (?:the )?(?:above|these|them)\b"
+    r"|\bboth [a-d] and [a-d]\b|\bnot (?:listed|given)\b",
+    re.I,
+)
+
 _BULLET = re.compile(r"(?m)^[ \t]*(?:[-*•–]|\d+[.)])[ \t]+")
 _SPLIT = re.compile(r"\s*(?:;|,\s*(?:and|or|plus)\b|,|\band\b|\bor\b|\bplus\b|\bas well as\b)\s*", re.I)
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
@@ -175,6 +206,71 @@ def assess(front: str, back: str, *, max_words: int = MAX_ANSWER_WORDS) -> Verdi
         return Verdict(False, "length", f"the answer is {words(back)} words; one card should ask for one thing")
 
     return Verdict(True)
+
+
+def is_list_question(front: str) -> bool:
+    """Does this question ask for a list? True of every card type there is."""
+    return bool(_LIST_QUESTION.search(front or ""))
+
+
+def assess_choices(answer: str, options: List[str]) -> Verdict:
+    """Is this a multiple-choice card worth answering?
+
+    Every rule here is a way a card can look right and measure nothing. They
+    run cheapest-first so the reason given is the most specific one true.
+    """
+    answer = (answer or "").strip()
+    clean = [o.strip() for o in (options or []) if o and o.strip()]
+
+    if not answer:
+        return Verdict(False, "choice-no-answer", "no correct answer to mark against")
+    if len(clean) < MIN_OPTIONS:
+        return Verdict(
+            False, "choice-too-few",
+            f"{len(clean)} options — under {MIN_OPTIONS}, guessing carries the card",
+        )
+    if len(clean) > MAX_OPTIONS:
+        return Verdict(
+            False, "choice-too-many", f"{len(clean)} options is filler, not discrimination"
+        )
+
+    normed = [_norm_choice(o) for o in clean]
+    if len(set(normed)) != len(normed):
+        return Verdict(False, "choice-duplicate", "two options are the same option")
+
+    matches = [o for o in clean if _norm_choice(o) == _norm_choice(answer)]
+    if len(matches) != 1:
+        return Verdict(
+            False, "choice-not-one-answer",
+            f"{len(matches)} of the options are the answer; exactly one must be",
+        )
+
+    for option in clean:
+        if _GIVEAWAY.search(option):
+            return Verdict(False, "choice-giveaway", f"“{option}” is not a real option")
+
+    distractors = [o for o in clean if _norm_choice(o) != _norm_choice(answer)]
+    lengths = sorted(len(d) for d in distractors)
+    median = lengths[len(lengths) // 2] if lengths else 0
+    if median and max(len(matches[0]), median) >= LENGTH_TELL_FLOOR_CHARS:
+        ratio = len(matches[0]) / median
+        if ratio > LENGTH_TELL_MAX:
+            return Verdict(
+                False, "choice-length-tell",
+                f"the right answer is {ratio:.1f}x the length of the others — "
+                f"it can be picked without reading the question",
+            )
+        if ratio < LENGTH_TELL_MIN:
+            return Verdict(
+                False, "choice-length-tell",
+                "the right answer is far shorter than every wrong one, which is "
+                "the same tell in reverse",
+            )
+    return Verdict(True)
+
+
+def _norm_choice(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
 
 
 # --------------------------------------------------------------------------

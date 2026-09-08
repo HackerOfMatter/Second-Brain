@@ -2033,6 +2033,11 @@ class Engine:
             "subject": deck.subject,
             "category": deck.category,
             "kind": card.kind,
+            "mode": card.mode,
+            # Options are safe before the reveal — showing them *is* the
+            # question. `Card.options()` fixes the order on the card id, so
+            # the list here and the list after the reveal are the same list.
+            "options": card.options(),
             "topic": card.topic,
             # Sweller: a scaffold for the first attempts, withdrawn as
             # competence rises. Available before the reveal on purpose — that
@@ -2588,6 +2593,7 @@ class Engine:
     def _deckable_notes(self, decks: List[Deck]) -> List[Dict[str, Any]]:
         """Notes worth making cards from that do not have any yet."""
         have = {d.note_id for d in decks}
+        where = self.vault.folders_by_id()
         out = []
         for note in self.notes():
             if note.id in have or note.bucket not in (Bucket.PROJECT, Bucket.RESOURCE):
@@ -2600,6 +2606,7 @@ class Engine:
                     "note_id": note.id,
                     "title": note.title,
                     "bucket": note.bucket.value,
+                    "folder": where.get(note.id, ""),
                     "learning": bool(note.project and note.project.learning),
                     "category": taxonomy.categorize(note, self.cfg),
                     "words": len(note.body.split()),
@@ -2684,7 +2691,12 @@ class Engine:
         # you the verdict *before* it counts, so a model that marks you wrong
         # costs you a click rather than a card.
         grading = None
-        if mode == "recall" and grade is None:
+        if mode == "choice" and grade is None:
+            # No model is consulted for a choice card, so there is nothing to
+            # degrade and nothing to warn about.
+            grading = tutor.grade_choice(card, typed)
+            grade = grading.grade
+        elif mode == "recall" and grade is None:
             grading = tutor.grade_recall(card.question(), card.answer(), typed, self.cfg)
             grade = grading.grade
         if grade is None:
@@ -2747,7 +2759,11 @@ class Engine:
         """
         deck = self.deck(note_id)
         card = deck.card(card_id)
-        grading = tutor.grade_recall(card.question(), card.answer(), typed, self.cfg)
+        grading = (
+            tutor.grade_choice(card, typed)
+            if card.kind == "mcq"
+            else tutor.grade_recall(card.question(), card.answer(), typed, self.cfg)
+        )
         return {
             "score": grading.score,
             "grade": grading.grade,

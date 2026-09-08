@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import random
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
@@ -63,20 +64,41 @@ EXPLAIN_LOG = "_explanations.jsonl"
 #: The trailing `.*` swallows the decorative status marker the renderer adds
 #: ("· *awaiting review*"); only the id is load-bearing.
 CARD_HEADING = re.compile(r"^###\s+Card\s+([A-Za-z0-9_-]+)\b.*$", re.M)
-FIELD_LABEL = re.compile(r"^\*\*(Q|A|Hint|Why|Type|Worked)\.\*\*[ \t]*", re.M)
+FIELD_LABEL = re.compile(
+    r"^\*\*(Q|A|Hint|Why|Type|Worked|Choices|Mode)\.\*\*[ \t]*", re.M
+)
 
 #: `Type` is the within-subject problem type — what Rohrer & Taylor's
 #: interleaving was actually measured on. `Worked` is a fully solved
 #: example, shown for a card's first attempts and then faded (Sweller).
 #: Both are body-owned text, like the question: lj can write or fix either
 #: by typing in Obsidian.
+#: `Choices` and `Mode` are how a card says it is not a plain question.
+#: Both are body-owned like the rest: a multiple-choice card is four lines lj
+#: can rewrite in Obsidian, not a structure only the generator can produce.
 LABEL_TO_FIELD = {
     "Q": "front", "A": "back", "Hint": "hint", "Why": "source",
-    "Type": "topic", "Worked": "worked",
+    "Type": "topic", "Worked": "worked", "Choices": "choices", "Mode": "mode",
 }
 FIELD_TO_LABEL = {v: k for k, v in LABEL_TO_FIELD.items()}
 
 CLOZE = re.compile(r"\{\{([^{}]+)\}\}")
+
+#: How a card is asked. Empty means the original behaviour — show the
+#: question, reveal, grade yourself.
+#:
+#: `recall`  — you type the answer and it is marked before you grade.
+#: `explain` — you write the *reason* before the reveal, then grade. The
+#:             generation effect (Slamecka & Graf) and prompted
+#:             self-explanation (Chi et al.) are the two best-evidenced
+#:             things in this whole module, and both need you to produce
+#:             something before you read the answer.
+#: A card with `Choices` is multiple choice whatever its mode says.
+MODES = ("", "recall", "explain")
+
+#: A leading "A) ", "1. ", "- " on an option line. Stripped on read so a
+#: hand-written option list works however it was labelled.
+OPTION_MARK = re.compile(r"^\s*(?:[-*+•]|\(?[A-Za-z][.)]|\d{1,2}[.)])\s+")
 
 
 # --------------------------------------------------------------------------
@@ -109,6 +131,11 @@ class Card(BaseModel):
     #: competence rises — Sweller's worked-example effect, and its
     #: expertise-reversal counterpart. See sb/tutor.worked_example_for.
     worked: str = ""
+    #: Multiple-choice options, `back` among them. Stored as written; the
+    #: order shown is decided by `options()`, not by this list.
+    choices: List[str] = Field(default_factory=list)
+    #: One of MODES.
+    mode: str = ""
     status: str = "draft"  # draft | active | suspended
     stability: float = 0.0
     difficulty: float = 0.0
@@ -121,7 +148,54 @@ class Card(BaseModel):
 
     @property
     def kind(self) -> str:
-        return "cloze" if CLOZE.search(self.front or "") else "basic"
+        """What kind of question this is, for the session UI and the grader.
+
+        Choices win over everything: a card with four options is a
+        multiple-choice card even if its front also contains braces, because
+        that is what the reader will be looking at.
+        """
+        if self.choices:
+            return "mcq"
+        if CLOZE.search(self.front or ""):
+            return "cloze"
+        if self.mode in ("recall", "explain"):
+            return self.mode
+        return "basic"
+
+    def options(self) -> List[str]:
+        """The options in a stable, non-obvious order.
+
+        Two properties this has to have, and neither is optional:
+
+          * **The answer is not always in the same place.** A generator that
+            lists the correct option first teaches position, not content.
+          * **The order never changes between the queue and the reveal.**
+            Seeded on the card id, so the same card shows the same order on
+            every device, in every session, forever — a card whose options
+            move while you are reading them cannot be answered at all.
+        """
+        if not self.choices:
+            return []
+        opts: List[str] = []
+        for raw in self.choices:
+            text = (raw or "").strip()
+            if text and not any(_same_option(text, o) for o in opts):
+                opts.append(text)
+        back = (self.back or "").strip()
+        if back and not any(_same_option(back, o) for o in opts):
+            opts.append(back)
+        random.Random(self.id or "seed").shuffle(opts)
+        return opts
+
+    def correct_option(self) -> str:
+        """The option that is the answer, as it is written in the list."""
+        for option in self.options():
+            if _same_option(option, self.back):
+                return option
+        return (self.back or "").strip()
+
+    def is_correct_choice(self, picked: str) -> bool:
+        return _same_option(picked, self.back)
 
     @property
     def is_new(self) -> bool:
@@ -298,6 +372,12 @@ def render_body(deck: Deck) -> str:
         lines += [f"### Card {card.id}{state}", ""]
         lines += [f"**Q.** {card.front.strip()}", ""]
         lines += [f"**A.** {card.back.strip()}", ""]
+        if card.choices:
+            lines += ["**Choices.**", ""]
+            lines += [f"- {c.strip()}" for c in card.choices if c.strip()]
+            lines += [""]
+        if card.mode.strip():
+            lines += [f"**Mode.** {card.mode.strip()}", ""]
         if card.topic.strip():
             lines += [f"**Type.** {card.topic.strip()}", ""]
         if card.hint.strip():
@@ -319,8 +399,37 @@ def parse_body(body: str) -> List[Card]:
         fields = _parse_fields(body[start:end])
         if not fields.get("front"):
             continue  # a heading with no question is not a card
+        # Every other field is a string; options are a list, and the body is
+        # where a human writes them, so they are parsed rather than trusted.
+        if "choices" in fields:
+            fields["choices"] = parse_choices(fields["choices"])
+        if fields.get("mode") not in MODES:
+            fields.pop("mode", None)
         cards.append(Card(id=m.group(1), **fields))
     return cards
+
+
+def parse_choices(text: str) -> List[str]:
+    """An option block into a list, however it was labelled.
+
+    Duplicates are dropped here rather than at generation time, because this
+    also runs over what lj typed in Obsidian — and two identical options is a
+    card with three answers, not four.
+    """
+    out: List[str] = []
+    for line in (text or "").split("\n"):
+        option = OPTION_MARK.sub("", line).strip()
+        if option and not any(_same_option(option, o) for o in out):
+            out.append(option)
+    return out
+
+
+def _same_option(a: str, b: str) -> bool:
+    return _norm_option(a) == _norm_option(b) and bool(_norm_option(a))
+
+
+def _norm_option(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
 
 
 def _parse_fields(chunk: str) -> Dict[str, str]:

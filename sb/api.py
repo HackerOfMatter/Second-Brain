@@ -79,6 +79,16 @@ async def body_of(request: Request) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _positive_int(value: Any) -> int | None:
+    """A count from a JSON body, or None. Never raises on junk — a malformed
+    limit should cost the limit, not the request."""
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def build_app(cfg: Config | None = None) -> Starlette:
     cfg = cfg or load()
     engine = Engine(cfg)
@@ -144,6 +154,56 @@ def build_app(cfg: Config | None = None) -> Starlette:
             body.get("title", ""),
             body.get("due") or None,
         ))
+
+    @guard
+    async def capture_plan(request: Request):
+        """What a paste would become. Writes nothing — see Engine.capture_plan."""
+        body = await body_of(request)
+        return ok(
+            await run_in_threadpool(
+                engine.capture_plan,
+                body.get("text", ""),
+                body.get("bucket", "project"),
+                due=body.get("due") or None,
+                mode=str(body.get("mode") or "auto"),
+            )
+        )
+
+    @guard
+    async def capture_commit(request: Request):
+        """File a reviewed plan. The items are whatever the preview shows,
+        including any edit lj made to a title, a body, a bucket or a date."""
+        body = await body_of(request)
+        items = body.get("items")
+        if not isinstance(items, list):
+            raise ValueError("items must be a list")
+        return ok(
+            await run_in_threadpool(
+                engine.capture_commit,
+                items,
+                bucket=str(body.get("bucket") or ""),
+                due=body.get("due") or None,
+            )
+        )
+
+    @guard
+    async def generate_folder(request: Request):
+        """Draft cards for every note under a folder.
+
+        Long by nature, so the engine holds a wall-clock budget and returns
+        what is left rather than running until the socket gives up.
+        """
+        body = await body_of(request)
+        return ok(
+            await run_in_threadpool(
+                engine.generate_folder,
+                str(body.get("folder") or ""),
+                limit=_positive_int(body.get("limit")),
+                max_cards=_positive_int(body.get("max_cards")),
+                include_existing=bool(body.get("include_existing")),
+                dry_run=bool(body.get("dry_run")),
+            )
+        )
 
     @guard
     async def list_notes(request: Request):
@@ -632,6 +692,8 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/dashboard", dashboard),
         Route("/api/inbox", inbox),
         Route("/api/capture", capture, methods=["POST"]),
+        Route("/api/capture/plan", capture_plan, methods=["POST"]),
+        Route("/api/capture/commit", capture_commit, methods=["POST"]),
         Route("/api/notes", list_notes),
         Route("/api/notes/{note_id}", get_note),
         Route("/api/notes/{note_id}/steps/{step_id}/toggle", toggle_step, methods=["POST"]),
@@ -675,6 +737,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/index/rebuild", reindex, methods=["POST"]),
         Route("/api/notes/{note_id}/connect", connect_note, methods=["POST"]),
         Route("/api/connect", connect_all, methods=["POST"]),
+        Route("/api/decks/generate-folder", generate_folder, methods=["POST"]),
         Route("/api/decks/{note_id}", get_deck),
         Route("/api/decks/{note_id}/generate", generate_cards, methods=["POST"]),
         Route("/api/decks/{note_id}/approve", approve_cards, methods=["POST"]),

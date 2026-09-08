@@ -48,6 +48,33 @@
   .sub { color: var(--faint); font-size: 13px; }
   .spacer { flex: 1; }
 
+  /* ---- the split preview ----
+     A proposed note is editable in place: the point of a preview is that a
+     wrong boundary costs a drag of the mouse, not a merge afterwards. */
+  .plan { border: 1px solid var(--accent); border-radius: var(--radius);
+          background: var(--panel); padding: 16px; margin-bottom: 24px; }
+  .plan header { display: flex; align-items: baseline; gap: 10px; margin: 0 0 12px; }
+  .plan h2 { font-size: 15px; margin: 0; }
+  .planitem { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+              margin-bottom: 10px; background: var(--panel-2); }
+  .planitem.gone { opacity: .4; }
+  .planitem .top { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 7px; }
+  .planitem .n { font: 11px var(--mono); color: var(--faint); min-width: 20px; }
+  .planitem input[type=text] { flex: 1; min-width: 180px; font: inherit; font-size: 14px;
+        padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line);
+        background: var(--panel); color: var(--ink); }
+  .planitem select { font: inherit; font-size: 12.5px; padding: 3px 6px; border-radius: 6px;
+        border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+  .planitem textarea { width: 100%; min-height: 62px; font: inherit; font-size: 13px;
+        line-height: 1.5; padding: 7px 9px; border-radius: 6px; border: 1px solid var(--line);
+        background: var(--panel); color: var(--ink); resize: vertical; }
+  .planitem .meta { font: 11px var(--mono); color: var(--faint); margin-top: 5px;
+        display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .plan .warnline { color: var(--warn); font-size: 13px; margin: 0 0 12px; }
+  .plan .okline { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { filter: brightness(1.07); }
+
   /* ---- capture ---- */
   .capture { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 24px; }
   textarea {
@@ -273,9 +300,25 @@
       <span class="hint" style="margin-left:6px">Due</span>
       <input type="date" id="duepick" title="Beats anything in the text — no confirmation needed">
       <span class="spacer"></span>
-      <span class="hint">Classification is yours. Everything after it is automatic.</span>
+      <label class="hint" title="Long text becomes several linked notes; a prompt holding several jobs becomes several Projects. You see and edit every one before anything is written.">
+        <input type="checkbox" id="splitmode"> Split into several
+      </label>
     </div>
+    <p class="hint" id="splithint" style="margin:8px 0 0">Classification is yours. Everything after it is automatic.</p>
   </div>
+
+  <section id="planbox" class="plan hide">
+    <header>
+      <h2 id="planhead">What this becomes</h2>
+      <span class="sub" id="planstrategy"></span>
+      <span class="spacer"></span>
+      <button id="plancancel" class="ghost">Cancel</button>
+      <button id="planfile" class="primary">File them</button>
+    </header>
+    <p class="warnline hide" id="planwarn"></p>
+    <p class="okline" id="plannote"></p>
+    <div id="planlist"></div>
+  </section>
 
   <section id="inboxbox" class="hide">
     <h2>Where does this go?</h2>
@@ -837,10 +880,143 @@ async function load() {
   } catch (e) { /* footer is cosmetic */ }
 }
 
+/* ---- the split preview -------------------------------------------------
+
+   Two shapes of capture that the three buttons could never file correctly:
+   a page of notes covering nine topics, and one sentence holding three jobs.
+   The server proposes; this screen is where lj disposes. Nothing is written
+   until "File them", and every field here is editable, because the only
+   thing worse than a missed boundary is one you cannot move.            */
+
+let PLAN = null;
+
+function planWordCount() {
+  return $("#capturebox").value.trim().split(/\s+/).filter(Boolean).length;
+}
+
+/* Long text is the case where splitting is nearly always what you wanted, so
+   the toggle sets itself — once. A manual click sticks for the session: being
+   overruled by the app you just overruled is how a checkbox loses trust. */
+let SPLIT_TOUCHED = false;
+$("#splitmode").addEventListener("change", () => { SPLIT_TOUCHED = true; updateSplitHint(); });
+
+function updateSplitHint() {
+  const words = planWordCount();
+  if (!SPLIT_TOUCHED && words >= 120 && !$("#splitmode").checked) $("#splitmode").checked = true;
+  const on = $("#splitmode").checked;
+  $("#splithint").textContent = on
+    ? `${words} word${words === 1 ? "" : "s"} — you'll see what it becomes before anything is written.`
+    : "Classification is yours. Everything after it is automatic.";
+}
+$("#capturebox").addEventListener("input", updateSplitHint);
+
+async function planCapture(bucket) {
+  const text = $("#capturebox").value.trim();
+  if (!text) { $("#capturebox").focus(); return; }
+  document.querySelectorAll("[data-bucket]").forEach(b => b.disabled = true);
+  try {
+    const due = $("#duepick").value || null;
+    PLAN = await api("/api/capture/plan",
+      {method: "POST", body: JSON.stringify({text, bucket, due})});
+    renderPlan();
+  } catch (e) { toast("Could not plan that capture", e.message, "err"); }
+  finally { document.querySelectorAll("[data-bucket]").forEach(b => b.disabled = false); }
+}
+
+function renderPlan() {
+  const d = PLAN;
+  const n = d.items.length;
+  $("#planhead").textContent =
+    n === 1 ? "This is one note" : `This becomes ${n} ${d.mode === "tasks" ? "Projects" : "notes"}`;
+  $("#planstrategy").textContent =
+    `split on ${esc(d.strategy)}${d.provider ? " · " + esc(d.provider) : ""} · ${d.words} words in`;
+
+  /* The one claim worth making on screen. A splitter you cannot check is a
+     splitter you stop pasting into. */
+  const warn = $("#planwarn");
+  if (d.lossless === false) {
+    warn.textContent = "Some lines did not land in any note — do not file this. " +
+      (d.lost_lines || []).slice(0, 3).map(l => `"${l}"`).join("  ");
+    warn.classList.remove("hide");
+  } else warn.classList.add("hide");
+
+  $("#plannote").textContent = d.note ||
+    (d.lossless === false ? "" : "Every line you typed is in exactly one of these. Edit anything, then file.");
+
+  $("#planlist").innerHTML = d.items.map((it, i) => {
+    const bits = [`${it.words} words`, esc(it.boundary)];
+    if (it.heading_path && it.heading_path.length) bits.push(esc(it.heading_path.join(" › ")));
+    if (it.due_phrase) bits.push(`date read from “${esc(it.due_phrase)}”`);
+    return `<div class="planitem" data-i="${i}">
+      <div class="top">
+        <span class="n">${i + 1}</span>
+        <input type="text" data-f="title" value="${esc(it.title)}" placeholder="Title">
+        <select data-f="bucket">
+          ${["area", "project", "resource", "inbox"].map(b =>
+            `<option value="${b}"${b === it.bucket ? " selected" : ""}>${b}</option>`).join("")}
+        </select>
+        <input type="date" data-f="due" value="${esc(it.due || "")}"${it.due && !it.due_confirmed ? ' class="guess"' : ""}>
+        <button data-act="drop" title="Do not file this one">✕</button>
+      </div>
+      <textarea data-f="body" rows="3">${esc(it.body)}</textarea>
+      <div class="meta">${bits.join(" · ")}</div>
+    </div>`;
+  }).join("");
+
+  $("#planbox").classList.remove("hide");
+  $("#planbox").scrollIntoView({behavior: "smooth", block: "nearest"});
+}
+
+$("#planlist").addEventListener("click", e => {
+  const b = e.target.closest("button[data-act='drop']");
+  if (!b) return;
+  const row = b.closest(".planitem");
+  row.classList.toggle("gone");
+  b.textContent = row.classList.contains("gone") ? "↺" : "✕";
+});
+
+$("#plancancel").addEventListener("click", () => {
+  PLAN = null;
+  $("#planbox").classList.add("hide");
+});
+
+$("#planfile").addEventListener("click", async () => {
+  if (!PLAN) return;
+  const items = [];
+  document.querySelectorAll("#planlist .planitem").forEach(row => {
+    if (row.classList.contains("gone")) return;
+    const get = f => row.querySelector(`[data-f="${f}"]`).value;
+    const body = get("body").trim();
+    if (body) items.push({title: get("title").trim(), body, bucket: get("bucket"), due: get("due") || null});
+  });
+  if (!items.length) { toast("Nothing selected", "Every item is set to skip.", "warn"); return; }
+  $("#planfile").disabled = true;
+  try {
+    const r = await api("/api/capture/commit", {method: "POST", body: JSON.stringify({items})});
+    PLAN = null;
+    $("#planbox").classList.add("hide");
+    $("#capturebox").value = "";
+    $("#duepick").value = "";
+    updateSplitHint();
+    const linked = r.created.reduce((a, c) => a + (c.linked || 0), 0);
+    toast(`Filed ${r.count}`,
+      r.created.slice(0, 4).map(c => c.title).join(" · ") +
+      (r.count > 4 ? ` … +${r.count - 4}` : "") +
+      (linked ? ` · ${linked} links` : ""),
+      r.failed.length ? "warn" : "");
+    if (r.failed.length) {
+      toast(`${r.failed.length} did not file`, r.failed.map(f => f.error).join(" · "), "err");
+    }
+    load();
+  } catch (e) { toast("Could not file them", e.message, "err"); }
+  finally { $("#planfile").disabled = false; }
+});
+
 async function capture(bucket) {
   const box = $("#capturebox");
   const text = box.value.trim();
   if (!text) { box.focus(); return; }
+  if ($("#splitmode").checked) return planCapture(bucket);
   document.querySelectorAll("[data-bucket]").forEach(b => b.disabled = true);
   try {
     const due = $("#duepick").value || null;

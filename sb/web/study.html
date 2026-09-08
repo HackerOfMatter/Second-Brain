@@ -113,6 +113,25 @@
   .grades button[data-grade="1"]:hover { border-color: var(--danger); }
   .grades button[data-grade="3"]:hover { border-color: var(--good); }
 
+  /* ---- multiple choice ----
+     Options are buttons rather than radios: one click answers, and there is
+     no "submit" step to forget. The verdict colours the two that matter and
+     leaves the rest alone, so the eye goes to what you picked and what was
+     right rather than to a wall of green and red. */
+  .choices { display: flex; flex-direction: column; gap: 8px; margin: 16px 0 4px; }
+  .choices button {
+    text-align: left; padding: 11px 14px; font-size: 15px; line-height: 1.45;
+    border-radius: 9px; white-space: normal;
+  }
+  .choices button .mark { font: 11px var(--mono); color: var(--faint); margin-right: 9px; }
+  .choices button.picked.hit  { border-color: var(--good);
+        background: color-mix(in srgb, var(--good) 14%, transparent); }
+  .choices button.picked.miss { border-color: var(--danger);
+        background: color-mix(in srgb, var(--danger) 14%, transparent); }
+  .choices button.wasright    { border-color: var(--good); }
+  .choices button:disabled { opacity: 1; cursor: default; }
+  .choices button:disabled:not(.picked):not(.wasright) { opacity: .5; }
+
   .marking { border-radius: 8px; padding: 12px 14px; font-size: 14px; }
   .marking.hit  { background: color-mix(in srgb, var(--good) 12%, transparent); border: 1px solid var(--good); }
   .marking.miss { background: color-mix(in srgb, var(--danger) 12%, transparent); border: 1px solid var(--danger); }
@@ -259,11 +278,22 @@
         </div>
         <div class="q" id="cq"></div>
 
+        <div id="choices" class="choices hide"></div>
+
         <div id="typedbox" class="hide">
           <textarea id="typed" rows="3" placeholder="Write the answer from memory, then press Ctrl+Enter."></textarea>
           <div class="row" style="margin-top:8px">
             <button class="primary" id="marks">Mark it<kbd style="margin-left:7px">⌃⏎</kbd></button>
             <button id="skipmark">Show answer</button>
+          </div>
+        </div>
+
+        <div id="explainfirst" class="why-first hide">
+          <p style="margin:0 0 7px">Say it in your own words first — then look.</p>
+          <textarea id="explainsaid" rows="2" placeholder="because…"></textarea>
+          <div class="row" style="margin-top:7px">
+            <button class="primary" id="explainsend">Check my reasoning<kbd style="margin-left:7px">⌃⏎</kbd></button>
+            <button id="explainskip" class="ghost">Skip</button>
           </div>
         </div>
 
@@ -333,6 +363,26 @@
         <select id="notepick" style="flex:1;min-width:200px"></select>
         <button class="primary" id="gen">Generate cards</button>
       </div>
+    </section>
+
+    <section>
+      <h2>Make cards from a whole folder</h2>
+      <div class="row">
+        <select id="genfolder" style="flex:1;min-width:200px"></select>
+        <label class="hint">at most
+          <input type="number" id="genlimit" value="10" min="1" max="200"
+                 style="width:64px;font:inherit;font-size:13px;padding:3px 6px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink)">
+          notes</label>
+        <button id="genpreview">What would it do?</button>
+        <button class="primary" id="genfolderbtn">Generate</button>
+      </div>
+      <div id="genresult" class="hide" style="margin-top:12px"></div>
+      <p class="hint" style="margin:10px 0 0">
+        A subject folder holds sixty notes, and generating them one at a time is
+        sixty clicks nobody makes. This walks the folder instead. It skips notes
+        that already have cards and notes too thin to test, stops on a note
+        boundary if it runs long, and still lands everything as a draft.
+      </p>
       <p class="hint" style="margin:10px 0 0">
         Cards land as drafts. Nothing is scheduled until you have read it — a wrong
         flashcard is worse than no flashcard, because spaced repetition will drill
@@ -501,6 +551,7 @@ async function loadOverview() {
   renderSubjects(d);
   renderDecks(d);
   renderNotePicker(d);
+  renderFolderPicker(d);
   renderProgress(STATE.stats || d.stats, d.decks, STATE.dial);
   renderGraduation(d.graduation);
   const s = d.stats;
@@ -668,10 +719,11 @@ function showCard() {
 
   $("#csw").style.background = (CATS[CARD.category] || {}).hex || "transparent";
   $("#csubject").textContent = CARD.subject;
+  const KINDLABEL = {cloze: "cloze", mcq: "multiple choice", recall: "type it", explain: "explain it"};
   $("#cflags").innerHTML =
     (CARD.reason === "new" ? `<span class="pill new">new</span> ` : "") +
     (CARD.overdue_days > 0 ? `<span class="pill warn">${CARD.overdue_days}d overdue</span> ` : "") +
-    (CARD.kind === "cloze" ? `<span class="pill">cloze</span>` : "");
+    (KINDLABEL[CARD.kind] ? `<span class="pill">${KINDLABEL[CARD.kind]}</span>` : "");
   $("#cq").innerHTML = md(CARD.question);
 
   $("#ca").classList.add("hide");
@@ -698,10 +750,30 @@ function showCard() {
     $("#workedtext").innerHTML = md(worked.text);
   }
 
-  const recall = $("#recallmode").checked;
+  /* Three shapes share one runner. Which controls appear is decided here and
+     nowhere else, so a card can never show two answer paths at once. */
+  const mcq = CARD.kind === "mcq" && (CARD.options || []).length >= 2;
+  const recall = !mcq && ($("#recallmode").checked || CARD.kind === "recall");
+  const explain = !mcq && CARD.kind === "explain";
+
+  $("#choices").classList.toggle("hide", !mcq);
+  if (mcq) renderChoices();
+
   $("#typedbox").classList.toggle("hide", !recall);
-  $("#revealrow").classList.toggle("hide", recall);
+  $("#revealrow").classList.toggle("hide", recall || mcq);
   if (recall) setTimeout(() => $("#typed").focus(), 30);
+
+  /* Slamecka & Graf's generation effect: producing the account beats reading
+     it, and reading it first is exactly what a reveal button invites. An
+     explain card asks for yours before it will show you anything. */
+  $("#explainfirst").classList.toggle("hide", !explain);
+  $("#explainsaid").value = "";
+  if (explain) {
+    $("#reveal").textContent = "Show the answer anyway";
+    setTimeout(() => $("#explainsaid").focus(), 30);
+  } else {
+    $("#reveal").innerHTML = 'Show answer<kbd style="margin-left:7px">space</kbd>';
+  }
 
   $("#posn").textContent = `${SESSION.i + 1} / ${SESSION.queue.length}`;
   $("#remaining").textContent = `${SESSION.queue.length - SESSION.i - 1} left`;
@@ -724,6 +796,76 @@ async function reveal() {
     $("#revealrow").classList.add("hide");
     $("#typedbox").classList.add("hide");
   } catch (e) { toast("Could not load the answer", e.message, "err"); REVEALED = false; }
+}
+
+function renderChoices() {
+  const letters = "ABCDEFG";
+  $("#choices").innerHTML = (CARD.options || []).map((o, i) =>
+    `<button data-opt="${esc(o)}"><span class="mark">${letters[i] || "•"}</span>${esc(o)}</button>`
+  ).join("");
+}
+
+$("#choices").addEventListener("click", e => {
+  const b = e.target.closest("button[data-opt]");
+  if (b && !REVEALED) pickChoice(b.dataset.opt);
+});
+
+/* Marking and grading stay separate here for the same reason they are
+   separate for a typed answer: the app says what it thinks, and lj still
+   decides what the card was worth. The difference is that a choice card is
+   marked by string comparison, so this path needs no model at all and works
+   exactly the same with Ollama closed. */
+async function pickChoice(picked) {
+  if (!CARD || REVEALED) return;
+  CARD.typed = picked;
+  CARD.picked_choice = true;
+  $$("#choices button").forEach(b => b.disabled = true);
+  try {
+    const m = await api(`/api/study/${CARD.note_id}/${CARD.id}/mark`,
+      {method: "POST", body: JSON.stringify({typed: picked})});
+    $$("#choices button").forEach(b => {
+      const isPick = b.dataset.opt === picked;
+      const isRight = m.answer && b.dataset.opt.trim() === String(m.answer).trim();
+      if (isPick) b.classList.add("picked", m.correct ? "hit" : "miss");
+      if (isRight && !m.correct) b.classList.add("wasright");
+    });
+    const box = $("#markresult");
+    box.className = "marking " + (m.correct ? "hit" : "miss");
+    box.innerHTML = `<div>${esc(m.feedback || (m.correct ? "Correct." : "Not quite."))}</div>` +
+      `<div class="score" style="margin-top:5px">suggested <b>${["", "Again", "Hard", "Good", "Easy"][m.grade]}</b> — recognising it is not the same as recalling it, so take the grade or overrule it.</div>`;
+    box.classList.remove("hide");
+    await reveal();
+  } catch (e) {
+    toast("Could not mark that", e.message, "err");
+    $$("#choices button").forEach(b => b.disabled = false);
+  }
+}
+
+$("#explainskip").addEventListener("click", () => {
+  $("#explainfirst").classList.add("hide");
+  reveal();
+});
+$("#explainsend").addEventListener("click", sendExplainFirst);
+$("#explainsaid").addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); sendExplainFirst(); }
+});
+
+async function sendExplainFirst() {
+  if (!CARD) return;
+  const said = $("#explainsaid").value.trim();
+  $("#explainfirst").classList.add("hide");
+  if (!said) { reveal(); return; }
+  try {
+    const r = await api(`/api/study/${CARD.note_id}/${CARD.id}/why`,
+      {method: "POST", body: JSON.stringify({said})});
+    const box = $("#markresult");
+    box.className = "marking " + (r.verdict === "sound" ? "hit" : r.verdict === "partial" ? "" : "miss");
+    box.innerHTML =
+      `<div><b>${esc(r.verdict === "sound" ? "That holds up" : r.verdict === "partial" ? "Most of the way" : "Not quite")}</b>` +
+      (r.missing ? ` — ${esc(r.missing)}` : "") + `</div>`;
+    box.classList.remove("hide");
+  } catch (e) { /* the card still gets answered; the marking is a bonus */ }
+  reveal();
 }
 
 function showGrades(intervals) {
@@ -790,7 +932,7 @@ async function grade(g) {
       method: "POST",
       body: JSON.stringify({
         grade: g,
-        mode: CARD.typed !== undefined ? "recall" : "self",
+        mode: CARD.picked_choice ? "choice" : (CARD.typed !== undefined ? "recall" : "self"),
         typed: CARD.typed || "",
         seconds: (Date.now() - SHOWN_AT) / 1000,
         confidence: CONFIDENCE,
@@ -887,12 +1029,93 @@ document.addEventListener("keydown", e => {
     setConfidence({j: "sure", k: "think-so", l: "no-idea"}[e.key]);
     return;
   }
+  /* A, B, C… answer a choice card, and space does nothing on one: there is
+     no answer to reveal until you have committed to an option, and a reveal
+     button that works before you answer is a reveal button that gets pressed
+     before you answer. */
+  if (!typing && !REVEALED && CARD && CARD.kind === "mcq" && (CARD.options || []).length) {
+    const idx = "abcdefg".indexOf(e.key.toLowerCase());
+    if (idx >= 0 && idx < CARD.options.length) {
+      e.preventDefault(); pickChoice(CARD.options[idx]); return;
+    }
+    if (e.key === " ") { e.preventDefault(); return; }
+  }
   if (e.key === " " && !typing && !REVEALED) { e.preventDefault(); reveal(); return; }
   if (typing) return;
   if (PENDING_WHY) return;   // the grade keys must not skip past the prompt
   if (["1", "2", "3", "4"].includes(e.key) && REVEALED) { e.preventDefault(); grade(Number(e.key)); }
   if (e.key === "e" && REVEALED) { e.preventDefault(); explainCard(); }
 });
+
+// -------------------------------------------------------- folder-wide cards
+
+/* The reason the vault has decks for zero of its 67 accounting notes is not
+   that the generator is bad. It is that the only way in is a dropdown, one
+   note at a time. This is the same generator with the loop moved server-side,
+   a budget on it, and a preview so a bulk run is never a surprise. */
+
+function renderFolderPicker(d) {
+  const counts = {};
+  (d.candidates || []).forEach(c => {
+    const parts = (c.folder || "").split("/").filter(Boolean);
+    for (let i = 0; i <= parts.length; i++) {
+      const key = parts.slice(0, i).join("/");
+      counts[key] = (counts[key] || 0) + 1;
+    }
+  });
+  const keys = Object.keys(counts).sort((a, b) =>
+    a.split("/").length - b.split("/").length || a.localeCompare(b));
+  const sel = $("#genfolder");
+  sel.innerHTML = keys.length
+    ? keys.map(k => `<option value="${esc(k)}">${esc(k || "Everything")} — ${counts[k]} note${counts[k] === 1 ? "" : "s"} without cards</option>`).join("")
+    : `<option value="">Every note already has cards</option>`;
+  $("#genfolderbtn").disabled = !keys.length;
+  $("#genpreview").disabled = !keys.length;
+}
+
+async function runFolder(dry) {
+  const folder = $("#genfolder").value;
+  const limit = Number($("#genlimit").value) || 10;
+  const btns = [$("#genfolderbtn"), $("#genpreview")];
+  btns.forEach(b => b.disabled = true);
+  $("#genfolderbtn").textContent = dry ? "Generate" : "Reading the notes…";
+  const box = $("#genresult");
+  box.classList.remove("hide");
+  box.innerHTML = `<p class="hint">${dry ? "Counting…" : "Working through the folder — this takes a while, and it is safe to leave open."}</p>`;
+  try {
+    const r = await api("/api/decks/generate-folder",
+      {method: "POST", body: JSON.stringify({folder, limit, dry_run: dry})});
+    box.innerHTML = renderFolderResult(r, dry);
+    if (!dry) { await loadOverview(); }
+  } catch (e) {
+    box.innerHTML = `<p class="hint" style="color:var(--danger)">${esc(e.message)}</p>`;
+  } finally {
+    btns.forEach(b => b.disabled = false);
+    $("#genfolderbtn").textContent = "Generate";
+  }
+}
+
+function renderFolderResult(r, dry) {
+  const head = dry
+    ? `<b>${r.candidates} note${r.candidates === 1 ? "" : "s"} would get cards</b>`
+    : `<b>${r.generated} draft card${r.generated === 1 ? "" : "s"} from ${r.attempted} note${r.attempted === 1 ? "" : "s"}</b>`;
+  const rows = (r.notes || []).slice(0, 40).map(n =>
+    `<div style="display:flex;gap:10px;font-size:13px;padding:3px 0;border-top:1px solid var(--line)">
+       <span style="flex:1">${esc(n.title)}</span>
+       <span class="sub">${esc(n.folder || "")}</span>
+       <span class="sub" style="min-width:66px;text-align:right">${
+         dry ? n.words + " words" : (n.error ? "failed" : n.cards + " cards")}</span>
+     </div>`).join("");
+  const skipped = (r.skipped || []).length
+    ? `<details style="margin-top:10px"><summary class="hint">${r.skipped.length} skipped</summary>
+       ${r.skipped.slice(0, 40).map(s => `<div class="hint">${esc(s.title)} — ${esc(s.reason)}</div>`).join("")}</details>`
+    : "";
+  return `<p style="margin:0 0 8px">${head}</p>
+          <p class="hint" style="margin:0 0 8px">${esc(r.note || "")}</p>${rows}${skipped}`;
+}
+
+$("#genpreview").addEventListener("click", () => runFolder(true));
+$("#genfolderbtn").addEventListener("click", () => runFolder(false));
 
 // ------------------------------------------------------------------ decks
 function renderNotePicker(d) {

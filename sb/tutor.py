@@ -461,6 +461,32 @@ def grade_recall(question: str, reference: str, typed: str, cfg: Config) -> Grad
     )
 
 
+def grade_choice(card: Card, picked: str) -> Grading:
+    """Mark a multiple-choice answer.
+
+    No model, no overlap heuristic, no ambiguity: the option matches or it
+    does not. That makes this the one grading path that works identically
+    whether or not Ollama is running, which is worth saying out loud — a
+    session made of choice cards is a session an outage cannot degrade.
+
+    The grade is Good rather than Easy on a hit, because recognising the right
+    option among four is not producing it from nothing, and Easy triples the
+    interval. Recognition should not buy a season away from a card.
+    """
+    picked = (picked or "").strip()
+    if not picked:
+        return Grading(0.0, fsrs.AGAIN, "Nothing picked.", graded_by="choice")
+    if card.is_correct_choice(picked):
+        return Grading(1.0, fsrs.GOOD, "Correct.", graded_by="choice")
+    return Grading(
+        0.0,
+        fsrs.AGAIN,
+        f"Not quite — the answer is “{card.correct_option()}”.",
+        missed=card.correct_option(),
+        graded_by="choice",
+    )
+
+
 def score_to_grade(score: float) -> int:
     if score >= 0.95:
         return fsrs.EASY

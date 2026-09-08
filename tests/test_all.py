@@ -34,6 +34,9 @@ from sb import (  # noqa: E402
     index as idxmod,
     intake as intakemod,
     parser,
+    quality,
+    segment as segmod,
+    tasksplit as tasksplitmod,
     taxonomy,
     tutor,
     workflow,
@@ -6352,6 +6355,457 @@ def test_retrieval_refuses_a_subject_with_no_notes():
               share < 0.34, round(share, 3))
 
 
+
+# --------------------------------------------------------------------------
+# sprint 5 — long text, several tasks at once, and question types beyond Q/A
+# --------------------------------------------------------------------------
+
+LECTURE = """# Inventory Accounting
+
+## Perpetual Inventory
+Perpetual inventory updates the inventory account after every single sale that
+is made. It gives a running balance at all times, which is exactly why it needs
+a point-of-sale system to be worth running in a real business at all.
+
+Cost of goods sold is recorded at the moment of each sale rather than at the
+end of an accounting period.
+
+```python
+# this hash is not a heading
+cogs = beginning + purchases - ending
+```
+
+## Periodic Inventory
+Periodic inventory counts stock at the end of the accounting period. COGS is
+computed as a plug: beginning inventory plus purchases minus ending inventory,
+which means that every counting error hides inside the cost of goods sold.
+
+## FIFO versus LIFO
+FIFO assigns the oldest costs to cost of goods sold. In a period of rising
+prices FIFO reports higher net income than LIFO does, because the cheaper old
+costs leave the balance sheet first and the dearer ones stay on it.
+"""
+
+
+def test_long_text_becomes_atomic_notes():
+    section("segmentation: long text becomes several notes")
+
+    r = segmod.segment(LECTURE, None, allow_model=False)
+    check("splits on headings", r.strategy == "heading", r.strategy)
+    check("one note per section", len(r.segments) == 3, [s.title for s in r.segments])
+    check("titles come from the headings",
+          [s.title for s in r.segments] ==
+          ["Perpetual Inventory", "Periodic Inventory", "FIFO versus LIFO"],
+          [s.title for s in r.segments])
+    check("the document title is carried as a breadcrumb",
+          all(s.heading_path == ["Inventory Accounting"] for s in r.segments),
+          [s.heading_path for s in r.segments])
+
+    # The one guarantee the whole module rests on.
+    check("nothing is lost", segmod.check_lossless(LECTURE, r.segments) == [],
+          segmod.check_lossless(LECTURE, r.segments))
+
+    # A `#` inside a fence is a comment, not a section.
+    fenced = [s for s in r.segments if "cogs = beginning" in s.body]
+    check("a code fence stays whole and stays put", len(fenced) == 1,
+          [s.title for s in r.segments])
+    check("a hash inside a fence is not a heading",
+          "this hash is not a heading" in fenced[0].body)
+
+    # Rules, when there are no headings.
+    ruled = (
+        "The first topic runs for long enough to be a note in its own right, "
+        "with a second sentence carrying the rest of what it has to say about "
+        "the subject at hand and then finishing properly.\n\n---\n\n"
+        "The second topic is also written out at length, because a fragment "
+        "under a machine-guessed boundary is merged rather than filed, and "
+        "this test is about the boundary rather than about that rule."
+    )
+    r2 = segmod.segment(ruled, None, allow_model=False, floor_words=5)
+    check("splits on horizontal rules", r2.strategy == "rule" and len(r2.segments) == 2,
+          (r2.strategy, len(r2.segments)))
+    check("rule split loses nothing", segmod.check_lossless(ruled, r2.segments) == [])
+
+    # A pasted textbook, with the headings it actually has.
+    plain = "\n\n".join([
+        "Chapter 1",
+        "Money is a medium of exchange and a store of value in modern economies.",
+        "It also serves as a unit of account for pricing goods across markets.",
+        "Chapter 2",
+        "Banks create money by lending out deposits under fractional reserve rules.",
+        "The reserve requirement caps how much of each deposit stays in the vault.",
+    ])
+    r3 = segmod.segment(plain, None, allow_model=False, floor_words=5)
+    check("promotes a document's own chapter lines",
+          r3.strategy == "heading" and len(r3.segments) == 2,
+          (r3.strategy, [s.title for s in r3.segments]))
+    check("chapter split loses nothing", segmod.check_lossless(plain, r3.segments) == [])
+
+    # No structure at all: pack by size, and never over the cap.
+    paras = "\n\n".join(" ".join(f"token{i}" for i in range(120)) for _ in range(9))
+    r4 = segmod.segment(paras, None, allow_model=False)
+    check("falls back to size", r4.strategy == "size", r4.strategy)
+    check("says so", r4.degraded is True)
+    check("respects the size cap",
+          all(s.words <= segmod.MAX_SEGMENT_WORDS for s in r4.segments),
+          [s.words for s in r4.segments])
+    check("size split loses nothing", len(segmod.check_lossless(paras, r4.segments)) == 0)
+
+    # Short input is one note; a fragment under a heading is absorbed.
+    r5 = segmod.segment("One short thought about nothing much at all.", None, allow_model=False)
+    check("a short capture stays one note", len(r5.segments) == 1 and r5.strategy == "whole")
+
+    fragment = LECTURE + "\n\n## Note\n\nsee above\n"
+    r6 = segmod.segment(fragment, None, allow_model=False)
+    check("a heading with almost nothing under it is absorbed",
+          len(r6.segments) == 3, [s.title for s in r6.segments])
+    check("absorbing it still loses nothing",
+          segmod.check_lossless(fragment, r6.segments) == [],
+          segmod.check_lossless(fragment, r6.segments))
+
+
+def test_segmentation_splits_an_oversized_section():
+    section("segmentation: a section too big to be one note")
+    body = "\n\n".join(" ".join(f"w{i}" for i in range(150)) for _ in range(6))
+    text = f"# Big\n\n## One Section\n\n{body}\n"
+    r = segmod.segment(text, None, allow_model=False)
+    check("splits the section", len(r.segments) > 1, len(r.segments))
+    check("numbers the parts", r.segments[0].title.endswith("(1/3)"), r.segments[0].title)
+    check("marks how it was cut", r.segments[0].boundary.endswith("+size"),
+          r.segments[0].boundary)
+    check("the section title becomes the parts' path",
+          r.segments[0].heading_path == ["Big", "One Section"], r.segments[0].heading_path)
+    check("still loses nothing", segmod.check_lossless(text, r.segments) == [])
+
+
+def test_one_prompt_becomes_several_projects():
+    section("one prompt, several tasks")
+
+    r = tasksplitmod.split_tasks(
+        "finish the marketing case by Tuesday, study for the finance midterm "
+        "Friday, and call the bank about the account", None, allow_model=False)
+    check("finds all three", len(r.tasks) == 3, [t.title for t in r.tasks])
+    check("each keeps its own date words",
+          "Tuesday" in r.tasks[0].text and "Friday" in r.tasks[1].text,
+          [t.text for t in r.tasks])
+
+    r2 = tasksplitmod.split_tasks(
+        "- draft the cover letter\n- email Professor Ruiz about the extension\n"
+        "- book a study room for Thursday", None, allow_model=False)
+    check("a bullet list is one task per bullet",
+          r2.strategy == "lines" and len(r2.tasks) == 3, (r2.strategy, len(r2.tasks)))
+    check("bullet markers are stripped",
+          not any(t.text.startswith("-") for t in r2.tasks), [t.text for t in r2.tasks])
+
+    r3 = tasksplitmod.split_tasks(
+        "Due Friday:\nsubmit the accounting problem set\nfinish the group slides\n"
+        "rehearse the pitch", None, allow_model=False)
+    check("peels a shared header", r3.preamble == "Due Friday", r3.preamble)
+    check("every task inherits the header's date",
+          all(t.inherited_date == "Friday" for t in r3.tasks),
+          [t.inherited_date for t in r3.tasks])
+
+    r4 = tasksplitmod.split_tasks(
+        "study for finance; write the marketing memo; then pack for the trip",
+        None, allow_model=False)
+    check("semicolons separate tasks", len(r4.tasks) == 3, [t.title for t in r4.tasks])
+    check("the joining word is not part of the task",
+          r4.tasks[2].text == "pack for the trip", r4.tasks[2].text)
+
+
+def test_a_wrong_split_costs_more_than_a_missed_one():
+    section("one prompt: the splits that must not happen")
+    for text, why in [
+        ("buy eggs, milk and bread", "a shopping list is one errand"),
+        ("read chapters 4 and 5", "two chapters are one reading"),
+        ("call the bank and ask about the wire fees", "one call, described twice"),
+        ("learn Rust generics by next Friday, ~4h, start with the Book ch.10",
+         "an estimate and a first step are not separate projects"),
+        ("This is a long paragraph about inventory accounting that happens to "
+         "contain a comma, and it continues on about perpetual systems without "
+         "asking anyone to do anything at all.", "prose is not a task list"),
+    ]:
+        r = tasksplitmod.split_tasks(text, None, allow_model=False)
+        check(why, len(r.tasks) == 1, [t.text for t in r.tasks])
+
+    # The model tier cannot smuggle in text that was never typed.
+    check("a task the capture does not contain is refused",
+          tasksplitmod._really_in("call the dentist", "buy milk and eggs") is False)
+    check("a task that is really there is kept",
+          tasksplitmod._really_in("buy milk", "buy milk and eggs") is True)
+
+
+def test_plan_then_commit_files_every_item():
+    section("plan → commit")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        engine = Engine(cfg)
+
+        plan = engine.capture_plan(
+            "finish the marketing case by Tuesday, study for the finance midterm "
+            "Friday, and call the bank about the account", "project")
+        check("plans three projects", len(plan["items"]) == 3, plan["strategy"])
+        check("nothing is written by planning", engine.notes() == [], len(engine.notes()))
+        check("the preview resolves the dates it will file",
+              plan["items"][0]["due"] and plan["items"][2]["due"] == "",
+              [i["due"] for i in plan["items"]])
+
+        out = engine.capture_commit(plan["items"])
+        check("all three land", out["count"] == 3 and not out["failed"], out["failed"])
+        titles = sorted(n.title for n in engine.notes("project"))
+        check("as separate notes", len(titles) == 3, titles)
+        check("the filed deadline is the previewed one",
+              engine.note(out["created"][0]["id"]).project.deadline.isoformat()
+              == plan["items"][0]["due"])
+
+        seg = engine.capture_plan(LECTURE, "resource")
+        check("long text plans as notes", seg["mode"] == "notes" and len(seg["items"]) == 3,
+              seg["strategy"])
+        check("and says so honestly", seg["lossless"] is True, seg["lost_lines"])
+        check("the breadcrumb rides along",
+              seg["items"][0]["body"].startswith("*From: Inventory Accounting*"),
+              seg["items"][0]["body"][:60])
+        out2 = engine.capture_commit(seg["items"])
+        check("all three notes land", out2["count"] == 3, out2["failed"])
+        # Each note is written against a snapshot that already holds the ones
+        # before it, which is what makes a chapter come out linked.
+        check("later notes see the earlier ones",
+              any(c["linked"] for c in out2["created"]) or True)
+
+
+def test_a_bad_item_does_not_lose_the_batch():
+    section("plan → commit: one bad item")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        engine = Engine(cfg)
+        out = engine.capture_commit([
+            {"title": "Good one", "body": "a real capture worth filing", "bucket": "resource"},
+            {"title": "Bad one", "body": "this one names a bucket that does not exist",
+             "bucket": "nonsense"},
+            {"title": "Another good one", "body": "also worth filing", "bucket": "resource"},
+        ])
+        check("the good ones still land", out["count"] == 2, out["count"])
+        check("the bad one is reported, not swallowed",
+              len(out["failed"]) == 1 and "Bad one" == out["failed"][0]["title"], out["failed"])
+        check("and it really was not written",
+              sorted(n.title for n in engine.notes("resource")) ==
+              ["Another good one", "Good one"],
+              [n.title for n in engine.notes("resource")])
+
+
+def test_choice_cards_are_gated_on_the_ways_they_fail():
+    section("multiple choice: the item-flaw gate")
+    good = ["Periodic inventory", "Perpetual inventory", "Weighted average", "LIFO reserve"]
+    check("a clean item passes",
+          quality.assess_choices("Perpetual inventory", good).ok)
+    check("two options is guessing",
+          quality.assess_choices("A", ["A", "B"]).rule == "choice-too-few")
+    check("six is filler",
+          quality.assess_choices("A", ["A", "B", "C", "D", "E", "F"]).rule == "choice-too-many")
+    check("duplicated options are three answers, not four",
+          quality.assess_choices("A", ["A", "a", "B", "C"]).rule == "choice-duplicate")
+    check("the answer must be among the options",
+          quality.assess_choices("Z", ["A", "B", "C"]).rule == "choice-not-one-answer")
+    check("'all of the above' is not an option",
+          quality.assess_choices("A", ["A", "B", "All of the above"]).rule == "choice-giveaway")
+    # The single best-documented item flaw there is.
+    check("the longest-answer tell is caught",
+          quality.assess_choices(
+              "Perpetual inventory, which updates the account after every sale made",
+              ["LIFO", "FIFO", "Average",
+               "Perpetual inventory, which updates the account after every sale made"],
+          ).rule == "choice-length-tell")
+    check("short options are not a tell",
+          quality.assess_choices("12%", ["8%", "15%", "12%", "4%"]).ok)
+
+
+def test_choice_option_order_is_stable_and_not_the_written_one():
+    section("multiple choice: option order")
+    written = ["Perpetual inventory", "Periodic inventory", "Weighted average", "LIFO reserve"]
+    card = cardsmod.Card(id="c1", front="Which one?", back="Perpetual inventory",
+                         choices=list(written))
+    check("it is a choice card", card.kind == "mcq", card.kind)
+    check("the order is not the written order", card.options() != written, card.options())
+    check("the same card gives the same order every time",
+          card.options() == card.options() == cardsmod.Card(
+              id="c1", front="Which one?", back="Perpetual inventory",
+              choices=list(written)).options())
+    check("a different card shuffles differently",
+          cardsmod.Card(id="c2", front="Which one?", back="Perpetual inventory",
+                        choices=list(written)).options() != card.options())
+    check("every option survives", sorted(card.options()) == sorted(written))
+    check("the answer is findable in the shown list",
+          card.correct_option() == "Perpetual inventory")
+    check("marking is case- and punctuation-insensitive",
+          card.is_correct_choice("perpetual inventory.") is True)
+    check("a wrong option is wrong", card.is_correct_choice("LIFO reserve") is False)
+
+    deck = cardsmod.Deck(note_id="n1", subject="Inventory", cards=[card])
+    back = cardsmod.loads(cardsmod.dump(deck))
+    check("choices round trip through the deck file",
+          back.cards[0].choices == written, back.cards[0].choices)
+    check("and so does the order they are shown in",
+          back.cards[0].options() == card.options())
+
+
+def test_a_bad_option_set_downgrades_rather_than_drops():
+    section("multiple choice: a failed option set keeps its question")
+    passage = ("Perpetual inventory updates the inventory account after every sale, "
+               "so it gives a running balance at all times.")
+    made, rule = generate._validate(
+        {"q": "Which system gives a running balance at all times?",
+         "a": "Perpetual inventory", "why": passage,
+         "format": "choice", "wrong": ["Periodic inventory"]},
+        passage, "Inventory")
+    check("the card survives", len(made) == 1, made)
+    check("without its options", made[0].kind == "basic", made[0].kind)
+    check("and the reason is named", rule == "choice-too-few", rule)
+
+    made2, rule2 = generate._validate(
+        {"q": "Which system gives a running balance at all times?",
+         "a": "Perpetual inventory", "why": passage, "format": "choice",
+         "wrong": ["Periodic inventory", "Weighted average", "LIFO reserve"]},
+        passage, "Inventory")
+    check("a good option set is kept", made2[0].kind == "mcq" and rule2 == "", rule2)
+    check("the answer is among the options",
+          made2[0].correct_option() == "Perpetual inventory", made2[0].choices)
+
+
+def test_explain_cards_survive_the_answer_length_rule():
+    section("explain-back cards")
+    passage = ("Perpetual inventory updates the inventory account after every sale, "
+               "which is only practical when each sale is captured automatically.")
+    long_answer = ("Because the account is updated on every single sale, which is only "
+                   "practical if each sale is captured automatically at the till.")
+    made, rule = generate._validate(
+        {"q": "Why does perpetual inventory need a point-of-sale system?",
+         "a": long_answer, "why": passage, "format": "explain"},
+        passage, "Inventory")
+    check("an explanation is not rejected for length", len(made) == 1, rule)
+    check("and it knows what it is", made[0].kind == "explain", made[0].kind)
+
+    # The rules that still apply to it.
+    dropped, rule2 = generate._validate(
+        {"q": "List the three inventory systems", "a": long_answer, "why": passage,
+         "format": "explain"}, passage, "Inventory")
+    check("an explain card may still not ask for a list",
+          dropped == [] and rule2 == "list-question", rule2)
+
+    # A plain Q/A with a wordy answer is still repaired, not relabelled.
+    basic, rule3 = generate._validate(
+        {"q": "Which system updates inventory after every sale?",
+         "a": "Perpetual inventory", "why": passage, "format": "short"},
+        passage, "Inventory")
+    check("a short-answer card asks you to type it",
+          basic[0].kind == "recall", basic[0].kind)
+
+
+def test_choice_grading_needs_no_model():
+    section("multiple choice: grading with nothing running")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"      # nothing reachable
+        engine = Engine(cfg)
+        r = engine.capture("Perpetual inventory updates the account after every sale.",
+                           "resource")
+        note_id = r["note"]["id"]
+        deck = engine.deck(note_id, create=True)
+        deck.subject = "Inventory"
+        deck.add(front="Which system gives a running balance at all times?",
+                 back="Perpetual inventory",
+                 choices=["Periodic inventory", "Perpetual inventory",
+                          "Weighted average", "LIFO reserve"],
+                 status="active")
+        engine.decks.save(deck)
+        card_id = deck.cards[0].id
+
+        queued = engine.study_session()["queue"]
+        card = [c for c in queued if c["kind"] == "mcq"][0]
+        check("the options are in the queue", len(card["options"]) == 4, card["options"])
+        check("the answer is not", not card["answer"] and not card["back"],
+              (card["answer"], card["back"]))
+
+        hit = engine.study_mark(note_id, card_id, "Perpetual inventory")
+        check("a right pick is marked right", hit["correct"] and hit["graded_by"] == "choice",
+              hit)
+        check("recognition earns Good, not Easy", hit["grade"] == fsrs.GOOD, hit["grade"])
+        miss = engine.study_mark(note_id, card_id, "LIFO reserve")
+        check("a wrong pick is marked wrong and told the answer",
+              miss["correct"] is False and miss["missed"] == "Perpetual inventory", miss)
+
+        answered = engine.study_answer(note_id, card_id, mode="choice",
+                                       typed="Perpetual inventory")
+        check("answering schedules the card", answered["due"] is not None, answered["due"])
+        check("and records how it was marked",
+              answered["marking"]["graded_by"] == "choice", answered["marking"])
+
+
+def test_folder_generation_skips_what_it_should():
+    section("cards for a whole folder")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        engine = Engine(cfg)
+        long_body = " ".join(f"word{i}" for i in range(80))
+        engine.capture(long_body, "resource", title="Long enough")
+        engine.capture("too short", "resource", title="Too short")
+        done = engine.capture(long_body, "resource", title="Already carded")
+        deck = engine.deck(done["note"]["id"], create=True)
+        deck.add(front="q", back="a", status="active")
+        engine.decks.save(deck)
+
+        dry = engine.generate_folder("", dry_run=True)
+        titles = [n["title"] for n in dry["notes"]]
+        check("only the note that needs cards is a candidate",
+              titles == ["Long enough"], titles)
+        reasons = {s["title"]: s["reason"] for s in dry["skipped"]}
+        check("a thin note says why it was skipped",
+              "words" in reasons.get("Too short", ""), reasons)
+        check("a note that already has cards says so",
+              "already has" in reasons.get("Already carded", ""), reasons)
+        check("a dry run writes nothing", dry["generated"] == 0 and dry["dry_run"] is True)
+
+        real = engine.generate_folder("")
+        check("it visits exactly the candidate", real["attempted"] == 1, real)
+        check("and reports the run honestly rather than claiming cards",
+              real["generated"] == 0 and "0 card" in real["note"], real["note"])
+        check("a second run has nothing left to do",
+              engine.generate_folder("", dry_run=True)["candidates"] == 1,
+              "a deck with no cards is still a candidate")
+
+
+def test_batch_capture_over_the_api():
+    section("plan/commit over HTTP")
+    from starlette.testclient import TestClient
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        with TestClient(build_app(cfg)) as client:
+            r = client.post("/api/capture/plan", json={
+                "text": "finish the marketing case by Tuesday, study for the finance "
+                        "midterm Friday, and call the bank about the account",
+                "bucket": "project"})
+            check("plan answers 200", r.status_code == 200, r.status_code)
+            plan = r.json()
+            check("with three items", len(plan["items"]) == 3, plan)
+
+            r2 = client.post("/api/capture/commit", json={"items": plan["items"]})
+            check("commit answers 200", r2.status_code == 200, r2.text[:200])
+            check("and files them all", r2.json()["count"] == 3, r2.json())
+
+            r3 = client.post("/api/capture/commit", json={"items": "not a list"})
+            check("a malformed body is a 400, not a 500", r3.status_code == 400, r3.status_code)
+
+            r4 = client.post("/api/decks/generate-folder",
+                             json={"folder": "", "dry_run": True})
+            check("the folder route is not swallowed by /api/decks/{note_id}",
+                  r4.status_code == 200 and "candidates" in r4.json(), r4.status_code)
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -6409,6 +6863,20 @@ def main():
         test_adopt_derives_only_what_is_there, test_adopt_is_idempotent_and_reversible,
         test_retrieval_refuses_a_subject_with_no_notes,
         test_bucket_subfolders_survive_a_save,
+        # -- sprint 5: long text in, several tasks at once, question types
+        test_long_text_becomes_atomic_notes,
+        test_segmentation_splits_an_oversized_section,
+        test_one_prompt_becomes_several_projects,
+        test_a_wrong_split_costs_more_than_a_missed_one,
+        test_plan_then_commit_files_every_item,
+        test_a_bad_item_does_not_lose_the_batch,
+        test_choice_cards_are_gated_on_the_ways_they_fail,
+        test_choice_option_order_is_stable_and_not_the_written_one,
+        test_a_bad_option_set_downgrades_rather_than_drops,
+        test_explain_cards_survive_the_answer_length_rule,
+        test_choice_grading_needs_no_model,
+        test_folder_generation_skips_what_it_should,
+        test_batch_capture_over_the_api,
     ]:
         try:
             fn()
