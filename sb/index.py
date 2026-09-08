@@ -100,6 +100,34 @@ KEYWORD_WEIGHT = 0.15
 #: is a floor that stops nonsense, not a precision dial.
 KEYWORD_FLOOR = 0.34
 
+#: The second gate, and a different question from `KEYWORD_FLOOR`.
+#:
+#: `KEYWORD_FLOOR` asks "of the part of this question the vault could match,
+#: how much does this passage cover?" — which is the right question for
+#: *ranking* and the wrong one for *answering*, because it silently throws
+#: away every word the corpus has never seen. q18 of the accounting set —
+#: "what are the three sections of the statement of cash flows?", a subject lj
+#: has no note on — keeps only "statement" and "cash", so a passage matching
+#: the one word "statement" covered 61% of what was left and came back looking
+#: like an answer.
+#:
+#: This floor measures the same match against the *whole* question, unknown
+#: words included, so it knows how much of what was asked is unanswerable in
+#: principle. Swept over the twenty questions in
+#: `sb/evalsets/accounting_retrieval.json`:
+#:
+#:     bar    hit@1   hit@3    MRR    false positives
+#:     0.15   11/16   15/16    0.802        1/4
+#:     0.18   11/16   15/16    0.802        0/4     <- window opens
+#:     0.20   11/16   15/16    0.802        0/4
+#:     0.22   10/16   13/16    0.708        0/4     <- recall starts to go
+#:
+#: 0.19 sits between the two failure edges. Note what the sweep rules out:
+#: simply counting unknown words at full rarity — the obvious fix — costs four
+#: answerable hits to buy the same one false positive, which is why the
+#: ranking weights still drop them.
+ANSWERABLE_FLOOR = 0.19
+
 STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "is", "are", "it", "that",
     "this", "for", "on", "with", "as", "by", "be", "was", "were", "at", "from",
@@ -493,7 +521,9 @@ class Index:
             return []
 
         term_sets, doc_freq = self._corpus_terms()
-        weights = _query_weights(_terms(question), doc_freq, len(term_sets))
+        terms = set(_terms(question))
+        weights = _query_weights(terms, doc_freq, len(term_sets))
+        answerable = _answerable_share(terms, weights, doc_freq, len(term_sets))
         query_vec = self._embed_query(question) if vectors else None
 
         # One vectorised pass over the whole matrix when the vault is big
@@ -518,6 +548,11 @@ class Index:
         for score, cosine, i in scored:
             if score < floor:
                 break
+            # Ranked by what the vault can match; admitted by how much of the
+            # whole question that actually is. The two differ only when part of
+            # what was asked is about something there is no note on.
+            if query_vec is None and score * answerable < ANSWERABLE_FLOOR:
+                continue
             chunk = chunks[i]
             note_id = chunk.get("note_id", "")
             if per_note_count.get(note_id, 0) >= per_note:
@@ -670,6 +705,26 @@ def _query_weights(
             continue
         out[term] = math.log((n + 1) / (df + 1)) + 1.0
     return out
+
+
+def _answerable_share(
+    terms: Iterable[str],
+    weights: Dict[str, float],
+    doc_freq: Dict[str, int],
+    passages: int,
+) -> float:
+    """What fraction of the question's weight the corpus can match at all.
+
+    1.0 when every word of the question appears somewhere in the vault, and it
+    falls as the question reaches for subjects there is no note on. Multiplied
+    into a passage's score it converts "share of the findable part" into
+    "share of what was asked" — see `ANSWERABLE_FLOOR`.
+    """
+    n = max(1, int(passages))
+    unseen = math.log((n + 1) / 1.0) + 1.0
+    known = sum(weights.values())
+    whole = known + sum(unseen for t in set(terms) if not doc_freq.get(t, 0))
+    return (known / whole) if whole else 0.0
 
 
 def _keyword_score(weights: Dict[str, float], found: Iterable[str]) -> float:

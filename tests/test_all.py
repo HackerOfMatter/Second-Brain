@@ -6309,6 +6309,49 @@ def test_bucket_subfolders_survive_a_save():
               moved.parent == vault.dir_for(Bucket.ARCHIVE), moved)
 
 
+def test_retrieval_refuses_a_subject_with_no_notes():
+    """A question the vault has no note on must come back empty (K2).
+
+    The failure this guards is specific: dropping unknown query words from the
+    ranking meant a question reduced to the words lj *had* written, so one
+    common word could cover most of what was left and look like an answer.
+    """
+    section("retrieval says nothing rather than matching one common word")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        vault = Vault(Path(tmp) / "v")
+        vault.ensure_structure()
+        for title, body in [
+            ("Shrinkage", "Shrinkage is inventory lost to theft, damage and error."),
+            ("Income Statement", "The income statement reports revenue less expenses."),
+            ("Cash Discount", "A cash discount rewards paying an invoice early."),
+            ("Petty Cash", "Petty cash is a small fund of cash kept for minor costs."),
+        ]:
+            vault.save(Note.capture(body, Bucket.RESOURCE, title=title))
+
+        cfg = Config(vault=vault.root)
+        ix = idxmod.Index(cfg)
+        ix.build([n for _, n in vault.notes()])
+
+        hits = ix.search("what is shrinkage and what causes it?")
+        check("a question the notes do answer still comes back",
+              hits and hits[0]["note_id"].endswith("shrinkage"),
+              hits[0]["note_id"] if hits else "nothing")
+
+        empty = ix.search("what are the three sections of the statement of cash flows?")
+        check("a subject with no note comes back empty, not with the 'cash' notes",
+              empty == [], [h["note_id"] for h in empty])
+
+        share = idxmod._answerable_share(
+            set(idxmod._terms("what are the three sections of the statement of cash flows?")),
+            {"statement": 4.33, "cash": 2.72},
+            {"statement": 3, "cash": 19},
+            111,
+        )
+        check("and the share of that question the corpus can reach is under a third",
+              share < 0.34, round(share, 3))
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -6364,6 +6407,7 @@ def main():
         test_today_screen, test_inbox_zero_flow, test_progress_panel_is_streak_free,
         # -- sprint 4: adopting the notes lj already wrote
         test_adopt_derives_only_what_is_there, test_adopt_is_idempotent_and_reversible,
+        test_retrieval_refuses_a_subject_with_no_notes,
         test_bucket_subfolders_survive_a_save,
     ]:
         try:
