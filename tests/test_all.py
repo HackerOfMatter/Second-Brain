@@ -4995,6 +4995,80 @@ def test_intake_api():
             check("and that nothing is left waiting", h["drop"]["waiting"] == 0, h["drop"])
 
 
+def test_drop_upload():
+    """Files dragged onto the dashboard land in Drop/ and get filed.
+
+    The folder was always the interface; this only removes the requirement
+    that lj be at this machine's Explorer window to use it. So the test that
+    matters is that an uploaded file is *indistinguishable* afterwards from a
+    copied one: same folder, same classifier, same `_filed/` original.
+    """
+    section("drop folder: dragged onto the page")
+    import base64
+
+    from starlette.testclient import TestClient
+
+    from sb import intake as intakemod
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.use_model = False
+        cfg.intake.watch = False
+        app = build_app(cfg)
+        with TestClient(app) as client:
+            def upload(*files):
+                return client.post("/api/drop/upload", json={"files": [
+                    {"name": n, "data": base64.b64encode(d.encode()).decode()}
+                    for n, d in files
+                ]})
+
+            r = upload(("essay.md", "Submit the WWII essay by 2026-09-04.\n- [ ] outline\n- [ ] draft\n"))
+            check("an uploaded file is accepted", r.status_code == 200, r.text)
+            out = r.json()
+            check("it says what it saved", [f["file"] for f in out["saved"]] == ["essay.md"], out)
+
+            # The settle wait exists for a file Word is still writing. These
+            # bytes arrived whole in one request, so waiting five seconds to
+            # file them would read as the feature not working.
+            check("and files it in the same request", out["intake"]["filed"] == 1, out["intake"])
+            check("the original is kept",
+                  list((cfg.drop_dir / intakemod.FILED_DIR).glob("essay--*.md")))
+            check("and is gone from the top level", not (cfg.drop_dir / "essay.md").exists())
+
+            # One bad file is a report, and the rest still land.
+            r = upload(("notes.txt", "Read this for reference later."),
+                       ("clip.mp4", "not really a video"))
+            out = r.json()
+            check("the good file still lands", [f["file"] for f in out["saved"]] == ["notes.txt"], out)
+            check("and the bad one is reported, not swallowed",
+                  len(out["rejected"]) == 1 and "mp4" in out["rejected"][0]["error"], out)
+            check("the refused file was never written",
+                  not any(cfg.drop_dir.glob("clip*")), list(cfg.drop_dir.iterdir()))
+
+            # A name from a JSON body is a name from whatever felt like
+            # sending it. `../` must not become a path.
+            r = upload(("../../config.yaml", "host: evil"))
+            check("a traversing name is refused on its extension",
+                  r.json()["rejected"] and not (Path(tmp) / "config.yaml").exists(), r.json())
+            r = upload(("../../notes.md", "Reference material about nothing much."))
+            check("a traversing name that IS readable keeps only its basename",
+                  [f["file"] for f in r.json()["saved"]] == ["notes.md"], r.json())
+            check("and never escaped the vault", not (Path(tmp) / "notes.md").exists())
+            check("it landed inside Drop/ like any other file",
+                  list((cfg.drop_dir / intakemod.FILED_DIR).glob("notes--*.md")))
+
+            check("two files with one name do not overwrite each other",
+                  intakemod.safe_drop_name("a/b/../c.md") == "c.md",
+                  intakemod.safe_drop_name("a/b/../c.md"))
+
+            r = client.post("/api/drop/upload", json={"files": []})
+            check("an empty upload is a 400, not a 500", r.status_code == 400, r.status_code)
+            r = client.post("/api/drop/upload", json={"files": [{"name": "x.md", "data": "!!!!"}]})
+            check("junk base64 is a 400, not a 500", r.status_code == 400, r.status_code)
+
+
 # --------------------------------------------------------------------------
 # Sprint 3, lane J — background failures, the weekly report, and honest
 # degradation. See sb/incidents.py, sb/jobqueue.py, and the docstring on

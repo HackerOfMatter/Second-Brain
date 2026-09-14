@@ -455,7 +455,61 @@ class Engine:
 
     # -- the Drop folder (sb/intake.py) --------------------------------------
 
-    def intake(self, dry_run: bool = False, limit: Optional[int] = None) -> Dict[str, Any]:
+    def accept_uploads(
+        self, files: List[Tuple[str, bytes]], *, run: bool = True
+    ) -> Dict[str, Any]:
+        """Files handed over by the browser, written into Drop/ and filed.
+
+        The Drop folder was always the interface and stays the interface —
+        this only removes the requirement that lj be standing in front of
+        *this* machine's Explorer window to use it. A file that arrives here
+        lands in the same folder, gets read by the same reader and classified
+        by the same rules; nothing downstream can tell the difference, which
+        is the point.
+
+        `settle_seconds=0` on the run afterwards is safe here and nowhere
+        else: the settle wait exists because a file Word is still writing is
+        not a file yet, and these bytes arrived whole in one request. Waiting
+        five seconds to file something lj just dropped into the page would
+        read as the feature not working.
+
+        One bad file is reported and the rest still land — the same rule the
+        bulk capture commit follows, for the same reason.
+        """
+        drop = self.ensure_drop_folder()
+        saved: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
+        if len(files) > intakemod.MAX_UPLOAD_FILES:
+            raise ValueError(
+                f"{len(files)} files at once — the limit is "
+                f"{intakemod.MAX_UPLOAD_FILES}. Drop them in a few batches."
+            )
+        for name, data in files:
+            try:
+                path = intakemod.accept_upload(drop, name, data)
+            except ValueError as exc:
+                rejected.append({"file": str(name), "error": str(exc)})
+                continue
+            except Exception as exc:  # noqa: BLE001 — a bad file is a report
+                rejected.append({"file": str(name), "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            saved.append({"file": path.name, "bytes": len(data)})
+            self.vault.log_line("intake", f"uploaded  {path.name}  {len(data)} bytes")
+        out: Dict[str, Any] = {
+            "saved": saved,
+            "rejected": rejected,
+            "folder": str(drop),
+        }
+        if run and saved:
+            out["intake"] = self.intake(settle_seconds=0.0)
+        return out
+
+    def intake(
+        self,
+        dry_run: bool = False,
+        limit: Optional[int] = None,
+        settle_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Read everything in Drop/, classify it, and file what it is sure of.
 
         One vault read for the whole run rather than one per file: the planner
@@ -471,14 +525,22 @@ class Engine:
                 "busy": True, "folder": str(self.cfg.drop_dir), "results": [],
             }
         try:
-            return self._intake(dry_run, limit)
+            return self._intake(dry_run, limit, settle_seconds)
         finally:
             self._intake_lock.release()
 
-    def _intake(self, dry_run: bool, limit: Optional[int]) -> Dict[str, Any]:
+    def _intake(
+        self,
+        dry_run: bool,
+        limit: Optional[int],
+        settle_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
         drop = self.cfg.drop_dir
         self.ensure_drop_folder()
-        found = intakemod.candidates(drop, self.cfg.intake.settle_seconds)
+        settle = (
+            self.cfg.intake.settle_seconds if settle_seconds is None else settle_seconds
+        )
+        found = intakemod.candidates(drop, settle)
         cap = limit if limit is not None else self.cfg.intake.max_per_run
         pending = found[: max(0, int(cap))]
 

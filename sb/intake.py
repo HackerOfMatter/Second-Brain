@@ -73,6 +73,13 @@ AUTO_FLOOR = 0.6
 #: Wait until it has been still for this long before touching it.
 SETTLE_SECONDS = 5.0
 
+#: A browser upload is held to the same scale a dropped note is. Far past any
+#: note anyone writes, far short of anything that would stall the box while it
+#: is base64'd through a JSON body. Enforced server-side as well as in the UI,
+#: because the UI is not the only thing that can POST.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_FILES = 50
+
 
 # --------------------------------------------------------------------------
 # reading what was dropped
@@ -279,6 +286,68 @@ def candidates(drop: Path, settle_seconds: float = SETTLE_SECONDS) -> List[Path]
             continue
         out.append(path)
     return out
+
+
+#: Everything Windows forbids in a filename, plus the Obsidian-hostile few.
+_UNSAFE_NAME = re.compile(r'[\\/:*?"<>|#^\[\]\x00-\x1f]')
+
+
+def safe_drop_name(name: str) -> str:
+    """A filename from a browser, made safe to write into Drop/.
+
+    The name arrives from a JSON body, which means it arrives from whatever
+    the caller felt like sending. `../../config.yaml` must not become a path,
+    and a name Windows refuses must not turn a dropped file into a 500. So:
+    the basename only, separators stripped rather than interpreted, and a
+    fallback name when nothing usable is left — dropping a file with an
+    unprintable name should cost the name, not the file.
+    """
+    base = str(name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    base = _UNSAFE_NAME.sub("", base).strip().strip(".")
+    if not base:
+        base = "dropped"
+    suffix = Path(base).suffix.lower()
+    stem = Path(base).stem[:80] or "dropped"
+    return f"{stem}{suffix}"
+
+
+def accept_upload(drop: Path, name: str, data: bytes) -> Path:
+    """Write one uploaded file into Drop/, as if it had been copied there.
+
+    This is the whole of what the browser adds: the folder remains the
+    interface, the classifier is untouched, and a file that arrives this way
+    is indistinguishable afterwards from one lj dragged into the folder in
+    Explorer. Nothing here decides anything about the note — that is still
+    `classify()`'s job on the next intake pass.
+
+    Unsupported types are refused *here*, before the bytes land, rather than
+    being written and then swept into `_problem/`: a file the system will
+    never read should not end up sitting in the vault as litter, and the
+    browser can say so while lj is still looking at the drop zone.
+    """
+    drop = Path(drop)
+    safe = safe_drop_name(name)
+    suffix = Path(safe).suffix.lower()
+    if suffix not in SUPPORTED:
+        raise ValueError(
+            f"{safe}: unsupported file type {suffix or '(none)'} — "
+            f"Drop reads {', '.join(sorted(SUPPORTED))}"
+        )
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"{safe}: {len(data) // (1024 * 1024)} MB is past the "
+            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit"
+        )
+    if not data.strip():
+        raise ValueError(f"{safe}: the file is empty")
+    drop.mkdir(parents=True, exist_ok=True)
+    target = drop / safe
+    n = 2
+    while target.exists():
+        target = drop / f"{Path(safe).stem} ({n}){suffix}"
+        n += 1
+    target.write_bytes(data)
+    return target
 
 
 def file_away(path: Path, drop: Path, sub: str) -> Path:

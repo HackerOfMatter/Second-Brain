@@ -14,6 +14,7 @@ signatures are shaped so a later swap is mechanical.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import traceback
@@ -614,6 +615,33 @@ def build_app(cfg: Config | None = None) -> Starlette:
         ))
 
     @guard
+    async def drop_upload(request: Request):
+        """Files dragged onto the dashboard, written into Drop/ and filed.
+
+        base64 in a JSON body rather than multipart: Starlette's form parser
+        needs `python-multipart`, and a sixth package for one route is a bad
+        trade against a transport the standard library already speaks on both
+        ends. Over loopback the ~33% encoding overhead costs nothing
+        measurable, and the 25 MB per-file cap in `intake.accept_upload`
+        keeps the whole body inside what a JSON parse should ever hold.
+        """
+        body = await body_of(request)
+        raw = body.get("files")
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("files must be a non-empty list")
+        files: list[tuple[str, bytes]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("each file must be an object with name and data")
+            name = str(item.get("name") or "")
+            try:
+                data = base64.b64decode(str(item.get("data") or ""), validate=True)
+            except Exception:
+                raise ValueError(f"{name or 'a file'}: the upload was not valid base64")
+            files.append((name, data))
+        return ok(await run_in_threadpool(engine.accept_uploads, files))
+
+    @guard
     async def classify(request: Request):
         body = await body_of(request)
         return ok(await run_in_threadpool(
@@ -720,6 +748,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/categories", categories),
         # -- the Drop folder
         Route("/api/intake", intake_run, methods=["POST"]),
+        Route("/api/drop/upload", drop_upload, methods=["POST"]),
         # -- tutor
         Route("/study", study_page),
         Route("/review", review_page),
