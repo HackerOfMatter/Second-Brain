@@ -1,0 +1,1 @@
+Descriptive: A constuctive response that lets the sender know whether the reciever understood the message.

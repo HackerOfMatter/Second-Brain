@@ -1,0 +1,1 @@
+ENCODING Converting an idea into words or gestures that will convey meaning.
