@@ -1,0 +1,1 @@
+The ability to share someone else’s feelings is called empathy

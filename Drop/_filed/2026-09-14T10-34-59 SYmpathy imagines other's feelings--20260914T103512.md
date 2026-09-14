@@ -1,0 +1,1 @@
+SYmpathy imagines other's feelings
