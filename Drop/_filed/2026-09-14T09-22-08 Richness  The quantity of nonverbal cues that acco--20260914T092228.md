@@ -1,0 +1,1 @@
+Richness : The quantity of nonverbal cues that accompany spoken messages. See also Leanness.

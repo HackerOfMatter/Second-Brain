@@ -1,0 +1,1 @@
+syncronous: Communication that occurs in real time.

@@ -1,0 +1,1 @@
+Remittance practices. Remittances are seen as the “right” thing to do in many cultures. This is especially true when the family or community helped fund their move to the United States. Even if it puts an individual at financial risk

@@ -1,0 +1,1 @@
+Communication that occurs when there is a time gap between when a message is sent and when it is received.

@@ -1,0 +1,1 @@
+Retirement or emergency funds. In a collectivistic culture, perhaps individuals will focus less on saving for retirement or an emergency fund knowing that their families will be there to support them (

@@ -1,0 +1,1 @@
+uilding self-efficacy is to give frequent positive feedback. It’s easy to pick out failures and mistakes. It’s much harder to catch our clients doing well.

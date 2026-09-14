@@ -1,0 +1,1 @@
+Financial self-efficacy is both the level of confidence one has around financial literacy and tasks, but it also encapsulates one’s perseverance in light of difficulties related to finances

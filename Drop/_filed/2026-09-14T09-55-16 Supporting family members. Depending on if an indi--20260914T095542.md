@@ -1,0 +1,1 @@
+Supporting family members. Depending on if an individual is from an individualistic culture or a collectivistic culture, their financial support of a family member could be either defined as enabling or very normative

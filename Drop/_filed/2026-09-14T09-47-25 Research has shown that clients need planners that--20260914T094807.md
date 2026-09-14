@@ -1,0 +1,1 @@
+Research has shown that clients need planners that believe in the client’s abilities to achieve their goals, create a sense of positive expectancy
