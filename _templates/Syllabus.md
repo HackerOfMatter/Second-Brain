@@ -1,15 +1,17 @@
 ---
-id:
-title:
-bucket:
-created:
-updated:
+id: "{{date:YYYYMMDD}}T{{time:HHmmss}}-syllabus"
+title: "{{title}}"
+bucket: resource
+created: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
+updated: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
 tags:
-source:
-category:
-cycle days:
+  - syllabus
+source: manual
+category: hw
+review:
+  cycle_days: 120
+  next:
 ---
-
 
 # {{title}}
 

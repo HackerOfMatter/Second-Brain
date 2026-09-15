@@ -304,6 +304,8 @@
     <button id="connectbtn" title="Find related notes and link them. Cheap tiers first — the model is only asked about links nothing else could find.">Link notes</button>
     <button id="intakebtn" title="Read the Drop folder and file what's in it. Runs by itself too, while this is open.">File dropped notes<span id="dropbadge"></span></button>
     <button id="addfilesbtn" title="Pick files to file — the same thing as dragging them onto this page, or copying them into Drop/.">Add files…</button>
+    <button id="groupbtn" title="File several notes into one folder at once.">Group file</button>
+    <button id="sessionbtn" title="Open a note-taking session: pick the class and chapter once, and every capture lands there until you close it.">Start session</button>
     <input type="file" id="filepick" multiple accept=".md,.markdown,.txt,.text,.docx" style="display:none">
   </header>
 
@@ -315,6 +317,42 @@
   </div>
 
   <div id="problems" class="hide"></div>
+
+  <!-- The open note-taking session. Hidden entirely when none is open: a
+       permanent "no session" line is one more thing to read past on every
+       load, for the majority of loads that are not in a lecture. -->
+  <div class="capture hide" id="sessionbox" style="padding:10px 14px">
+    <div class="buttons" style="margin:0">
+      <strong id="sessionwhere" style="font-size:14.5px"></strong>
+      <span class="hint" id="sessioncount"></span>
+      <span class="spacer"></span>
+      <button id="sessionend">End session &amp; summarise</button>
+    </div>
+  </div>
+
+  <!-- Filing several notes into one folder. The thing this replaces is
+       opening Obsidian and dragging each note, which is fine for one note
+       and is why forty notes stay where they landed. -->
+  <section id="groupbox" class="plan hide">
+    <header>
+      <h2>File several into a folder</h2>
+      <span class="sub" id="groupcount"></span>
+      <span class="spacer"></span>
+      <button id="groupcancel" class="ghost">Close</button>
+      <button id="groupfile" class="primary">File them</button>
+    </header>
+    <div class="buttons" style="margin:0 0 8px">
+      <input type="search" id="groupfilter" placeholder="Filter by title…" style="flex:1;min-width:200px">
+      <input type="text" id="groupfolder" list="folderlist" placeholder="Folder — “fed tax” finds “Federal Taxation”" style="flex:1;min-width:220px">
+      <datalist id="folderlist"></datalist>
+    </div>
+    <div id="grouplist" style="max-height:340px;overflow-y:auto"></div>
+    <p class="hint" style="margin:8px 0 0">
+      Only the folder changes. A Project stays a Project and keeps its deadline,
+      its steps and its calendar blocks — <code>20-Projects/Federal Taxation</code>
+      and <code>30-Resources/Federal Taxation</code> are two halves of one subject.
+    </p>
+  </section>
 
   <div class="capture">
     <textarea id="capturebox" placeholder="Capture anything — “learn Rust generics by next Friday, ~4h, start with the Book ch.10”"></textarea>
@@ -362,6 +400,18 @@
       Your original files moved to <code>Drop/_filed/</code> — nothing is deleted, so a
       wrong call is always undoable.
     </p>
+  </section>
+
+  <section id="collectedbox" class="hide">
+    <h2>Kept, but not used <span id="collectedcost" class="cost"></span></h2>
+    <p class="hint" style="margin:0 0 10px">
+      Saving a good note produces the feeling of having learned it, and the feeling
+      is not evidence. These are Resources over 40 words, older than two weeks, with
+      nothing written under <code>## In my own words</code> and no card anyone has
+      answered. Oldest first — three ways out of each: restate it, card it, or retire it.
+    </p>
+    <div id="collectedlist"></div>
+    <div id="undefinedlist"></div>
   </section>
 
   <section id="datesbox" class="hide">
@@ -601,6 +651,232 @@ async function runIntake(btn) {
   }
 }
 
+// ---- kept, but not used ----------------------------------------------------
+// See sb/collected.py for what counts as having used a note, and why links
+// and "edited since" deliberately do not.
+
+function renderCollected(out) {
+  const box = $("#collectedbox");
+  if (!out || !out.eligible) { box.classList.add("hide"); return; }
+  box.classList.remove("hide");
+  $("#collectedcost").textContent = out.ratio === null ? ""
+    : `${Math.round(out.ratio * 100)}% used · ${out.collected} outstanding`;
+
+  $("#collectedlist").innerHTML = (out.items || []).length
+    ? (out.items || []).map(n => `
+      <div class="droprow" data-collected="${esc(n.note_id)}">
+        <strong>${esc(n.title)}</strong>
+        ${n.folder ? `<span class="file">${esc(n.folder)}</span>` : ""}
+        <span class="conf">${n.words} words · ${n.age_days} days</span>
+        ${n.has_cards ? `<span class="pill">cards nobody has answered</span>` : ""}
+        <span class="fileacts">
+          <button data-card-note="${esc(n.note_id)}" title="Draft cards from this note. They land as drafts — nothing reaches the scheduler unread.">Make cards</button>
+          <button data-retire-note="${esc(n.note_id)}" title="Move it to 40-Archive/_retired/. Nothing is deleted; it stays searchable and is one drag from being back.">Retire</button>
+        </span>
+      </div>`).join("")
+    : `<p class="empty">${esc(out.sentence)}</p>`;
+
+  const terms = out.undefined_terms || [];
+  $("#undefinedlist").innerHTML = terms.length ? `
+    <h2 style="margin-top:18px">Terms with no definition</h2>
+    <p class="hint" style="margin:0 0 8px">
+      Each one is a card the moment it has a definition. Open it and fill in
+      <code>## Definition</code>.
+    </p>
+    ${terms.map(t => `<div class="droprow"><strong>${esc(t.title)}</strong>
+       <span class="conf">${esc((t.created || "").slice(0, 10))}</span></div>`).join("")}` : "";
+}
+
+document.addEventListener("click", async e => {
+  const card = e.target.closest("[data-card-note]");
+  const retire = e.target.closest("[data-retire-note]");
+  if (!card && !retire) return;
+  const btn = card || retire;
+  const id = btn.dataset.cardNote || btn.dataset.retireNote;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = card ? "Drafting…" : "Retiring…";
+  try {
+    if (card) {
+      const out = await api(`/api/decks/${id}/generate`, {method: "POST"});
+      toast(`${(out.cards || []).length} drafted`,
+            "They are drafts — read them in Study before any of them is scheduled.");
+    } else {
+      await api(`/api/notes/${id}/retire`, {method: "POST",
+                 body: JSON.stringify({reason: "kept but never used"})});
+      toast("Retired", "Moved to 40-Archive/_retired/ — nothing was deleted.");
+    }
+    loadCollected();
+  } catch (err) {
+    toast(card ? "Could not draft cards" : "Could not retire it", err.message, "err");
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+});
+
+async function loadCollected() {
+  // Its own request rather than a key on /api/dashboard: it reads every deck
+  // as well as every note, and the dashboard is the one endpoint that must
+  // not grow another whole-vault pass.
+  try { renderCollected(await api("/api/collected")); }
+  catch (e) { /* a panel, not the page */ }
+}
+
+// ---- filing several notes into one folder ----------------------------------
+// The whole note list is fetched once and filtered here rather than asking the
+// server per keystroke: it is one request for a few hundred titles, and a
+// filter that responds on the keypress is the difference between using this
+// and giving up and opening Obsidian.
+
+let GROUP_NOTES = null;
+const GROUP_PICKED = new Set();
+const GROUP_SHOWN = 60;
+
+async function openGroupFile() {
+  const box = $("#groupbox");
+  if (!box.classList.contains("hide")) { closeGroupFile(); return; }
+  box.classList.remove("hide");
+  try {
+    if (!GROUP_NOTES) GROUP_NOTES = await api("/api/notes");
+    const folders = await api("/api/folders");
+    $("#folderlist").innerHTML = (folders.all || [])
+      .map(f => `<option value="${esc(f)}"></option>`).join("");
+  } catch (e) { toast("Could not load the note list", e.message, "err"); return; }
+  renderGroupList();
+  $("#groupfilter").focus();
+  box.scrollIntoView({behavior: "smooth", block: "nearest"});
+}
+
+function closeGroupFile() {
+  $("#groupbox").classList.add("hide");
+  GROUP_PICKED.clear();
+}
+
+function renderGroupList() {
+  const q = $("#groupfilter").value.trim().toLowerCase();
+  const all = GROUP_NOTES || [];
+  const hits = q ? all.filter(n => n.title.toLowerCase().includes(q)) : all;
+  // Anything already ticked stays visible even when the filter no longer
+  // matches it — a selection that disappears as you type is a selection you
+  // cannot trust, and this box exists to be trusted with forty notes.
+  const shown = hits.slice(0, GROUP_SHOWN);
+  const ids = new Set(shown.map(n => n.id));
+  const pinned = all.filter(n => GROUP_PICKED.has(n.id) && !ids.has(n.id));
+
+  $("#grouplist").innerHTML = pinned.concat(shown).map(n => `
+    <label class="droprow" style="cursor:pointer">
+      <input type="checkbox" data-pick="${esc(n.id)}"${GROUP_PICKED.has(n.id) ? " checked" : ""}>
+      <strong>${esc(n.title)}</strong>
+      ${bucketPill(n.bucket)}
+      ${n.deadline ? duePill(n.deadline) : ""}
+    </label>`).join("") || `<p class="empty">No note matches that.</p>`;
+
+  const more = Math.max(0, hits.length - shown.length);
+  $("#groupcount").textContent =
+    `${GROUP_PICKED.size} selected · ${hits.length} shown${more ? ` (first ${GROUP_SHOWN}; keep typing)` : ""}`;
+}
+
+$("#grouplist").addEventListener("change", e => {
+  const box = e.target.closest("[data-pick]");
+  if (!box) return;
+  if (box.checked) GROUP_PICKED.add(box.dataset.pick);
+  else GROUP_PICKED.delete(box.dataset.pick);
+  renderGroupList();
+});
+
+async function fileGroup(btn) {
+  const folder = $("#groupfolder").value.trim();
+  if (!GROUP_PICKED.size) { toast("Nothing selected", "Tick the notes to file first."); return; }
+  if (!folder) { toast("Which folder?", "Type a folder name — it matches ones you already have."); return; }
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = "Filing…";
+  try {
+    const out = await api("/api/notes/folder", {
+      method: "POST",
+      body: JSON.stringify({note_ids: Array.from(GROUP_PICKED), folder}),
+    });
+    const bad = out.failed || [];
+    toast(`${out.moved.length} filed into ${out.folder}`,
+          [out.matched === "new" ? "That folder did not exist, so it was created." : "",
+           bad.length ? `${bad.length} could not be moved: ${bad.map(f => f.error).join("; ")}` : ""]
+            .filter(Boolean).join(" ") || "Only the folder changed — nothing else about them.",
+          bad.length ? "err" : "");
+    GROUP_PICKED.clear();
+    GROUP_NOTES = null;   // paths changed; the next open re-reads
+    closeGroupFile();
+    load();
+  } catch (e) {
+    toast("Could not file them", e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
+// ---- note-taking sessions --------------------------------------------------
+// The declaration is made once, at the start, and every capture inherits it.
+// The panel exists so the browser agrees with the capture box about what is
+// open — the state itself lives in the engine, not here.
+
+let SESSION = null;
+
+function renderSession(session) {
+  SESSION = session;
+  const box = $("#sessionbox"), btn = $("#sessionbtn");
+  if (!session) {
+    box.classList.add("hide");
+    btn.textContent = "Start session";
+    return;
+  }
+  box.classList.remove("hide");
+  btn.textContent = "Switch session";
+  $("#sessionwhere").textContent = "→ " + session.folder;
+  const bits = [`${session.notes} note${session.notes === 1 ? "" : "s"}`];
+  if (session.terms) bits.push(`${session.terms} term${session.terms === 1 ? "" : "s"}`);
+  $("#sessioncount").textContent = bits.join(" · ") + " so far";
+}
+
+async function startSession() {
+  // The class is *matched* against folders that already exist, so "fed tax"
+  // finds "Federal Taxation" rather than making a fourth spelling of it. The
+  // server says which it did, and "new folder" is the answer worth seeing.
+  const course = prompt("Which class?  (\u201cfed tax\u201d finds \u201cFederal Taxation\u201d)", "");
+  if (course === null || !course.trim()) return;
+  const chapter = prompt("Which chapter or week?  (optional)", "") || "";
+  try {
+    const out = await api("/api/session/start", {
+      method: "POST", body: JSON.stringify({course, chapter}),
+    });
+    renderSession(out.session);
+    toast(`Session: ${out.session.folder}`,
+          out.matched === "new"
+            ? "That folder did not exist, so it was created — check the spelling."
+            : `Matched an existing folder (${out.matched}).`);
+    if (out.closed) load();
+  } catch (e) { toast("Could not start the session", e.message, "err"); }
+}
+
+async function endSession(btn) {
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = "Summarising…";
+  try {
+    const out = await api("/api/session/end", {method: "POST"});
+    renderSession(null);
+    const left = (out.undefined || []).length;
+    toast(`${(out.notes || []).length} notes filed`,
+          left ? `${left} term${left === 1 ? "" : "s"} still need a definition — they are listed in the summary.`
+               : "Summary written into the session folder.");
+    load();
+  } catch (e) {
+    toast("Could not close the session", e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
 // ---- dropping files onto the page ------------------------------------------
 // The folder is still the interface; this only removes the requirement that
 // you be standing in front of *this* machine's Explorer window to use it.
@@ -719,6 +995,14 @@ document.addEventListener("click", async e => {
   const b = e.target.closest("[data-file-note]");
   if (!b) return;
   const bucket = b.dataset.into;
+  // Answering this question is not a move — the note gets parsed, planned,
+  // linked and put on the calendar, and filing a Project also asks the model
+  // for its steps. Several seconds is normal and correct. What is not
+  // acceptable is a row that looks dead while it happens, so the button that
+  // was actually pressed says what it is doing.
+  const label = b.textContent;
+  b.textContent = bucket === "project" ? "Planning…" : "Filing…";
+  b.classList.add("suggested");
   document.querySelectorAll("[data-file-note]").forEach(x => x.disabled = true);
   try {
     const r = await api(`/api/notes/${b.dataset.fileNote}/classify`,
@@ -730,6 +1014,7 @@ document.addEventListener("click", async e => {
     load();
   } catch (err) {
     toast("Could not file it", err.message, "err");
+    b.textContent = label;
     document.querySelectorAll("[data-file-note]").forEach(x => x.disabled = false);
   }
 });
@@ -988,8 +1273,15 @@ function renderProblems(problems) {
 }
 
 async function load() {
+  // Both requests go out at once. They were serial, which meant the footer
+  // waited for the whole dashboard and the page took the sum of two
+  // whole-vault passes rather than the slower one. Neither depends on the
+  // other, and `run_in_threadpool` means the server really does overlap them.
+  const dashboardReq = api("/api/dashboard");
+  const healthReq = api("/api/health").catch(() => null);
+  const sessionReq = api("/api/session").catch(() => null);
   try {
-    const d = await api("/api/dashboard");
+    const d = await dashboardReq;
     $("#vaultpath").textContent = d.vault;
     CATS = Object.fromEntries((d.categories || []).map(c => [c.key, c]));
     renderInbox(d.inbox || []);
@@ -1004,8 +1296,11 @@ async function load() {
     renderStudy(d.study);
     renderCounts(d.counts);
   } catch (e) { toast("Could not load dashboard", e.message, "err"); }
+  renderSession(((await sessionReq) || {}).session || null);
+  loadCollected();
   try {
-    const h = await api("/api/health");
+    const h = await healthReq;
+    if (!h) return;  // the footer is cosmetic; a failed health call is silent
     const on = h.llm.available;
     // A file sitting unfiled in Drop/ is the one bit of state the dashboard
     // cannot show anywhere else — it isn't a note yet.
@@ -1437,6 +1732,12 @@ $("#connectall").addEventListener("click", e =>
 
 $("#intakebtn").addEventListener("click", e => runIntake(e.currentTarget));
 $("#addfilesbtn").addEventListener("click", () => $("#filepick").click());
+$("#sessionbtn").addEventListener("click", startSession);
+$("#groupbtn").addEventListener("click", openGroupFile);
+$("#groupcancel").addEventListener("click", closeGroupFile);
+$("#groupfile").addEventListener("click", e => fileGroup(e.currentTarget));
+$("#groupfilter").addEventListener("input", renderGroupList);
+$("#sessionend").addEventListener("click", e => endSession(e.currentTarget));
 $("#filepick").addEventListener("change", e => {
   uploadFiles(e.target.files);
   e.target.value = "";  // so picking the same file twice in a row still fires

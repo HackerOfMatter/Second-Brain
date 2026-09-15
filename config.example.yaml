@@ -109,6 +109,26 @@ areas:
   schedule_review_minutes: 20
 
 # --------------------------------------------------------------- review ----
+capture:
+  # Where a capture goes when it did not say. The three dashboard buttons
+  # always say; the hotkey box and anything else handing over a bare line of
+  # text do not, and those used to land in 00-Inbox — which is a queue, and a
+  # queue nobody empties is a folder with a worse name.
+  #
+  # This is NOT the Drop folder's auto_floor. A dropped file the classifier is
+  # unsure about still waits in the Inbox with its suggestion, because there
+  # the system has actually formed a doubt. Silence is not doubt.
+  default_bucket: resource      # resource | inbox | area | project
+
+  # Which template shapes a plain capture. Any file in _templates/ works; the
+  # template decides the headings, so editing that file changes what the
+  # system writes without touching any code.
+  #
+  # "Atomic Note" on purpose: every captured note then arrives carrying the
+  # ## In my own words heading, which is the one slot the "Kept, but not used"
+  # panel reads to tell a note you processed from a note you merely saved.
+  default_template: Atomic Note
+
 review:
   resource_cycle_days: 90        # how often a Resource is asked "still needed?"
   habit_checkin_weekday: 6       # 6 = Sunday

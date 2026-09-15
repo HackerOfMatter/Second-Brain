@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import threading
 import unicodedata
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -85,9 +86,48 @@ def slugify(text: str, max_len: int = 60) -> str:
     return text[:max_len].strip("-") or "untitled"
 
 
+#: slug -> the last second stamped onto an id with that slug. See `new_id`.
+#: Bounded: only titles captured in this process are in it, and the oldest
+#: are dropped past the cap, which cannot reintroduce a collision — an
+#: evicted entry is by then far enough in the past that the wall clock has
+#: moved on anyway.
+_issued: "Dict[str, dt.datetime]" = {}
+_ISSUED_MAX = 512
+_id_lock = threading.Lock()
+
+
 def new_id(title: str) -> str:
-    """Stable, sortable, human-readable id: 20260822T093012-learn-rust-generics."""
-    return f"{now().strftime('%Y%m%dT%H%M%S')}-{slugify(title, 40)}"
+    """Stable, sortable, human-readable id: 20260822T093012-learn-rust-generics.
+
+    The stamp is second-resolution, and the id is the stamp plus the title's
+    slug — so two notes with the same title, captured in the same second, used
+    to be *the same id*. That is not a cosmetic clash: `path_for` builds the
+    filename from the same two parts, so the second note overwrote the first
+    on disk, and `find` could not tell them apart afterwards even if it
+    hadn't. Two terms typed quickly into a lecture is exactly that shape of
+    capture, and the loss was silent — no error, anywhere.
+
+    The format is load-bearing (sortable, and `path_for` slices the first 15
+    characters as the filename stamp), so the fix is not to change it but to
+    refuse to issue the same one twice: a repeat advances the stamp by a
+    second. Ids stay unique, sortable and the same shape, and a capture can
+    at worst be stamped a second or two late — which is a price nothing in
+    this system can notice.
+    """
+    slug = slugify(title, 40)
+    with _id_lock:
+        at = now()
+        last = _issued.get(slug)
+        if last is not None and at <= last:
+            # Per slug, not globally: two *different* titles in one second are
+            # already two different ids, and should keep the time they really
+            # happened. Only a repeat of the same title has to move.
+            at = last + dt.timedelta(seconds=1)
+        _issued[slug] = at
+        if len(_issued) > _ISSUED_MAX:
+            for stale in list(_issued)[: len(_issued) - _ISSUED_MAX]:
+                del _issued[stale]
+        return f"{at.strftime('%Y%m%dT%H%M%S')}-{slug}"
 
 
 # --------------------------------------------------------------------------

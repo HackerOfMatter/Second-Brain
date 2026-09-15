@@ -1,1 +1,0 @@
-![[Merchandising Accounting Cycle.png]]

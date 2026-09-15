@@ -45,6 +45,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from pydantic import ValidationError
+
 from . import atomic, frontmatter
 from .models import Bucket, Note
 
@@ -67,6 +69,18 @@ _STAMPED = re.compile(r"--\d{8}T\d{6}$")
 class VaultError(ValueError):
     """Subclasses ValueError so the API layer reports it as a 400, not a 500:
     'no note with that id' is a bad request, not a broken server."""
+
+
+#: "this file is not a note we can read" — every way that can be true.
+#:
+#: `VaultError` is ours (no frontmatter, no id). `UnicodeDecodeError` is a
+#: file that is not text. `pydantic.ValidationError` is frontmatter that is
+#: text and is YAML and still is not a note — `bucket: nonsense`, typed by
+#: hand in Obsidian. That last one used to escape: a single mistyped bucket
+#: anywhere in the vault turned `/api/health` into a 500 and took the whole
+#: dashboard footer with it, which is the opposite of the documented rule
+#: that a file we cannot read is skipped rather than fatal.
+UNREADABLE = (VaultError, ValidationError, UnicodeDecodeError, OSError)
 
 
 #: Frontmatter is YAML, so its values are drawn from a closed set of types.
@@ -254,7 +268,7 @@ class Vault:
         for p in self.iter_paths(bucket):
             try:
                 out.append((p, self.read(p)))
-            except (VaultError, UnicodeDecodeError, OSError):
+            except UNREADABLE:
                 continue
         return out
 
@@ -359,7 +373,7 @@ class Vault:
     def _try_read(self, path: Path) -> Optional[Note]:
         try:
             return self.read(path)
-        except (VaultError, UnicodeDecodeError, OSError):
+        except UNREADABLE:
             return None
 
     def get(self, note_id: str) -> Tuple[Path, Note]:
@@ -424,7 +438,7 @@ class Vault:
             return None
         try:
             return self.read(path)
-        except (VaultError, UnicodeDecodeError, OSError):
+        except UNREADABLE:
             return None
 
     # -- write --------------------------------------------------------------
@@ -433,6 +447,28 @@ class Vault:
         from .models import slugify
 
         return self.dir_for(note.bucket) / f"{slugify(note.title)}--{note.id[:15]}.md"
+
+    def path_in(self, note: Note, folder: str) -> Path:
+        """Where this note goes inside a subfolder of its own bucket.
+
+        Subfolders under a bucket are lj's, not ours — a note in
+        `30-Resources/Federal Taxation/Ch 4` is still a Resource, and phase 12
+        already reads them as study scopes. This is the write-side counterpart:
+        a capture that knows which folder it belongs to (a note-taking session
+        knows exactly that) can say so without anyone reaching for `path_for`
+        and gluing paths together at the call site.
+
+        The folder is taken apart and put back a segment at a time, so
+        `..` cannot climb out of the bucket and a leading slash cannot
+        reach the drive root. An empty folder means the bucket itself.
+        """
+        base = self.dir_for(note.bucket)
+        for part in str(folder or "").replace("\\", "/").split("/"):
+            part = part.strip()
+            if not part or part in (".", ".."):
+                continue
+            base = base / part
+        return base / self.path_for(note).name
 
     def write(self, note: Note, path: Optional[Path] = None) -> Path:
         """Write a note atomically: temp file, then replace.
@@ -462,6 +498,7 @@ class Vault:
         # syscalls per save on a vault that already exists. The one directory
         # that has to be there is the target's, and that is created below.
         target.parent.mkdir(parents=True, exist_ok=True)
+        target = self._free_name(target, note.id)
         content = frontmatter.dump(note.frontmatter(), note.body)
         tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:
@@ -475,6 +512,35 @@ class Vault:
             # a new note, and a stale parse would serve the pre-write body.
             self._forget(target)
         return target
+
+    def _free_name(self, target: Path, note_id: str) -> Path:
+        """`target`, or the next free name beside it if another note is there.
+
+        A write never lands on top of a *different* note. It sounds like it
+        could not happen, and it can: `new_id` is `{second}-{slug}`, and
+        `path_for` names the file from the same two things, so two notes
+        captured in the same second with the same title are the same id and
+        the same path — and the second write destroyed the first, silently,
+        with no error anywhere. Two terms typed quickly into a lecture is
+        exactly the shape of capture that does it.
+
+        Rewriting the *same* note is untouched — that is every save in the
+        system, and it must stay a plain overwrite. This only diverts a write
+        whose destination is somebody else.
+        """
+        if not target.exists() or self._id_at(target) in (None, note_id):
+            return target
+        n = 2
+        while True:
+            candidate = target.with_name(f"{target.stem} ({n}){target.suffix}")
+            if not candidate.exists() or self._id_at(candidate) == note_id:
+                self.log_line(
+                    "vault",
+                    f"name taken by another note, wrote {candidate.name} instead "
+                    f"of {target.name}",
+                )
+                return candidate
+            n += 1
 
     def save(self, note: Note) -> Path:
         """Update an existing note in place, following it if it has been moved
@@ -562,15 +628,109 @@ class Vault:
 
     # -- misc ---------------------------------------------------------------
 
+    def _bucket_at(self, path: Path) -> Optional[str]:
+        """The bucket in a file's frontmatter, without building a `Note`.
+
+        The same argument as `_id_at`, and it matters more here because this
+        one runs over *every* file: `counts()` used to construct a validated
+        pydantic model and deep-copy its whole frontmatter for each note in
+        the vault, in order to read a single enum off it. On a 600-note vault
+        that was the entire cost of `/api/health` — which the dashboard calls
+        on every load, so it was also most of the cost of opening the
+        dashboard.
+
+        The answer must match what `Note` would have said, or the footer and
+        the dashboard disagree about how many notes exist: an unparseable or
+        id-less file is not ours and counts nowhere, a missing or unknown
+        bucket falls back to the model's own default rather than to the
+        directory the file happens to sit in.
+        """
+        try:
+            meta, _ = self._meta(path)
+        except (UnicodeDecodeError, OSError, ValueError):
+            return None
+        if not isinstance(meta.get("id"), str) or not meta["id"]:
+            return None
+        raw = meta.get("bucket")
+        if isinstance(raw, Bucket):
+            return raw.value
+        if raw is None:
+            # `Note` supplies its own default for a missing bucket. The file
+            # is still ours and still counts.
+            return Note.model_fields["bucket"].default.value
+        try:
+            return Bucket(str(raw)).value
+        except ValueError:
+            # A bucket `Note` would refuse. Skipped here for exactly the same
+            # reason `_try_read` skips it — see UNREADABLE.
+            return None
+
+    def relocate(self, path: Path, target: Path) -> Path:
+        """Move a note's file, keeping the note itself untouched.
+
+        A folder is not a property of a note — the bucket is, and that is in
+        the frontmatter. So filing a note into `30-Resources/Federal Taxation`
+        is a file move and nothing else: no rewrite, no `updated` bump, no
+        history entry, and no chance of the round trip through YAML changing
+        something on the way past. The note that comes back out is byte for
+        byte the note that went in.
+
+        `atomic.move` rather than `Path.replace` because on Windows the
+        destination can be held for a moment by Obsidian or a scanner — see
+        that module.
+        """
+        path, target = Path(path), Path(target)
+        if path == target:
+            return target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target = self._free_name(target, self._id_at(path) or "")
+        atomic.move(path, target)
+        self._forget(path, target)
+        return target
+
+    RETIRED_DIR = "_retired"
+
+    def retire(self, path: Path, reason: str = "") -> Path:
+        """Move a note out of the way. Nothing in this system deletes one.
+
+        The rule is lj's and it is the right one: a note that was worth
+        writing down is never worth destroying on a machine's judgement, and
+        every automated "clean up" that has ever deleted someone's work
+        believed at the time that it was removing something worthless.
+        Undoing a bad classification costs a drag in Obsidian. Undoing a
+        deletion costs the note.
+
+        So the one operation is this: the file moves to
+        `40-Archive/_retired/<YYYY-MM>/`, under a name that cannot collide,
+        and the reason goes to the log. Obsidian's search still finds it,
+        `40-Archive` is already the bucket the system searches only on
+        request, and the note is one drag from being back.
+
+        Deleting is left to lj, in Explorer, deliberately.
+        """
+        path = Path(path)
+        target_dir = (self.dir_for(Bucket.ARCHIVE) / self.RETIRED_DIR
+                      / dt.date.today().strftime("%Y-%m"))
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / path.name
+        n = 2
+        while target.exists():
+            target = target_dir / f"{path.stem} ({n}){path.suffix}"
+            n += 1
+        atomic.move(path, target)
+        self._forget(path, target)
+        self.log_line("retire", f"{path.name}  ->  {target}  {reason}".rstrip())
+        return target
+
     def counts(self) -> Dict[str, int]:
         counts = {b.value: 0 for b in Bucket}
         for bucket in BUCKET_DIRS:
             # Count per bucket directory so a note only has to be parsed to
             # confirm it is ours, not to discover where it lives.
             for path in self._listing(bucket):
-                note = self._try_read(path)
-                if note is not None:
-                    counts[note.bucket.value] += 1
+                got = self._bucket_at(path)
+                if got is not None:
+                    counts[got] += 1
         return counts
 
     def log_line(self, name: str, message: str) -> None:

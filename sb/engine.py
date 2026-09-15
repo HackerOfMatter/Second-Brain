@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import (
     ask as askmod,
     calibration,
+    collected,
     connect as connectmod,
     digest,
     extract,
@@ -32,8 +33,10 @@ from . import (
     parser,
     quality,
     reminders as remindersmod,
+    render as rendermod,
     retention,
     segment,
+    session as sessionmod,
     tasksplit,
     threshold,
     taxonomy,
@@ -84,12 +87,24 @@ class Engine:
         #: Card generation requests made while no model was reachable.
         #: See sb/jobqueue.py.
         self.card_queue = jobqueue.CardQueue(cfg.system_dir)
+        #: The open note-taking session, if there is one — "which folder am I
+        #: filing into right now". Disposable by design; see sb/session.py.
+        self.sessions = sessionmod.SessionStore(cfg.system_dir)
+        #: The shape every note takes. Read from `_templates/` and re-read
+        #: when lj edits one, so a template change lands on the next capture
+        #: rather than the next restart. See sb/render.py.
+        self.templates = rendermod.TemplateStore(cfg.vault)
         self.ensure_drop_folder()
 
     # -- capture ------------------------------------------------------------
 
     def capture(
-        self, text: str, bucket: str, title: str = "", due: Optional[str] = None
+        self,
+        text: str,
+        bucket: str,
+        title: str = "",
+        due: Optional[str] = None,
+        folder: str = "",
     ) -> Dict[str, Any]:
         """The three-button entry point (§2). Classification is the human's
         decision; everything after it is automatic.
@@ -104,15 +119,518 @@ class Engine:
         target = Bucket(bucket)
         note = Note.capture(text, target, title=title or extract.derive_title(text))
 
+        # A session says which folder, never which bucket. An essay mentioned
+        # in a lecture is still a Project; it just belongs under that class
+        # rather than loose in 20-Projects, and `path_in` anchors the folder
+        # to whichever bucket the note actually landed in.
+        where, session = self._session_folder(folder)
+
         # One read, reused by the planner and the calendar sync below.
         snapshot = self._snapshot()
 
         info = self._apply_bucket(note, target, snapshot, due=due)
 
-        path = self.vault.write(note)
+        path = self.vault.write(
+            note, self.vault.path_in(note, where) if where else None
+        )
+        self._session_record(session, note.id)
         self.vault.log_line("capture", f"{note.bucket.value}  {note.id}  {note.title}")
         self._sync_calendar_quiet(self._replacing(snapshot, note))
         return {"note": _note_dict(note), "path": str(path), **info}
+
+    def _shape(
+        self,
+        note: Note,
+        objective: str,
+        filled: Optional[Dict[str, str]] = None,
+        *,
+        extra: Optional[List[Tuple[str, str]]] = None,
+    ) -> None:
+        """Give a note the shape its template says it has, and the defaults the
+        template says go with it.
+
+        Called on the paths where the system *composes* a note. It sets the
+        body and, for anything the note has not already been given explicitly,
+        the tags, category and review cycle the template carries — which is
+        what makes "a Term is tagged `term` and reviewed every 90 days" a fact
+        about `_templates/Term.md` rather than a constant in this file.
+
+        Never raises. A template being edited is not a reason to lose a
+        capture, so a failure here leaves the note with the body it already
+        had — see sb/render.py.
+        """
+        filled = dict(filled or {})
+        # A section named `__preamble__` is the line that sits under the title,
+        # above the first heading — a session's date and counts, say. It is not
+        # a heading of its own, so it cannot be passed as one.
+        preamble = filled.pop("__preamble__", "")
+        try:
+            template = self.templates.for_objective(objective)
+            note.body = self.templates.body_for(
+                objective, note.title, filled, preamble=preamble, extra=extra
+            )
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            self.vault.log_line("template", f"{objective} render failed: {exc!r}")
+            return
+        defaults = template.defaults()
+        if not note.tags and defaults.get("tags"):
+            note.tags = [str(t) for t in defaults["tags"]]
+        if not note.category and defaults.get("category"):
+            note.category = str(defaults["category"])
+        review = defaults.get("review")
+        if isinstance(review, dict) and review.get("cycle_days") and not note.review:
+            note.review = ReviewMeta(
+                cycle_days=int(review["cycle_days"]),
+                next=dt.date.today() + dt.timedelta(days=int(review["cycle_days"])),
+            )
+
+    # -- note-taking sessions (housekeeping 2) ------------------------------
+
+    def _bucket_folders(self, bucket: Bucket) -> List[str]:
+        """Top-level subfolders lj has made under one bucket.
+
+        The candidate list `resolve_folder` matches against. Directory names
+        only — no note is read, so offering the list costs one `iterdir`.
+        """
+        root = self.vault.dir_for(bucket)
+        try:
+            return sorted(p.name for p in root.iterdir()
+                          if p.is_dir() and not p.name.startswith((".", "_")))
+        except OSError:
+            return []
+
+    def session_start(self, course: str, chapter: str = "") -> Dict[str, Any]:
+        """Open a session. Every capture until it closes lands in its folder.
+
+        Starting one while another is open closes the first rather than
+        refusing: the realistic reason it happens is that lj walked out of one
+        lecture into the next and never pressed anything in between, and
+        losing the second session's notes to a modal error would be the worst
+        possible answer to that.
+        """
+        course = sessionmod.clean_folder_name(course)
+        if not course:
+            raise ValueError("a session needs a class")
+
+        closed = None
+        if self.sessions.open() is not None:
+            closed = self.session_end()
+
+        # Resources are where class notes live, so that is the folder list
+        # worth matching against — see `capture` for what happens to a
+        # Project captured mid-lecture.
+        course_folder, how = sessionmod.resolve_folder(
+            self._bucket_folders(Bucket.RESOURCE), course
+        )
+        chapters = []
+        base = self.vault.dir_for(Bucket.RESOURCE) / course_folder
+        if base.is_dir():
+            chapters = sorted(p.name for p in base.iterdir()
+                              if p.is_dir() and not p.name.startswith((".", "_")))
+        chapter_folder, chapter_how = sessionmod.resolve_folder(chapters, chapter)
+
+        session = sessionmod.Session(
+            id=sessionmod.new_id(course_folder, chapter_folder),
+            course=course_folder,
+            chapter=chapter_folder,
+            started=_now().isoformat(timespec="seconds"),
+        )
+        # Made now rather than on the first capture, so the folder is there to
+        # be opened in Obsidian while the lecture is still happening.
+        (self.vault.dir_for(Bucket.RESOURCE) / session.folder).mkdir(
+            parents=True, exist_ok=True
+        )
+        self.sessions.save(session)
+        self.vault.log_line("session", f"start  {session.id}  {session.folder}")
+        return {
+            "session": session.as_dict(),
+            "matched": how,
+            "chapter_matched": chapter_how,
+            "closed": closed,
+        }
+
+    def session_status(self) -> Dict[str, Any]:
+        session = self.sessions.open()
+        return {"session": session.as_dict() if session else None}
+
+    def session_end(self) -> Dict[str, Any]:
+        """Close the session and write its summary.
+
+        The summary is built from the session's own list of ids, so it can
+        only ever claim notes that were actually taken. A note lj deleted or
+        moved in Obsidian mid-lecture is simply absent from it rather than
+        appearing as a dead link — the ids are looked up, and one that no
+        longer resolves is dropped.
+        """
+        session = self.sessions.open()
+        if session is None:
+            raise ValueError("no session is open")
+
+        notes: List[Dict[str, Any]] = []
+        terms: List[Dict[str, Any]] = []
+        term_ids = set(session.term_ids)
+        for note_id in session.note_ids:
+            try:
+                note = self.note(note_id)
+            except ValueError:
+                # Moved or deleted since (VaultError subclasses ValueError).
+                # Absent from the summary beats a dead link in it.
+                continue
+            row = {
+                "id": note.id,
+                "title": note.title,
+                "needs_definition": self.UNDEFINED_TAG in (note.tags or []),
+            }
+            notes.append(row)
+            if note.id in term_ids:
+                terms.append(row)
+
+        ended = _now()
+        summary = Note.capture(
+            "", Bucket.RESOURCE,
+            title=f"Session — {session.course}"
+                  f"{' · ' + session.chapter if session.chapter else ''}"
+                  f" — {ended.strftime('%Y-%m-%d')}",
+        )
+        self._shape(summary, "session", sessionmod.summary_sections(
+            session, notes, terms, ended
+        ))
+        snapshot = self._snapshot()
+        info = self._apply_bucket(summary, Bucket.RESOURCE, snapshot, shape=False)
+        path = self.vault.write(summary, self.vault.path_in(summary, session.folder))
+
+        session.ended = ended.isoformat(timespec="seconds")
+        session.summary_id = summary.id
+        self.sessions.clear()
+        self.vault.log_line(
+            "session",
+            f"end  {session.id}  {len(notes)} notes  {len(terms)} terms",
+        )
+        return {
+            "session": session.as_dict(),
+            "summary": _note_dict(summary),
+            "path": str(path),
+            "notes": notes,
+            "terms": terms,
+            "undefined": [t for t in terms if t["needs_definition"]],
+            **info,
+        }
+
+    def _session_folder(self, explicit: str = "") -> Tuple[str, Any]:
+        """(folder to file into, the open session or None).
+
+        An explicit folder always wins. Saying where a note goes is a
+        decision, and a session is a default — a default that overrode a
+        decision would make the session something to fight rather than
+        something to forget about.
+        """
+        session = self.sessions.open()
+        if explicit:
+            return explicit, session
+        return (session.folder if session else ""), session
+
+    def _session_record(self, session, note_id: str, *, term: bool = False) -> None:
+        if session is None:
+            return
+        session.add(note_id, term=term)
+        self.sessions.save(session)
+
+    # -- terms (housekeeping 1) ---------------------------------------------
+
+    #: A term with no definition yet. A tag rather than a frontmatter field on
+    #: purpose: it shows up in Obsidian's search and tag pane, which is where
+    #: lj is when they go to fill one in, and it disappears by being edited
+    #: out rather than by a button only this app knows about.
+    UNDEFINED_TAG = "needs-definition"
+
+    def capture_term(
+        self,
+        term: str,
+        definition: str = "",
+        *,
+        source: str = "",
+        folder: str = "",
+    ) -> Dict[str, Any]:
+        """One term, one note, and — if it has a definition — one card.
+
+        Highlighting a word and pressing the capture hotkey is the single most
+        common thing that happens while reading, and until now it produced an
+        Inbox line reading "elasticity" that had to be opened, retyped and
+        classified later. A term is a known shape: it has a name, it has a
+        definition, and the only thing anyone ever wants to do with it
+        afterwards is be asked it again.
+
+        **The card is written here rather than generated.** A term note is
+        twelve words long, and `generate_folder` skips anything under forty as
+        too thin — so the notes lj most wants to be quizzed on were exactly
+        the ones the deck machinery would never touch. Front and back are the
+        term and the definition lj typed, so there is nothing for a model to
+        add and nothing for it to get wrong: this is the one study path that
+        works with Ollama closed.
+
+        It lands `active` rather than `draft` for the same reason
+        `add_card` does — the draft rule exists to stop *generated* cards
+        reaching the scheduler unread, and lj wrote both sides of this one.
+
+        A term captured without a definition is still worth keeping — it is
+        the thing you did not know, which is the whole point — so it is filed
+        and tagged `needs-definition` rather than refused.
+        """
+        term = (term or "").strip()
+        definition = (definition or "").strip()
+        if not term:
+            raise ValueError("a term needs a name")
+        if len(term) > 120:
+            raise ValueError("that is a passage, not a term — capture it as a note")
+
+        note = Note.capture(definition or term, Bucket.RESOURCE, title=term)
+        # The template supplies the shape, the headings and the tags; the
+        # `needs-definition` marker is a fact about *this* term rather than
+        # about terms in general, so it is added here and not in the file.
+        self._shape(note, "term", {
+            "Definition": definition,
+            "Seen in": f"- {source}" if source else "",
+        })
+        if not definition:
+            note.tags = list(note.tags) + [self.UNDEFINED_TAG]
+
+        where, session = self._session_folder(folder)
+        snapshot = self._snapshot()
+        info = self._apply_bucket(note, Bucket.RESOURCE, snapshot, shape=False)
+        path = self.vault.write(
+            note, self.vault.path_in(note, where) if where else None
+        )
+        self._session_record(session, note.id, term=True)
+        self.vault.log_line("capture", f"term  {note.id}  {note.title}")
+
+        carded = False
+        if definition:
+            deck = self.deck(note.id, create=True)
+            deck.add(
+                front=term,
+                back=definition,
+                source=source,
+                status="active",
+            )
+            self.decks.save(deck)
+            carded = True
+
+        self._sync_calendar_quiet(self._replacing(snapshot, note))
+        return {
+            "note": _note_dict(note),
+            "path": str(path),
+            "carded": carded,
+            "needs_definition": not definition,
+            **info,
+        }
+
+    # -- screenshots (housekeeping 7) ---------------------------------------
+
+    #: Images live beside the notes that embed them, in a folder Obsidian
+    #: already treats as attachments. Not `_system/`: this is lj's material,
+    #: it cannot be regenerated, and `_system/` is the one place the doctor is
+    #: allowed to suggest deleting.
+    ATTACH_DIR = "_attachments"
+
+    def attach_image(
+        self,
+        data: bytes,
+        *,
+        caption: str = "",
+        source: str = "",
+        suffix: str = ".png",
+    ) -> Dict[str, Any]:
+        """A screenshot becomes a note with the image in it.
+
+        Not a loose file in an attachments folder — a note. Everything else
+        in this system is a note, which is what makes everything else
+        searchable, linkable, reviewable and countable, and an image filed as
+        an exception to that is an image nobody finds again. A diagram off a
+        lecture slide is a Resource that happens to be a picture.
+
+        During a session it lands in the session's folder and joins the
+        summary, which is the case this exists for: the slide you snipped at
+        11:15 is in the chapter it was shown in, not in Downloads.
+
+        The embed is `![[name.png]]` — Obsidian resolves an embed by filename
+        from anywhere in the vault, so the link survives the note being moved
+        later by the group-file box, which a relative path would not.
+        """
+        if not data:
+            raise ValueError("no image data")
+        title = (caption or "").strip() or f"Screenshot — {_now().strftime('%d %b %Y, %H:%M')}"
+
+        note = Note.capture(caption or "", Bucket.RESOURCE, title=title)
+        where, session = self._session_folder()
+
+        stamp = _now().strftime("%Y%m%dT%H%M%S")
+        image_dir = self.vault.dir_for(Bucket.RESOURCE)
+        for part in (where or "").split("/"):
+            if part.strip() and part not in (".", ".."):
+                image_dir = image_dir / part.strip()
+        image_dir = image_dir / self.ATTACH_DIR
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        image_path = image_dir / f"screenshot-{stamp}{suffix}"
+        n = 2
+        while image_path.exists():
+            image_path = image_dir / f"screenshot-{stamp}-{n}{suffix}"
+            n += 1
+        image_path.write_bytes(data)
+
+        embed = f"![[{image_path.name}]]"
+        if caption.strip():
+            embed += "\n\n" + caption.strip()
+        self._shape(note, "screenshot", {
+            "Image": embed,
+            "Seen in": f"- {source}" if source else "",
+        })
+
+        snapshot = self._snapshot()
+        info = self._apply_bucket(note, Bucket.RESOURCE, snapshot, shape=False)
+        path = self.vault.write(
+            note, self.vault.path_in(note, where) if where else None
+        )
+        self._session_record(session, note.id)
+        self.vault.log_line("capture", f"screenshot  {note.id}  {image_path.name}")
+        return {
+            "note": _note_dict(note),
+            "path": str(path),
+            "image": str(image_path),
+            "image_name": image_path.name,
+            "folder": where,
+            **info,
+        }
+
+    # -- the collector's fallacy (housekeeping 6) ---------------------------
+
+    def collected_debt(self, limit: int = 40) -> Dict[str, Any]:
+        """Which notes were kept and never used. See sb/collected.py.
+
+        One vault walk and one deck read for the whole report — the same
+        pattern every other whole-vault view here uses, because a per-note
+        deck lookup over six hundred notes is the arithmetic that quietly
+        turns a panel into a page that takes four seconds to open.
+
+        Sorted oldest first. The oldest untouched note is the one most likely
+        to be genuinely dead, and a list that starts with last week's is a
+        list that never reaches it.
+        """
+        decks = {d.note_id: d for d in self.decks.all()}
+        where = self.vault.folders_by_id()
+        rows = [
+            collected.assess(note, decks.get(note.id))
+            for note in self.notes()
+        ]
+        stats = collected.summarise(rows)
+        items = [r for r in rows if r["eligible"] and not r["used"]]
+        items.sort(key=lambda r: -(r["age_days"] or 0))
+        for row in items:
+            row["folder"] = where.get(row["note_id"], "")
+        return {
+            **stats,
+            "sentence": collected.sentence(stats),
+            "items": items[: max(0, int(limit))] if limit else items,
+            "shown": min(len(items), limit) if limit else len(items),
+            # The sharper special case: a term met and never understood. It
+            # has its own list because it is one action away from being fixed
+            # and the general list is not.
+            "undefined_terms": self.undefined_terms()[:20],
+        }
+
+    # -- filing several notes at once (housekeeping 5) -----------------------
+
+    def folders(self) -> Dict[str, List[str]]:
+        """Every folder lj has made, by bucket, plus the union.
+
+        Names only, from `iterdir` — no note is read. The union is what the
+        group-file box matches against, because a folder is a subject and a
+        subject is not the property of one bucket: `Federal Taxation` exists
+        under Projects and under Resources and is the same thing both times.
+        """
+        by_bucket = {b.value: self._bucket_folders(b) for b in Bucket}
+        every = sorted({f for names in by_bucket.values() for f in names})
+        return {"by_bucket": by_bucket, "all": every}
+
+    def move_to_folder(
+        self, note_ids: List[str], folder: str, *, create: bool = True
+    ) -> Dict[str, Any]:
+        """File several notes into one folder, in one action.
+
+        The thing this replaces is opening Obsidian, finding each note, and
+        dragging it — which is fine for one note and is why forty notes stay
+        where they landed. Nothing about the notes changes: a Project stays a
+        Project and keeps its deadline, its steps and its calendar blocks.
+        Only the folder under its own bucket changes, so `20-Projects/Federal
+        Taxation` and `30-Resources/Federal Taxation` both end up holding the
+        right half of the same subject.
+
+        The folder name is matched the same way a session's is — "fed tax"
+        finds `Federal Taxation` — because the two features would otherwise
+        disagree about what a folder is called, and the whole point of
+        matching is that there is one folder per subject.
+
+        **One bad id is reported and the rest still move.** The same rule the
+        bulk capture commit follows: losing the other thirty-nine because the
+        seventh id was stale is what makes a batch operation untrustworthy.
+        """
+        ids = [str(i).strip() for i in (note_ids or []) if str(i).strip()]
+        if not ids:
+            raise ValueError("no notes were selected")
+
+        resolved, how = sessionmod.resolve_folder(self.folders()["all"], folder)
+        if not resolved:
+            raise ValueError("a folder needs a name")
+        if how == "new" and not create:
+            raise ValueError(f"no folder matching {folder!r} — create it explicitly")
+
+        moved: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for note_id in ids:
+            try:
+                path, note = self.vault.get(note_id)
+                target = self.vault.relocate(path, self.vault.path_in(note, resolved))
+            except Exception as exc:  # noqa: BLE001 — see the docstring
+                failed.append({"note_id": note_id, "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            moved.append({
+                "note_id": note.id,
+                "title": note.title,
+                "bucket": note.bucket.value,
+                "path": str(target),
+            })
+        if moved:
+            self.vault.log_line(
+                "move", f"{len(moved)} notes -> {resolved}  ({how})"
+            )
+        return {"folder": resolved, "matched": how, "moved": moved, "failed": failed}
+
+    def retire_note(self, note_id: str, reason: str = "") -> Dict[str, Any]:
+        """Get a note out of the way. There is no delete, by design.
+
+        The sanctioned answer to "I do not want this note any more", and the
+        reason there is no other one: every button that destroys a note is a
+        button that will eventually destroy the wrong note, and the cost is
+        not symmetrical. This moves it to `40-Archive/_retired/`, which the
+        system searches only on request and Obsidian still finds.
+        """
+        path, note = self.vault.get(note_id)
+        target = self.vault.retire(path, reason or f"retired: {note.title}")
+        return {"note_id": note.id, "title": note.title, "path": str(target)}
+
+    def undefined_terms(self) -> List[Dict[str, Any]]:
+        """Terms captured without a definition, oldest first.
+
+        The backlog of "I did not know this word" is the most useful list in
+        the vault and the easiest one to never look at again.
+        """
+        out = [
+            _note_dict(n)
+            for n in self.notes()
+            if self.UNDEFINED_TAG in (n.tags or [])
+        ]
+        out.sort(key=lambda n: n.get("created") or "")
+        return out
 
     def _apply_bucket(
         self,
@@ -120,6 +638,7 @@ class Engine:
         target: Bucket,
         snapshot: List[Note],
         due: Optional[str] = None,
+        shape: bool = True,
     ) -> Dict[str, Any]:
         """Everything that happens to a note *because* of which bucket it is
         in: parse and plan a Project, give an Area a habit and a block, put a
@@ -173,6 +692,25 @@ class Engine:
             )
             note.body = _area_body(note, self.cfg)
         elif target == Bucket.RESOURCE:
+            # The shape of a plain capture, which is the Atomic Note template
+            # unless config says otherwise. Two guards on it, and both matter:
+            #
+            #   `shape=False` is passed by the paths that already gave the
+            #   note a shape of their own — a term, a screenshot, a session
+            #   summary — so this cannot overwrite a more specific template
+            #   with the general one.
+            #
+            #   `wants_shape` refuses text that already has its own headings.
+            #   A line typed into the capture box has no structure and is
+            #   exactly what a template is for; a nine-thousand-word document
+            #   dropped into Drop/ has an author's structure already, and
+            #   folding it under our `## Definition` would bury it.
+            if shape and rendermod.wants_shape(note.body):
+                self._shape(
+                    note,
+                    self.cfg.capture.default_template,
+                    {"Definition": note.body.strip()},
+                )
             note.review = note.review or ReviewMeta(
                 cycle_days=self.cfg.review.resource_cycle_days,
                 next=dt.date.today()
@@ -844,6 +1382,11 @@ class Engine:
             "estimates": forecasting.summary(notes),
             "calibration": calibration.curve(self.decks.reviews()).as_dict(),
             "atomicity": lint.check(notes).as_dict(),
+            # Whether the vault is being used or only fed. A week is the
+            # right scale for it: the ratio does not move in a day, and the
+            # review is the one moment set aside for looking at the whole
+            # thing rather than at the next thing. See sb/collected.py.
+            "collected": self._week_collected(notes, decks),
             # The week is also where a health check that stopped running gets
             # noticed. `doctor --write` leaves a dated report; this says when
             # the last one landed, or that none ever did.
@@ -852,6 +1395,22 @@ class Engine:
             # live; the review is where they get read on purpose.
             "problems": self.incidents.open(),
         }
+
+    def _week_collected(self, notes: List[Note], decks: List) -> Dict[str, Any]:
+        """The collected-vs-used figure, from the walk the review already did.
+
+        No extra read: `weekly_review` has the notes and the decks in hand,
+        and this is the one place the number is worth a whole section rather
+        than a panel.
+        """
+        by_note = {d.note_id: d for d in decks}
+        rows = [collected.assess(n, by_note.get(n.id)) for n in notes]
+        stats = collected.summarise(rows)
+        worst = sorted(
+            (r for r in rows if r["eligible"] and not r["used"]),
+            key=lambda r: -(r["age_days"] or 0),
+        )[:5]
+        return {**stats, "sentence": collected.sentence(stats), "oldest": worst}
 
     def _week_closed(
         self, notes: List[Note], decks: List, reviews: List[Dict[str, Any]], since: dt.date
@@ -3326,6 +3885,9 @@ class Engine:
 
         ics = self.cfg.ics_path
         decks = self.decks.all()
+        # Counted once. It globs the deck folder, and it was being asked
+        # twice on a call the dashboard makes on every load.
+        deck_files = self._deck_file_count()
         return {
             "vault": str(self.cfg.vault),
             "vault_exists": vault_exists,
@@ -3350,6 +3912,11 @@ class Engine:
                 "lanes": lanes,
             },
             "index": self.index.status(),
+            # The templates are the shape of every note, and they are files lj
+            # edits in Obsidian — which is how all nine of them came to be
+            # silently corrupted for three weeks. Cheap: a stat and a parse
+            # each, from the same cache the renderer uses.
+            "templates": self._template_health(),
             "drop": {
                 "path": str(self.cfg.drop_dir),
                 # `intake.candidates` answers "[]" for a folder that is not
@@ -3369,8 +3936,8 @@ class Engine:
                 # makes a corrupted deck disappear from the count in silence —
                 # the one number here that must not quietly shrink. Files on
                 # disk minus decks read is exactly how many did that.
-                "deck_files": self._deck_file_count(),
-                "unreadable": max(0, self._deck_file_count() - len(decks)),
+                "deck_files": deck_files,
+                "unreadable": max(0, deck_files - len(decks)),
                 "retention": self.cfg.study.desired_retention,
                 "path": str(self.cfg.deck_dir),
             },
@@ -3395,6 +3962,29 @@ class Engine:
                 "categories": len(taxonomy.table(self.cfg)),
                 "google": google,
             },
+        }
+
+    def _template_health(self) -> Dict[str, Any]:
+        """Which templates still describe a note this system can read.
+
+        Not a style check. It exists for one specific failure: Obsidian's
+        Properties editor rewrote every template in this vault into something
+        that still *looked* right in the sidebar while producing notes with no
+        id and no bucket, and nothing noticed for three weeks. So the test is
+        the only one that would have caught it — build a real `Note` from each
+        template and see what happens. See sb/render.py:check.
+        """
+        try:
+            rows = rendermod.check(self.templates)
+        except Exception as exc:  # noqa: BLE001 — health must not be the thing that breaks
+            return {"ok": 0, "total": 0, "broken": [], "error": f"{type(exc).__name__}: {exc}"}
+        broken = [r for r in rows if not r["ok"]]
+        return {
+            "ok": sum(1 for r in rows if r["ok"]),
+            "total": len(rows),
+            "broken": [
+                {"template": r["template"], "problems": r["problems"]} for r in broken
+            ],
         }
 
     def _deck_file_count(self) -> int:
@@ -3599,6 +4189,29 @@ def _absorb_materials(note: Note, sections: List[Tuple[str, str]]) -> None:
                 # its kind than a default that was never chosen.
                 if existing.kind == MaterialKind.MATERIAL:
                     existing.kind = kind
+
+
+def _term_body(term: str, definition: str, source: str = "") -> str:
+    """The Term template, rendered.
+
+    Three headings, in the order they get filled in: what it means, what it
+    means in lj's own words, and where it was met. The middle one is not
+    decoration — restating a definition in your own words is the difference
+    between a term you have collected and a term you know (the generation
+    effect; the same reason `explain` cards ask before they reveal), and a
+    heading that is visibly empty is the cheapest possible prompt to do it.
+
+    `## Seen in` holds the source rather than a frontmatter field because a
+    term is usually met more than once, and the second and third sightings
+    are what turn a definition into a meaning.
+    """
+    lines = [f"# {term}", "", "## Definition", ""]
+    if definition:
+        lines += [definition, ""]
+    lines += ["## In my own words", "", "## Seen in", ""]
+    if source:
+        lines += [f"- {source}", ""]
+    return "\n".join(lines)
 
 
 def _project_body(note: Note) -> str:

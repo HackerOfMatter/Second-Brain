@@ -1,4 +1,4 @@
-"""Second Brain -- global capture hotkey (Story F1).
+"""Second Brain -- global capture hotkey (Story F1; extended, housekeeping 1-2).
 
 Ctrl+Alt+Z, anywhere in Windows, opens a one-line capture box. Enter
 files it; Escape throws it away. This process is the whole point of the
@@ -31,10 +31,36 @@ the extra ceremony of creating a real window class just to receive it.
 tkinter (stdlib, ships with the python.org Windows build used here --
 confirmed by the presence of .venv/Scripts/pythonw.exe, which only that
 build produces) provides the input box and toast.
+
+Three things the box does beyond taking a line of text, all of them in
+service of the same idea -- that the cheapest moment to record something is
+the moment you met it, and every step between the two loses some of it:
+
+  * **It reads what is highlighted.** Press the hotkey with a word selected
+    anywhere in Windows and the box opens with that word already in it,
+    selected, so Enter accepts it and typing replaces it. See
+    `grab_selection` for how that is done without stealing the clipboard.
+  * **It knows what a term is.** A short one-line selection opens in Term
+    mode, which has a second field for the definition. A term and its
+    definition become a note *and a card*, written rather than generated --
+    see `Engine.capture_term`.
+  * **It can open a note-taking session.** `/start fed tax / ch 4` in the
+    box, and every capture until `/end` lands in that class's chapter
+    folder, with a summary written when it closes. See sb/session.py.
+  * **It notices a Win+Shift+S snip.** Windows owns that key and it cannot be
+    intercepted; it does not need to be, because the snip's only effect is a
+    bitmap on the clipboard and this process is already resident. During a
+    session the snip is filed into the session\'s folder as a note with the
+    image in it. Outside one it files *nothing* -- see `watch_clipboard` for
+    why that restraint is the whole design -- and instead offers itself to
+    the next capture, where the line typed becomes the caption. The DIB is
+    turned into a PNG by hand (`png_from_dib`) rather than by pulling in an
+    imaging library this file has no business depending on.
 """
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import os
@@ -114,6 +140,7 @@ def _load_endpoint() -> tuple[str, Path]:
 
 
 API_URL, DROP_DIR = _load_endpoint()
+TERM_URL = API_URL.rsplit("/", 1)[0] + "/capture/term"
 API_TIMEOUT_SECONDS = 2.0  # generous for a local hung server; instant on refusal
 
 # -- capture: API first, Drop/ fallback --------------------------------------
@@ -122,9 +149,34 @@ _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|#^\[\]]')
 
 
 def try_api(text: str) -> bool:
-    payload = json.dumps({"text": text, "bucket": "inbox"}).encode("utf-8")
+    # No bucket. The box has no buttons and asserting one here would be this
+    # file inventing a classification it has no basis for — the server's
+    # `capture.default_bucket` is where that decision belongs, and it is one
+    # line in config.yaml rather than an edit to a startup script.
+    payload = json.dumps({"text": text}).encode("utf-8")
+    return _post(API_URL, payload)
+
+
+def _get(url: str):
+    """A GET that answers `None` rather than raising. Everything this is used
+    for is a label on a window; none of it is worth a traceback."""
+    try:
+        with urllib.request.urlopen(url, timeout=API_TIMEOUT_SECONDS) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def try_term_api(term: str, definition: str, source: str) -> bool:
+    payload = json.dumps(
+        {"term": term, "definition": definition, "source": source}
+    ).encode("utf-8")
+    return _post(TERM_URL, payload)
+
+
+def _post(url: str, payload: bytes) -> bool:
     req = urllib.request.Request(
-        API_URL, data=payload, method="POST",
+        url, data=payload, method="POST",
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -141,7 +193,7 @@ def try_api(text: str) -> bool:
         return False
 
 
-def write_drop_fallback(text: str) -> Path:
+def write_drop_fallback(text: str, name: str = "") -> Path:
     """Mirror of the Obsidian plugin's own fallback (main.js `dropFile`):
     a plain .md file, first line in the name, no frontmatter -- the same
     shape intake.py already reads. Bucket choice isn't preserved because it
@@ -149,7 +201,7 @@ def write_drop_fallback(text: str) -> Path:
     rule/model classifier as any other Drop file."""
     DROP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
-    first_line = text.split("\n", 1)[0]
+    first_line = name or text.split("\n", 1)[0]
     safe = _INVALID_NAME_CHARS.sub("", first_line).strip()[:50] or "capture"
     target = DROP_DIR / f"{stamp} {safe}.md"
     n = 2
@@ -158,6 +210,346 @@ def write_drop_fallback(text: str) -> Path:
         n += 1
     target.write_text(text, encoding="utf-8")
     return target
+
+
+# --8<-- testable: the two rules the box's behaviour turns on, and the
+# offline shape of a term note. Sliced out by tests/test_all.py, which
+# cannot import this file off Windows. Keep both markers in place.
+def term_markdown(term: str, definition: str, source: str) -> str:
+    """The Term note, written by hand, for the Drop fallback.
+
+    Must match `engine._term_body` closely enough that a term filed while the
+    app was closed reads the same as one filed while it was open — that is
+    the whole promise of the fallback. It cannot match it *exactly*: this
+    file goes through `intake`, which classifies it rather than trusting a
+    bucket we assert, so the frontmatter is deliberately absent and the
+    shape is what carries the meaning.
+    """
+    lines = [f"# {term}", "", "## Definition", ""]
+    if definition:
+        lines += [definition, ""]
+    lines += ["## In my own words", "", "## Seen in", ""]
+    if source:
+        lines += [f"- {source}", ""]
+    return "\n".join(lines)
+
+
+# -- Win+Shift+S: the snip, turned into a file --------------------------------
+# Windows owns Win+Shift+S; it cannot be intercepted and does not need to be.
+# What the snip *does* is put a device-independent bitmap on the clipboard, and
+# this process is already resident with a message loop — so watching the
+# clipboard sequence number costs one DWORD call a second and tells us the
+# moment a new image appears.
+#
+# Turning that DIB into a PNG by hand, with no Pillow and no pywin32, is the
+# unglamorous half. It is worth it: a screenshot that needs a third-party
+# imaging stack installed is a screenshot that stops working the first time
+# the venv is rebuilt, and this file's whole contract is that it is stdlib
+# only and therefore always runs.
+#
+# Only 24- and 32-bit uncompressed DIBs are handled, which is what every
+# Windows screen capture produces. Anything else is reported rather than
+# guessed at, because a wrong guess here writes a corrupt file into the vault
+# and calls it a note.
+
+CF_DIB = 8
+BI_RGB, BI_BITFIELDS = 0, 3
+
+
+def png_from_dib(data: bytes) -> "tuple[bytes, int, int]":
+    """(PNG bytes, width, height) from a CF_DIB clipboard payload.
+
+    Alpha is deliberately dropped. A 32-bit BI_RGB DIB has a fourth byte that
+    is *undefined*, and Windows screen capture leaves it at zero — read as
+    alpha, every screenshot comes out fully transparent, which looks exactly
+    like the feature silently not working. Screenshots are opaque; the fourth
+    byte is padding and is treated as padding.
+    """
+    import struct
+    import zlib
+
+    if len(data) < 40:
+        raise ValueError("clipboard bitmap is too small to be an image")
+    header_size, width, height = struct.unpack_from("<Iii", data, 0)
+    planes, bits = struct.unpack_from("<HH", data, 12)
+    compression = struct.unpack_from("<I", data, 16)[0]
+    clr_used = struct.unpack_from("<I", data, 32)[0]
+
+    if header_size < 40:
+        raise ValueError(f"unsupported bitmap header ({header_size} bytes)")
+    if bits not in (24, 32):
+        raise ValueError(f"unsupported colour depth ({bits}-bit)")
+    if compression not in (BI_RGB, BI_BITFIELDS):
+        raise ValueError("the bitmap is compressed in a format we do not read")
+
+    offset = header_size
+    # BI_BITFIELDS puts three masks after a 40-byte header. Larger headers
+    # (V4, V5) carry the masks inside themselves and need no skip.
+    if compression == BI_BITFIELDS and header_size == 40:
+        offset += 12
+    offset += clr_used * 4  # a palette, if one is claimed
+
+    top_down = height < 0
+    height = abs(height)
+    if width <= 0 or height <= 0:
+        raise ValueError("the bitmap has no size")
+
+    stride = ((width * bits + 31) // 32) * 4
+    step = bits // 8
+    needed = offset + stride * height
+    if len(data) < needed:
+        raise ValueError("the clipboard bitmap is truncated")
+
+    rows = []
+    for y in range(height):
+        # A DIB is bottom-up unless its height is negative.
+        src = offset + (y if top_down else height - 1 - y) * stride
+        row = bytearray(width * 3)
+        for x in range(width):
+            b, g, r = data[src], data[src + 1], data[src + 2]
+            row[x * 3:x * 3 + 3] = bytes((r, g, b))   # BGR on the wire, RGB in a PNG
+            src += step
+        rows.append(bytes(row))
+
+    raw = b"".join(b"\x00" + row for row in rows)  # filter byte 0 per scanline
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 6))
+           + chunk(b"IEND", b""))
+    return png, width, height
+
+
+# --8<-- end testable
+
+# -- reading the image off the clipboard --------------------------------------
+
+ATTACH_URL = API_URL.rsplit("/api/", 1)[0] + "/api/attach"
+
+user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+user32.OpenClipboard.argtypes = [wintypes.HWND]
+user32.GetClipboardData.argtypes = [ctypes.c_uint]
+user32.GetClipboardData.restype = wintypes.HANDLE
+kernel32.GlobalLock.argtypes = [wintypes.HANDLE]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+kernel32.GlobalSize.argtypes = [wintypes.HANDLE]
+kernel32.GlobalSize.restype = ctypes.c_size_t
+
+
+def clipboard_dib():
+    """The clipboard's bitmap as bytes, or None.
+
+    Opening the clipboard can fail outright — another process holds it for a
+    moment on every copy anywhere in Windows — and that is a retry, not an
+    error. A few attempts over a fifth of a second covers it; failing after
+    that means somebody else is genuinely using it and we simply do not have
+    the image this time round.
+    """
+    if not user32.IsClipboardFormatAvailable(CF_DIB):
+        return None
+    for _ in range(6):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.03)
+    else:
+        return None
+    try:
+        handle = user32.GetClipboardData(CF_DIB)
+        if not handle:
+            return None
+        size = kernel32.GlobalSize(handle)
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr or not size:
+            return None
+        try:
+            return ctypes.string_at(ptr, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+#: An image seen but not yet filed, held for the next capture. See
+#: `watch_clipboard` for why a snip outside a session waits rather than files.
+_pending = {"png": None, "seen_at": 0.0}
+PENDING_SECONDS = 180.0
+
+
+def file_screenshot(png: bytes, caption: str = "", source: str = "") -> bool:
+    payload = json.dumps({
+        "data": base64.b64encode(png).decode("ascii"),
+        "caption": caption, "source": source,
+    }).encode("utf-8")
+    return _post(ATTACH_URL, payload)
+
+
+def watch_clipboard() -> None:
+    """Notice a snip and, during a session, file it where the session is.
+
+    Windows owns Win+Shift+S and there is no way to intercept it. There is
+    also no need: the snip's only effect is to put a bitmap on the clipboard,
+    and this process is already resident, so a sequence-number check once a
+    second sees it land.
+
+    **Outside a session it files nothing**, and that restraint is the whole
+    design. Most screenshots anyone takes are not notes — they are a receipt
+    being pasted into an email, a bug going to a colleague — and a tool that
+    quietly copied every one of them into a vault would be something you
+    would want to turn off within a day. Instead it is held for three
+    minutes, and if the capture box is opened in that time it offers to
+    attach it. Nothing is read, nothing is written, and the clipboard is
+    never modified.
+    """
+    last = 0
+    while True:
+        time.sleep(1.0)
+        try:
+            seq = user32.GetClipboardSequenceNumber()
+            if seq == last:
+                continue
+            last = seq
+            dib = clipboard_dib()
+            if not dib:
+                continue
+            png, w, h = png_from_dib(dib)
+        except ValueError as exc:
+            log(f"clipboard image not readable: {exc}")
+            continue
+        except Exception as exc:
+            log(f"clipboard watch: {type(exc).__name__}: {exc}")
+            continue
+
+        label = session_label()
+        if label:
+            source = foreground_title()
+            if file_screenshot(png, source=source):
+                log(f"screenshot filed into {label} ({w}x{h})")
+                beep_ok()
+                notify(f"Screenshot → {label}")
+            else:
+                log("screenshot could not be filed — server unreachable")
+                notify("Screenshot not filed — Second Brain is not running.", error=True)
+            continue
+
+        # No session: hold it, say so once, and let the capture box offer it.
+        _pending["png"], _pending["seen_at"] = png, time.time()
+        EVENTS.put(("pending", True))
+
+
+def pending_png():
+    """The held screenshot, if it is still fresh."""
+    if not _pending["png"]:
+        return None
+    if time.time() - _pending["seen_at"] > PENDING_SECONDS:
+        _pending["png"] = None
+        return None
+    return _pending["png"]
+
+
+# -- sessions, from the box --------------------------------------------------
+# A slash command rather than a second window. Starting a lecture's session is
+# a thing done with a laptop half-open thirty seconds before it begins, and
+# the fastest path to it is the box that is already bound to a hotkey. Three
+# commands is the whole surface:
+#
+#     /start fed tax / ch 4      open a session on that class and chapter
+#     /end                       close it and write the summary
+#     /status                    say what is open
+#
+# The class name is *matched* against folders that already exist, so "fed tax"
+# finds "Federal Taxation" rather than making a fourth spelling of it — see
+# sb/session.py for why that matters more than it sounds like it should.
+
+SESSION_BASE = API_URL.rsplit("/api/", 1)[0] + "/api/session"
+
+
+def session_label() -> str:
+    """"Federal Taxation · Ch 4", or "" when nothing is open."""
+    data = _get(SESSION_BASE) or {}
+    session = data.get("session")
+    if not isinstance(session, dict):
+        return ""
+    return " · ".join(p for p in (session.get("course"), session.get("chapter")) if p)
+
+
+def handle_command(text: str) -> None:
+    """`/start`, `/end`, `/status`. Anything else is captured as written —
+    a note that happens to begin with a slash is still a note."""
+    body = text[1:].strip()
+    word, _, rest = body.partition(" ")
+    word = word.lower()
+
+    if word in ("end", "stop", "close"):
+        out = _get_json_post(f"{SESSION_BASE}/end", {})
+        if out is None:
+            beep_fail()
+            notify("Could not close the session — is Second Brain running?", error=True)
+            return
+        if out.get("error"):
+            notify(out["error"], error=True)
+            return
+        data = out.get("data", out)
+        beep_ok()
+        notify(f"Session closed — {len(data.get('notes') or [])} notes, "
+               f"{len(data.get('undefined') or [])} to look up")
+        return
+
+    if word in ("status", "?"):
+        label = session_label()
+        notify(f"Session: {label}" if label else "No session open")
+        return
+
+    if word in ("start", "session", "class"):
+        course, _, chapter = rest.partition("/")
+        if not course.strip():
+            notify("Say which class: /start fed tax / ch 4", error=True)
+            return
+        out = _get_json_post(
+            f"{SESSION_BASE}/start",
+            {"course": course.strip(), "chapter": chapter.strip()},
+        )
+        if out is None:
+            beep_fail()
+            notify("Could not start a session — is Second Brain running?", error=True)
+            return
+        if out.get("error"):
+            notify(out["error"], error=True)
+            return
+        data = out.get("data", out)
+        session = data.get("session") or {}
+        # Which folder it picked, and how. "matched: new" is the one worth
+        # seeing — it means a folder was created, which is either right or a
+        # typo, and only lj can tell which.
+        beep_ok()
+        notify(f"Session: {session.get('folder', '')}"
+               + (f"  (new folder)" if data.get("matched") == "new" else ""))
+        return
+
+    # Not a command. File it as typed, slash and all.
+    handle_capture(text)
+
+
+def _get_json_post(url: str, payload: dict):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            return {"error": f"HTTP {exc.code}"}
+    except Exception as exc:
+        log(f"session call failed: {type(exc).__name__}: {exc}")
+        return None
 
 
 def handle_capture(text: str) -> None:
@@ -176,6 +568,26 @@ def handle_capture(text: str) -> None:
         notify("Captured (Second Brain offline -- saved to Drop).")
     except Exception as exc:
         log(f"DROP FALLBACK FAILED, capture lost: {exc!r}")
+        beep_fail()
+        notify("Capture FAILED -- nothing was saved.", error=True)
+
+
+def handle_term(term: str, definition: str, source: str) -> None:
+    term, definition = term.strip(), definition.strip()
+    if not term:
+        return
+    if try_term_api(term, definition, source):
+        log(f"term filed via API: {term!r} ({'defined' if definition else 'no definition'})")
+        beep_ok()
+        notify(f"Term: {term}" + ("" if definition else " — no definition yet"))
+        return
+    try:
+        path = write_drop_fallback(term_markdown(term, definition, source), name=term)
+        log(f"API unreachable, term filed to Drop: {path}")
+        beep_ok()
+        notify("Term saved (Second Brain offline -- saved to Drop).")
+    except Exception as exc:
+        log(f"DROP FALLBACK FAILED, term lost: {exc!r}")
         beep_fail()
         notify("Capture FAILED -- nothing was saved.", error=True)
 
@@ -261,6 +673,131 @@ HOTKEY_CANDIDATES = [
     ("Ctrl+Shift+F9", MOD_CONTROL | MOD_SHIFT, 0x78),
     ("Win+Alt+Z", MOD_WIN | MOD_ALT, ord("Z")),
 ]
+
+# -- reading what is highlighted, without stealing the clipboard -------------
+# There is no Win32 call for "give me the selected text in some other app".
+# The only general mechanism is the one the user would use: send the
+# foreground window Ctrl+C and see what turns up. Every tool that does this
+# has the same two problems, and both are solvable:
+#
+#   1. The hotkey is Ctrl+Alt+Z, so at the moment it fires Ctrl and Alt are
+#      physically held down. A synthetic 'C' on top of that is Ctrl+Alt+C,
+#      which is not copy. So the modifiers we did not want are released
+#      synthetically first, and Ctrl is pressed cleanly.
+#   2. It clobbers the clipboard. `GetClipboardSequenceNumber` is what makes
+#      this honest: if the number does not move, the app had nothing selected
+#      (or ignored us), and the clipboard is left exactly as it was rather
+#      than the old contents being "restored" over themselves. When it does
+#      move, the previous *text* is put back afterwards. A previous clipboard
+#      holding an image cannot be restored and is reported rather than lied
+#      about — see `grab_selection`.
+
+VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN = 0x11, 0x12, 0x10, 0x5B, 0x5C
+KEYEVENTF_KEYUP = 0x0002
+
+user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.keybd_event.argtypes = [
+    wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.POINTER(wintypes.ULONG)
+]
+
+
+def foreground_title() -> str:
+    """The title of the window lj was looking at — the term's "Seen in".
+
+    Free, and it is the difference between a term note that says where it was
+    met and one that does not. A term met in three places is a term you
+    understand; a term met nowhere is a word you wrote down.
+    """
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(user32.GetForegroundWindow(), buf, 512)
+        return buf.value.strip()
+    except Exception:
+        return ""
+
+
+def _tap(vk: int) -> None:
+    user32.keybd_event(vk, 0, 0, None)
+    user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, None)
+
+
+def grab_selection(root: "tk.Tk") -> str:
+    """Whatever is highlighted in the foreground window, or "".
+
+    Runs on the Tk main thread, before the box is shown, and blocks for up to
+    ~250 ms waiting for the other application to answer. That is the budget:
+    a box that appears a quarter-second late with the word already in it is a
+    better trade than one that appears instantly and empty.
+    """
+    try:
+        before = user32.GetClipboardSequenceNumber()
+    except Exception as exc:
+        log(f"clipboard sequence unavailable: {exc!r}")
+        return ""
+
+    try:
+        old = root.clipboard_get()
+        old_was_text = True
+    except Exception:
+        old, old_was_text = "", False
+
+    try:
+        # Let go of what the hotkey is holding, then copy cleanly.
+        for vk in (VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL):
+            user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, None)
+        user32.keybd_event(VK_CONTROL, 0, 0, None)
+        _tap(ord("C"))
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, None)
+    except Exception as exc:
+        log(f"could not synthesise Ctrl+C: {exc!r}")
+        return ""
+
+    deadline = time.time() + 0.25
+    while time.time() < deadline:
+        time.sleep(0.02)
+        try:
+            if user32.GetClipboardSequenceNumber() != before:
+                break
+        except Exception:
+            return ""
+    else:
+        # Nothing was selected, or the app ignored us. The clipboard was never
+        # touched, so there is nothing to put back.
+        return ""
+
+    try:
+        grabbed = root.clipboard_get()
+    except Exception:
+        grabbed = ""
+
+    if old_was_text:
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(old)
+        except Exception as exc:
+            log(f"could not restore the clipboard: {exc!r}")
+    elif grabbed:
+        # We overwrote something that was not text and cannot put it back.
+        # Saying so is the only honest option.
+        log("clipboard held non-text content and was overwritten by the grab")
+
+    return grabbed.strip()
+
+
+#: A selection this short, on one line, is a term. Anything longer is a
+#: passage someone highlighted to keep, and opening it in Term mode would
+#: mean retyping it out of the wrong field.
+TERM_MAX_WORDS = 6
+TERM_MAX_CHARS = 60
+
+
+def looks_like_a_term(text: str) -> bool:
+    t = text.strip()
+    return bool(t) and "\n" not in t and len(t) <= TERM_MAX_CHARS \
+        and len(t.split()) <= TERM_MAX_WORDS
+
 
 user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
 user32.RegisterHotKey.restype = wintypes.BOOL
@@ -376,55 +913,56 @@ _fix_tcl_paths()
 
 import tkinter as tk  # noqa: E402  (after the stdout/stderr redirect above)
 
-_box = {"win": None, "entry": None}
+_box = {
+    "win": None, "entry": None, "defn": None, "defrow": None,
+    "hint": None, "banner": None, "mode": "note", "source": "",
+    "session": "",
+}
+
+_HINTS = {
+    "note": "Capture  ·  Enter files it  ·  Tab for a term  ·  Esc cancels",
+    "term": "Term  ·  Enter → definition  ·  Enter again files it  ·  Tab back",
+}
+
+
+def _set_mode(mode: str) -> None:
+    """Note or Term. The two shapes of thing that get captured while reading,
+    and the only difference between them that matters here is that a term has
+    a second field — because a term without a definition is a word you wrote
+    down, and the moment you are most likely to know the definition is the
+    moment you met the word."""
+    _box["mode"] = mode
+    _box["hint"].configure(text=_HINTS[mode])
+    row = _box["defrow"]
+    if mode == "term":
+        row.pack(fill="x", pady=(6, 0))
+    else:
+        row.pack_forget()
 
 
 def show_capture_box(root: tk.Tk) -> None:
+    # Before the window is raised, while the other application is still the
+    # foreground one — a box that has taken focus has no selection to read.
+    #
+    # Skipped entirely when a screenshot is waiting: the grab works by sending
+    # Ctrl+C, which would overwrite the image on the clipboard with whatever
+    # text happened to be selected, and the image cannot be put back. The
+    # note would survive (we already hold the bytes) but lj's clipboard would
+    # not, and the box is open to caption the picture anyway.
+    grabbed = "" if pending_png() else grab_selection(root)
+    source = foreground_title()
+
     win = _box["win"]
-    if win is not None:
-        try:
-            win.deiconify()
-            win.lift()
-            win.focus_force()
-            _box["entry"].focus_set()
-            _box["entry"].selection_range(0, tk.END)
-            return
-        except tk.TclError:
-            _box["win"] = None
+    if win is None:
+        win = _build_capture_box(root)
 
-    win = tk.Toplevel(root)
-    win.title("Second Brain Capture")
-    win.overrideredirect(True)
-    win.attributes("-topmost", True)
-    win.configure(bg="#3a3a3a")
-
-    frame = tk.Frame(win, bg="#3a3a3a", padx=10, pady=8)
-    frame.pack(fill="both", expand=True)
-    tk.Label(
-        frame, text="Capture  (Enter to file · Esc to cancel)",
-        bg="#3a3a3a", fg="#bbbbbb", font=("Segoe UI", 9),
-        anchor="w",
-    ).pack(fill="x", pady=(0, 4))
-    entry = tk.Entry(frame, width=64, font=("Segoe UI", 13))
-    entry.pack(fill="x")
-
-    def submit(_event=None):
-        text = entry.get()
-        close()
-        if text.strip():
-            threading.Thread(target=handle_capture, args=(text,), daemon=True).start()
-
-    def cancel(_event=None):
-        close()
-
-    def close():
-        win.withdraw()
-
-    entry.bind("<Return>", submit)
-    entry.bind("<KP_Enter>", submit)
-    entry.bind("<Escape>", cancel)
-    win.bind("<Escape>", cancel)
-    win.protocol("WM_DELETE_WINDOW", cancel)
+    entry, defn = _box["entry"], _box["defn"]
+    _box["source"] = source
+    entry.delete(0, tk.END)
+    defn.delete(0, tk.END)
+    if grabbed:
+        entry.insert(0, grabbed)
+    _set_mode("term" if looks_like_a_term(grabbed) else "note")
 
     win.update_idletasks()
     sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
@@ -435,9 +973,165 @@ def show_capture_box(root: tk.Tk) -> None:
     win.attributes("-topmost", True)
     win.focus_force()
     entry.focus_set()
+    # Selected, not just present: Enter accepts what was highlighted and
+    # typing replaces it. Either way it is one keystroke.
+    entry.selection_range(0, tk.END)
+    entry.icursor(tk.END)
 
-    _box["win"] = win
-    _box["entry"] = entry
+    # Painted from what we knew last time so the box is never waiting on the
+    # network to appear, then corrected off-thread. A banner that is one
+    # keypress stale is fine; a capture box that takes 200 ms to open is not.
+    set_session_banner(_box["session"])
+    threading.Thread(
+        target=lambda: EVENTS.put(("session", session_label())), daemon=True
+    ).start()
+
+
+def _build_capture_box(root: tk.Tk) -> tk.Toplevel:
+    win = tk.Toplevel(root)
+    win.title("Second Brain Capture")
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+    win.configure(bg="#3a3a3a")
+
+    frame = tk.Frame(win, bg="#3a3a3a", padx=10, pady=8)
+    frame.pack(fill="both", expand=True)
+    hint = tk.Label(
+        frame, text=_HINTS["note"],
+        bg="#3a3a3a", fg="#bbbbbb", font=("Segoe UI", 9),
+        anchor="w",
+    )
+    hint.pack(fill="x", pady=(0, 4))
+    # Where captures are going right now. Blank and invisible when no session
+    # is open, because a permanently-present "no session" line would be one
+    # more thing to read past on every capture for the 95% of them that are
+    # not in a lecture.
+    banner = tk.Label(
+        frame, text="", bg="#3a3a3a", fg="#8fb98f", font=("Segoe UI", 9, "bold"),
+        anchor="w",
+    )
+    entry = tk.Entry(frame, width=64, font=("Segoe UI", 13))
+    entry.pack(fill="x")
+
+    defrow = tk.Frame(frame, bg="#3a3a3a")
+    tk.Label(
+        defrow, text="means", bg="#3a3a3a", fg="#8fb98f",
+        font=("Segoe UI", 9), anchor="w",
+    ).pack(side="left", padx=(0, 6))
+    defn = tk.Entry(defrow, width=56, font=("Segoe UI", 12))
+    defn.pack(side="left", fill="x", expand=True)
+
+    def close():
+        win.withdraw()
+
+    def submit(_event=None):
+        mode = _box["mode"]
+        text, definition, source = entry.get(), defn.get(), _box["source"]
+        close()
+        if not text.strip():
+            return
+        png = pending_png()
+        if text.lstrip().startswith("/"):
+            threading.Thread(
+                target=_run_command, args=(text.strip(),), daemon=True
+            ).start()
+        elif png:
+            # The typed line becomes the caption, which is the title, which
+            # is what makes the image findable six weeks later. An image
+            # filed under "Screenshot — 14 Sep" is an image nobody finds.
+            _pending["png"] = None
+            threading.Thread(
+                target=_file_pending, args=(png, text, source), daemon=True
+            ).start()
+        elif mode == "term":
+            threading.Thread(
+                target=handle_term, args=(text, definition, source), daemon=True
+            ).start()
+        else:
+            threading.Thread(target=handle_capture, args=(text,), daemon=True).start()
+
+    def _file_pending(png, caption, source):
+        if file_screenshot(png, caption=caption, source=source):
+            beep_ok()
+            notify(f"Screenshot filed: {caption[:50]}")
+        else:
+            beep_fail()
+            notify("Screenshot not filed — Second Brain is not running.", error=True)
+        EVENTS.put(("pending", False))
+
+    def _run_command(text):
+        handle_command(text)
+        # The banner is stale the moment a session opens or closes, and this
+        # is the only thread that knows it happened.
+        EVENTS.put(("session", session_label()))
+
+    def on_term_enter(_event=None):
+        """Enter from the term field means "yes, that is the term".
+
+        It moves to the definition rather than filing, because the definition
+        is the half that makes the note worth having and asking for it costs
+        one keystroke. Pressing Enter again on an empty definition files it
+        anyway — an undefined term is still the thing you did not know.
+        """
+        if not defn.get().strip() and win.focus_get() is not defn:
+            defn.focus_set()
+            return "break"
+        return submit()
+
+    def _drop_pending(_event=None):
+        """Keep the note, throw away the picture. A screenshot offered is not
+        a screenshot wanted, and having to cancel the whole capture to say so
+        would make the offer a nuisance."""
+        _pending["png"] = None
+        set_session_banner()
+        return "break"
+
+    def toggle_mode(_event=None):
+        _set_mode("note" if _box["mode"] == "term" else "term")
+        # Focus stays on the first field either way: switching mode is a
+        # correction of what the thing *is*, not a jump to a different part
+        # of it, and the text already typed is still the term or the note.
+        entry.focus_set()
+        return "break"  # Tab must not walk the focus ring as well
+
+    for widget in (entry, defn, win):
+        widget.bind("<Escape>", lambda _e: close())
+        widget.bind("<Tab>", toggle_mode)
+        # Ctrl+Enter files from wherever the cursor is, including a
+        # half-typed definition.
+        widget.bind("<Control-Return>", submit)
+        widget.bind("<Control-d>", _drop_pending)
+    entry.bind("<Return>", lambda e: on_term_enter(e) if _box["mode"] == "term" else submit(e))
+    entry.bind("<KP_Enter>", lambda e: on_term_enter(e) if _box["mode"] == "term" else submit(e))
+    defn.bind("<Return>", submit)
+    defn.bind("<KP_Enter>", submit)
+    win.protocol("WM_DELETE_WINDOW", lambda: close())
+
+    _box.update({"win": win, "entry": entry, "defn": defn, "defrow": defrow,
+                 "hint": hint, "banner": banner})
+    return win
+
+
+def set_session_banner(label: str = None) -> None:
+    """One line above the box saying where this capture is going, and whether
+    a screenshot is riding along. Hidden when neither is true — a permanent
+    "no session, no screenshot" line is one more thing to read past on every
+    capture, for the majority of captures that are neither."""
+    if label is not None:
+        _box["session"] = label
+    banner = _box.get("banner")
+    if banner is None:
+        return
+    bits = []
+    if _box["session"]:
+        bits.append(f"→ {_box['session']}")
+    if pending_png():
+        bits.append("📎 screenshot attached  (Ctrl+D to drop it)")
+    if bits:
+        banner.configure(text="   ".join(bits))
+        banner.pack(fill="x", pady=(0, 4), before=_box["entry"])
+    else:
+        banner.pack_forget()
 
 
 def show_toast(root: tk.Tk, text: str, error: bool) -> None:
@@ -464,6 +1158,12 @@ def poll_events(root: tk.Tk) -> None:
                 show_capture_box(root)
             elif item[0] == "notify":
                 show_toast(root, item[1], item[2])
+            elif item[0] == "session":
+                set_session_banner(item[1])
+            elif item[0] == "pending":
+                # Only repaints the box; nothing pops up. A snip should not
+                # steal focus from whatever it was taken out of.
+                set_session_banner()
     except queue.Empty:
         pass
     root.after(80, poll_events, root)
@@ -476,6 +1176,7 @@ def main() -> int:
         return 0
 
     threading.Thread(target=hotkey_thread, daemon=True).start()
+    threading.Thread(target=watch_clipboard, daemon=True).start()
 
     root = tk.Tk()
     root.withdraw()

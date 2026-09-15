@@ -1,17 +1,15 @@
 ---
-id:
-title:
-bucket:
-created:
-updated:
+id: "{{date:YYYYMMDD}}T{{time:HHmmss}}-curiosity"
+title: "{{title}}"
+bucket: resource
+created: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
+updated: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
 tags:
-source:
-category:
+  - curiosity
+source: manual
+category: study
 review:
-cycle days:
----
-
-
+  cycle_days: 180
   next:
 ---
 
@@ -41,9 +39,9 @@ cycle days:
 
 ## Source
 
-<!-- Where the curiosity came from, and any material worth coming back to. -->
+<!-- Where the curiosity came from, and any material worth coming back to.
 
-<!-- HOW ATOMIC NOTES GET WRITTEN — the same rule as an Assignment: feed in a
+     HOW ATOMIC NOTES GET WRITTEN — the same rule as an Assignment: feed in a
      block of text, and the fewest atomic notes that cover the relevant
      roadmap items above get written. The roadmap is the filter; anything in
      the source that does not serve an item up there is out of scope. -->

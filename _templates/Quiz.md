@@ -1,22 +1,22 @@
 ---
-aliases:
-id:
-title:
-bucket:
-created:
-updated:
+id: "{{date:YYYYMMDD}}T{{time:HHmmss}}-quiz"
+title: "{{title}}"
+bucket: project
+created: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
+updated: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
 tags:
-source:
-category:
+  - quiz
+source: manual
+category: quiz
 project:
-status:
-learning:
-level:
-ideal_end:
-skills:
-material:
----
-
+  status: active
+  deadline:
+  estimate_minutes: 60
+  level: 3
+  learning: true
+  ideal_end:
+  skills: []
+  materials: []
   steps:
     - id: s1
       text: Compile key concepts and link their atomic notes

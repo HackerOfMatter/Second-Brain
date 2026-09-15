@@ -1,0 +1,1 @@
+![[docs/Drop/_Past/Accounting/Study Terms/Screenshot 2025-07-05 140249.png]] 

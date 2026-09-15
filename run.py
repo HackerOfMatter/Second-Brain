@@ -74,6 +74,51 @@ def cmd_init(args) -> int:
     return 0
 
 
+def cmd_templates(args) -> int:
+    """Check the templates, and put them back when one is broken.
+
+    Separate from `init` because the two want opposite things. `init` must
+    never clobber a template lj has customised, so it only writes what is
+    missing. Repair is the case where a template has been *corrupted* rather
+    than customised — which has happened once already, to all nine at once —
+    and there the whole point is to overwrite.
+
+    So repair is opt-in, it prints what it is about to overwrite, and the
+    plain form checks without touching anything.
+    """
+    from sb.render import check
+    from sb.templates import write_templates
+
+    cfg = load(args.config)
+    engine = Engine(cfg)
+    rows = check(engine.templates)
+    broken = [r for r in rows if not r["ok"]]
+
+    for row in rows:
+        mark = "OK " if row["ok"] else "!! "
+        print(f"{mark}{row['template']:14} {row.get('bucket', '') or '':9}"
+              f"{len(row.get('headings') or [])} headings")
+        for problem in row["problems"]:
+            print(f"                  · {problem}")
+
+    if not args.repair:
+        print()
+        if broken:
+            print(f"{len(broken)} of {len(rows)} templates would not produce a readable note.")
+            print("Run `python run.py templates --repair` to write them back.")
+            return 1
+        print(f"All {len(rows)} templates build a readable note.")
+        return 0
+
+    written = write_templates(engine.vault, overwrite=True)
+    print()
+    print(f"Rewrote {len(written)} files in _templates/.")
+    print("Anything you had customised in them is gone — that is what repair means.")
+    print("Never put a `#` comment inside the --- block: Obsidian's Properties")
+    print("editor swallows it and leaves the rest of the YAML in the note body.")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     """The wiring check — and, since Sprint 3, an audited one.
 
@@ -131,6 +176,27 @@ def cmd_doctor(args) -> int:
         out("           " + ("path does not exist" if not h["vault_exists"]
                              else "the path exists but no note in it could be read"))
     out("           notes: " + ", ".join(f"{k}={v}" for k, v in h["counts"].items()))
+
+    # -- templates ----------------------------------------------------------
+    # The shape of every note, and a file lj edits in Obsidian — which is how
+    # all nine came to be silently corrupted for three weeks while still
+    # looking fine in the sidebar. A template that no longer builds a Note is
+    # a hand-written note that will not be readable, so this is a failure and
+    # not a warning.
+    t = h.get("templates") or {}
+    if t.get("error"):
+        out(f"{bad}templates  could not be checked: {t['error']}")
+    elif not t.get("total"):
+        out(f"{meh}templates  none found — `python run.py templates` writes them")
+    elif t.get("broken"):
+        out(f"{bad}templates  {t['ok']}/{t['total']} usable")
+        for row in t["broken"]:
+            out(f"           · {row['template']}: {'; '.join(row['problems'])}")
+        out("           `python run.py templates --repair` puts them back")
+        out("           never put a `#` comment inside the --- block: Obsidian's")
+        out("           Properties editor swallows it and truncates the rest")
+    else:
+        out(f"{ok}templates  {t['ok']}/{t['total']} build a readable note")
 
     # -- models -------------------------------------------------------------
     llm = h["llm"]
@@ -704,6 +770,10 @@ def main() -> int:
     s.set_defaults(func=cmd_serve)
 
     sub.add_parser("init", help="create vault folders and templates").set_defaults(func=cmd_init)
+    t = sub.add_parser("templates", help="check the note templates, or put them back")
+    t.add_argument("--repair", action="store_true",
+                   help="overwrite every template with the built-in copy")
+    t.set_defaults(func=cmd_templates)
     d = sub.add_parser("doctor", help="check the wiring")
     d.add_argument("--write", action="store_true",
                    help="also save the report to _system/logs/doctor-YYYYMMDD.txt")

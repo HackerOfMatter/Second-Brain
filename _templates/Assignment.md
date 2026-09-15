@@ -1,32 +1,26 @@
 ---
-id:
-title:
-bucket:
-created:
-updated:
+id: "{{date:YYYYMMDD}}T{{time:HHmmss}}-assignment"
+title: "{{title}}"
+bucket: project
+created: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
+updated: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
 tags:
-source:
-category:
+  - assignment
+source: manual
+category: hw
 project:
-status: active
-deadline:
-estimate_minutes:
-level:
-learning:
-ideal_end:
-skills:
----
-
-
+  status: active
+  deadline:
+  estimate_minutes: 60
+  level: 3
+  learning: true
+  ideal_end:
+  skills: []
   materials:
     - text: the source guide file, e.g. unit3_study_guide.pdf
       kind: material
       done: false
-  steps:                # ONE STEP PER QUESTION OR KEY CONCEPT — see below.
-                        # Wikilink the key terms inside the question text; where
-                        # a key term IS the atomic note, the question and the
-                        # pointer to that note are the same link. The links start
-                        # empty and resolve during stage 2.
+  steps:
     - id: s1
       text: "Why does [[Key Term]] behave the way it does?"
       minutes: 20
@@ -36,6 +30,11 @@ skills:
 # {{title}}
 
 **Done means:**
+
+<!-- ONE STEP PER QUESTION OR KEY CONCEPT. Wikilink the key terms inside the
+     question text; where a key term IS the atomic note, the question and the
+     pointer to that note are the same link. The links start empty and resolve
+     during stage 2 below. -->
 
 ## Steps
 

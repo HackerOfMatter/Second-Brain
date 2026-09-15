@@ -11,7 +11,7 @@ type:
 
 2. **Key Concepts**: ConceptsRelated
 
-[[Credit Terms.png]]
+[[docs/Drop/_Past/Accounting/Study Terms/Credit Terms.png]]
 
 
 

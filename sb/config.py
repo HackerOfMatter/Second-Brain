@@ -244,6 +244,38 @@ class IntakeConfig(BaseModel):
     max_per_run: int = 25
 
 
+class CaptureConfig(BaseModel):
+    """What happens to a capture that did not say where it was going.
+
+    The three dashboard buttons always say. The hotkey box, the Obsidian
+    plugin and anything else that just hands over a line of text do not, and
+    those used to land in `00-Inbox` — which is a queue, and a queue nobody
+    empties is a folder with a worse name. Most of what gets captured in a
+    hurry is reference material, so `resource` is the honest default: the
+    note is filed, reviewable, searchable and on the review cycle from the
+    moment it is written, and moving one that guessed wrong is a drag in
+    Obsidian.
+
+    This is *not* the Drop folder's floor. A dropped file the classifier is
+    unsure about still goes to the Inbox with its suggestion attached, because
+    there the system has actually formed a doubt and saying so is the whole
+    design (`intake.auto_floor`). Silence is not doubt.
+    """
+
+    default_bucket: str = "resource"  # resource | inbox | area | project
+
+    #: Which template shapes a plain capture. `Atomic Note` on purpose: every
+    #: captured note then arrives carrying the `## In my own words` heading,
+    #: which is the one slot `sb/collected.py` reads to tell a note you used
+    #: from a note you merely kept. A heading that is visibly empty is the
+    #: cheapest prompt there is.
+    #:
+    #: Any name in `_templates/` works — the template decides the headings, so
+    #: changing this, or editing that file, changes what the system writes
+    #: without touching code. See sb/render.py.
+    default_template: str = "Atomic Note"
+
+
 class ReviewConfig(BaseModel):
     resource_cycle_days: int = 90
     habit_checkin_weekday: int = 6  # Sunday
@@ -287,6 +319,7 @@ class Config(BaseModel):
     review: ReviewConfig = Field(default_factory=ReviewConfig)
     study: StudyConfig = Field(default_factory=StudyConfig)
     intake: IntakeConfig = Field(default_factory=IntakeConfig)
+    capture: CaptureConfig = Field(default_factory=CaptureConfig)
     connect: ConnectConfig = Field(default_factory=ConnectConfig)
 
     @property

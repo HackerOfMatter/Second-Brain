@@ -30,6 +30,7 @@ from starlette.staticfiles import StaticFiles
 
 from . import digest as digestmod
 from . import freshness
+from . import intake as intakemod
 from .config import Config, load
 from .engine import Engine
 
@@ -147,14 +148,107 @@ def build_app(cfg: Config | None = None) -> Starlette:
 
     @guard
     async def capture(request: Request):
+        """A capture that names no bucket gets the configured default.
+
+        It used to be `inbox` — which is a queue, and the failure mode of a
+        queue is that it is not emptied. See CaptureConfig.
+        """
         body = await request.json()
         return ok(await run_in_threadpool(
             engine.capture,
             body.get("text", ""),
-            body.get("bucket", "inbox"),
+            body.get("bucket") or cfg.capture.default_bucket,
             body.get("title", ""),
             body.get("due") or None,
+            str(body.get("folder") or ""),
         ))
+
+    @guard
+    async def session_status(request: Request):
+        return ok(await run_in_threadpool(engine.session_status))
+
+    @guard
+    async def session_start(request: Request):
+        body = await body_of(request)
+        return ok(await run_in_threadpool(
+            engine.session_start,
+            str(body.get("course") or ""),
+            str(body.get("chapter") or ""),
+        ))
+
+    @guard
+    async def session_end(request: Request):
+        return ok(await run_in_threadpool(engine.session_end))
+
+    @guard
+    async def capture_term(request: Request):
+        """One highlighted word, one term note, one card. See Engine.capture_term."""
+        body = await body_of(request)
+        return ok(await run_in_threadpool(
+            engine.capture_term,
+            str(body.get("term") or ""),
+            str(body.get("definition") or ""),
+            source=str(body.get("source") or ""),
+            folder=str(body.get("folder") or ""),
+        ))
+
+    @guard
+    async def attach(request: Request):
+        """A screenshot from the clipboard. See Engine.attach_image.
+
+        base64 in a JSON body, same as the drop upload and for the same
+        reason: the form parser would be a sixth package for one route.
+        """
+        body = await body_of(request)
+        try:
+            data = base64.b64decode(str(body.get("data") or ""), validate=True)
+        except Exception:
+            raise ValueError("the image was not valid base64")
+        if len(data) > intakemod.MAX_UPLOAD_BYTES:
+            raise ValueError("that image is past the upload limit")
+        return ok(await run_in_threadpool(
+            engine.attach_image, data,
+            caption=str(body.get("caption") or ""),
+            source=str(body.get("source") or ""),
+            suffix=str(body.get("suffix") or ".png"),
+        ))
+
+    @guard
+    async def collected_debt(request: Request):
+        """Kept but never used. See sb/collected.py."""
+        raw = request.query_params.get("limit")
+        limit = int(raw) if raw and raw.isdigit() else 40
+        return ok(await run_in_threadpool(engine.collected_debt, limit))
+
+    @guard
+    async def folders(request: Request):
+        return ok(await run_in_threadpool(engine.folders))
+
+    @guard
+    async def move_to_folder(request: Request):
+        """File several notes into one folder. See Engine.move_to_folder."""
+        body = await body_of(request)
+        ids = body.get("note_ids")
+        if not isinstance(ids, list):
+            raise ValueError("note_ids must be a list")
+        return ok(await run_in_threadpool(
+            engine.move_to_folder, ids, str(body.get("folder") or ""),
+            create=body.get("create", True) is not False,
+        ))
+
+    @guard
+    async def retire_note(request: Request):
+        """The only way the system takes a note out of circulation, and it
+        does not delete it. See Engine.retire_note."""
+        body = await body_of(request)
+        return ok(await run_in_threadpool(
+            engine.retire_note, request.path_params["note_id"],
+            str(body.get("reason") or ""),
+        ))
+
+    @guard
+    async def undefined_terms(request: Request):
+        return ok({"terms": await run_in_threadpool(engine.undefined_terms)})
 
     @guard
     async def capture_plan(request: Request):
@@ -720,6 +814,16 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/dashboard", dashboard),
         Route("/api/inbox", inbox),
         Route("/api/capture", capture, methods=["POST"]),
+        Route("/api/session", session_status),
+        Route("/api/session/start", session_start, methods=["POST"]),
+        Route("/api/session/end", session_end, methods=["POST"]),
+        Route("/api/capture/term", capture_term, methods=["POST"]),
+        Route("/api/terms/undefined", undefined_terms),
+        Route("/api/folders", folders),
+        Route("/api/collected", collected_debt),
+        Route("/api/attach", attach, methods=["POST"]),
+        Route("/api/notes/folder", move_to_folder, methods=["POST"]),
+        Route("/api/notes/{note_id}/retire", retire_note, methods=["POST"]),
         Route("/api/capture/plan", capture_plan, methods=["POST"]),
         Route("/api/capture/commit", capture_commit, methods=["POST"]),
         Route("/api/notes", list_notes),

@@ -1,31 +1,26 @@
 ---
-id:
-title:
-bucket:
-created:
-updated:
+id: "{{date:YYYYMMDD}}T{{time:HHmmss}}-paper"
+title: "{{title}}"
+bucket: project
+created: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
+updated: "{{date:YYYY-MM-DD}}T{{time:HH:mm:ss}}"
 tags:
-source:
-category:
+  - paper
+source: manual
+category: hw
 project:
-status:
-deadline:
-estimate_minutes:
-level:
-learning:
-ideal_end:
-skills:
-material:
----
-
-
+  status: active
+  deadline:
+  estimate_minutes: 240
+  level: 3
+  learning: false
+  ideal_end:
+  skills: []
   materials:
     - text: the assignment prompt
       kind: material
       done: false
-  steps:                # THE SECTION OUTLINE — structure only, no prose.
-                        # Each step names a section and what it must accomplish,
-                        # with [[links]] to the atomic notes that supply evidence.
+  steps:
     - id: s1
       text: "Intro — frame the question, state the thesis"
       minutes: 30
@@ -39,6 +34,10 @@ material:
 # {{title}}
 
 **Done means:**
+
+<!-- THE STEPS ARE THE SECTION OUTLINE — structure only, no prose. Each step
+     names a section and what it must accomplish, with [[links]] to the atomic
+     notes that supply evidence. -->
 
 ## Steps
 

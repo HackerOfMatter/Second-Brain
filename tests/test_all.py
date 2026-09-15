@@ -4995,6 +4995,1094 @@ def test_intake_api():
             check("and that nothing is left waiting", h["drop"]["waiting"] == 0, h["drop"])
 
 
+def _age_note(engine, note_id, days):
+    note = engine.note(note_id)
+    note.created = note.created - dt.timedelta(days=days)
+    engine.vault.save(note)
+
+
+def test_every_template_builds_a_readable_note():
+    """Phase 14 — the check that would have caught three weeks of silence.
+
+    Every template in this vault was corrupted by Obsidian's Properties editor
+    between 23 August and 14 September, and nothing noticed: they went on
+    looking right in the sidebar while producing notes with no id and no
+    bucket. So the test is not about style. It builds a real `Note` from each
+    template, which is the only thing that would have failed.
+    """
+    section("templates: every one builds a note")
+    import re as _re
+
+    from sb import frontmatter as _fm
+    from sb.render import fill_placeholders
+    from sb.templates import TEMPLATES
+
+    for name, text in sorted(TEMPLATES.items()):
+        filled = fill_placeholders(text, "Example Title")
+        meta, body = _fm.parse(filled)
+        block = filled.split("---", 2)[1] if filled.startswith("---") else ""
+
+        check(f"{name}: frontmatter carries no `#` comment",
+              not _re.search(r"(^|\s)#", block), block[:120])
+        check(f"{name}: no stray `---` left in the body",
+              not _re.search(r"^---\s*$", body, _re.M))
+        try:
+            note = Note.from_frontmatter(dict(meta), body)
+            check(f"{name}: builds a note", True)
+            check(f"{name}: with a bucket", bool(note.bucket))
+        except Exception as exc:
+            check(f"{name}: builds a note", False, f"{type(exc).__name__}: {exc}")
+
+
+def test_the_templates_on_disk_are_the_ones_in_the_code():
+    """`sb/templates.py` is the fallback, and a fallback that differs from the
+    real thing is a second shape nobody asked for."""
+    section("templates: disk and code agree")
+    from sb.render import TemplateStore, parse
+    from sb.templates import TEMPLATES, write_templates
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "vault"
+        vault = Vault(root)
+        write_templates(vault)
+        store = TemplateStore(root)
+        for filename, text in sorted(TEMPLATES.items()):
+            name = filename[:-3]
+            on_disk = store.get(name)
+            built_in = parse(name, text, source="builtin")
+            check(f"{name}: read from disk, not the fallback",
+                  on_disk.source == "file", on_disk.source)
+            check(f"{name}: same headings either way",
+                  on_disk.headings == built_in.headings,
+                  (on_disk.headings, built_in.headings))
+
+        # A template lj is halfway through editing must not cost a capture.
+        (root / "_templates" / "Term.md").write_text("---\nnot: [valid", encoding="utf-8")
+        store = TemplateStore(root)
+        check("a broken template falls back to the built-in copy",
+              store.get("Term").headings == built_in.headings or
+              store.get("Term").headings == parse("Term", TEMPLATES["Term.md"]).headings,
+              store.get("Term").headings)
+        (root / "_templates" / "Term.md").write_text("", encoding="utf-8")
+        store = TemplateStore(root)
+        check("and so does an empty one",
+              store.get("Term").headings ==
+              parse("Term", TEMPLATES["Term.md"]).headings)
+
+
+def test_editing_a_template_changes_what_the_system_writes():
+    """The whole claim, in one test. If this fails the templates are
+    documentation again."""
+    section("templates: the template is the shape")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+        from sb.templates import write_templates
+        write_templates(engine.vault)
+
+        out = engine.capture_term("Elasticity", "How much quantity moves with price.")
+        body = engine.note(out["note"]["id"]).body
+        check("a term comes out in the template's shape",
+              body.index("## Definition") < body.index("## In my own words")
+              < body.index("## Seen in"), body)
+        # The guidance is for the person filling one in by hand. Six hundred
+        # copies of it in the vault would outweigh the content.
+        check("the template's HTML comments are not copied into the note",
+              "<!--" not in body, body)
+        check("but they are still in the template",
+              "<!--" in (engine.vault.root / "_templates" / "Term.md").read_text(encoding="utf-8"))
+
+        # Now edit the template the way lj would, and capture again.
+        path = engine.vault.root / "_templates" / "Term.md"
+        path.write_text(
+            path.read_text(encoding="utf-8")
+            .replace("## Seen in", "## Where I met it")
+            + "\n## Why it matters\n",
+            encoding="utf-8",
+        )
+        out = engine.capture_term("Nexus", "Enough presence to be taxed.")
+        body = engine.note(out["note"]["id"]).body
+        check("a renamed heading renames it in the next note",
+              "## Where I met it" in body and "## Seen in" not in body, body)
+        check("a new heading appears in the next note",
+              "## Why it matters" in body, body)
+        check("and no restart was needed to pick it up", True)
+
+
+def test_a_plain_capture_takes_the_atomic_note_shape():
+    section("templates: the capture default")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        check("Atomic Note is the default", cfg.capture.default_template == "Atomic Note")
+        engine = Engine(cfg)
+
+        out = engine.capture("Gross income is all income from whatever source derived.",
+                             "resource")
+        body = engine.note(out["note"]["id"]).body
+        check("a plain capture comes out as an Atomic Note",
+              "## Definition" in body and "## In my own words" in body, body)
+        check("with what you typed in it",
+              "all income from whatever source derived" in body, body)
+        # The point of the default: the slot that discharges the debt is
+        # already on the note, so "have I processed this?" has an answer.
+        from sb.collected import restatement
+        check("and the restatement slot is there and empty",
+              not restatement(body), body)
+
+        # Text that already has structure keeps its own.
+        structured = ("# Chapter 4\n\n## Elasticity\n\nSome prose.\n\n"
+                      "## Incidence\n\nMore prose.\n")
+        out = engine.capture(structured, "resource")
+        body = engine.note(out["note"]["id"]).body
+        check("a document with its own headings is left alone",
+              "## Elasticity" in body and "## Definition" not in body, body)
+
+        from sb.render import wants_shape
+        check("a typed line wants a shape", wants_shape("just a thought"))
+        check("an empty body wants one too", wants_shape(""))
+        check("a structured document does not", not wants_shape(structured))
+
+
+def test_doctor_catches_a_corrupted_template():
+    """The specific corruption, reproduced: Obsidian's Properties editor
+    renaming a key, swallowing a comment and truncating the block."""
+    section("templates: the drift check")
+    from sb.render import TemplateStore, check as check_templates
+    from sb.templates import write_templates
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "vault"
+        write_templates(Vault(root))
+        store = TemplateStore(root)
+        check("a fresh set is clean", all(r["ok"] for r in check_templates(store)))
+
+        path = root / "_templates" / "Atomic Note.md"
+        original = path.read_text(encoding="utf-8")
+
+        # 1. the truncation: the rest of the YAML ends up in the body
+        path.write_text(original.replace(
+            "review:\n  cycle_days: 90\n  next:\n",
+            "review:\ncycle days: 90\n---\n  next:\n"), encoding="utf-8")
+        rows = {r["template"]: r for r in check_templates(TemplateStore(root))}
+        check("a truncated block is caught",
+              not rows["Atomic Note"]["ok"]
+              and any("stray" in p for p in rows["Atomic Note"]["problems"]),
+              rows["Atomic Note"]["problems"])
+
+        # 2. a `#` comment inside the frontmatter — the thing that causes it
+        path.write_text(original.replace(
+            "source: manual", "source: manual  # where it came from"), encoding="utf-8")
+        rows = {r["template"]: r for r in check_templates(TemplateStore(root))}
+        check("a comment inside the frontmatter is caught",
+              any("Properties" in p for p in rows["Atomic Note"]["problems"]),
+              rows["Atomic Note"]["problems"])
+
+        # 3. repair puts it back
+        write_templates(Vault(root), overwrite=True)
+        check("repair fixes it",
+              all(r["ok"] for r in check_templates(TemplateStore(root))))
+        check("and it is byte-for-byte the built-in copy",
+              path.read_text(encoding="utf-8") == original)
+
+
+def test_a_snip_becomes_a_note_with_the_picture_in_it():
+    """Housekeeping 7 — Win+Shift+S, filed where the session is.
+
+    A note rather than a loose file in an attachments folder. Everything else
+    here is a note, which is what makes everything else searchable, linkable
+    and countable; an image filed as an exception to that is an image nobody
+    finds again.
+    """
+    section("screenshots")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+        png = b"\x89PNG\r\n\x1a\n" + b"pretend this is an image"
+
+        engine.session_start("Negotiation", "Week 3")
+        out = engine.attach_image(png, caption="The BATNA diagram",
+                                  source="Zoom — Negotiation")
+        note_path, image_path = Path(out["path"]), Path(out["image"])
+
+        check("the image is written beside the note that embeds it",
+              image_path.read_bytes() == png and image_path.parent.name == "_attachments",
+              str(image_path))
+        check("both land in the session's folder",
+              "Week 3" in str(note_path) and "Week 3" in str(image_path),
+              (str(note_path), str(image_path)))
+
+        body = note_path.read_text(encoding="utf-8")
+        # An embed by filename, not by path: Obsidian resolves it from
+        # anywhere in the vault, so it survives the group-file box moving
+        # the note later. A relative path would not.
+        check("the note embeds the image by name",
+              f"![[{image_path.name}]]" in body, body)
+        check("the caption is the title, so it is findable",
+              engine.note(out["note"]["id"]).title == "The BATNA diagram")
+        check("and it asks for a restatement like any other note",
+              "## In my own words" in body, body)
+
+        done = engine.session_end()
+        check("it is in the session summary",
+              "[[The BATNA diagram]]" in Path(done["path"]).read_text(encoding="utf-8"))
+
+        # With nothing open it is still a note, just not in a class folder.
+        loose = engine.attach_image(png)
+        check("with no session it files to Resources",
+              Path(loose["path"]).parent.name == "30-Resources", loose["path"])
+        check("and titles itself by time rather than pretending to a caption",
+              engine.note(loose["note"]["id"]).title.startswith("Screenshot — "))
+
+        try:
+            engine.attach_image(b"")
+            check("an empty image is refused", False)
+        except ValueError:
+            check("an empty image is refused", True)
+
+        # Two snips in one second are two images, not one overwritten twice.
+        a = engine.attach_image(png, caption="First")
+        b = engine.attach_image(png + b"x", caption="Second")
+        check("two snips are two files",
+              Path(a["image"]).read_bytes() != Path(b["image"]).read_bytes(),
+              (a["image"], b["image"]))
+
+
+def test_a_clipboard_bitmap_becomes_a_png():
+    """The DIB-to-PNG conversion, which has no imaging library behind it.
+
+    A screenshot that needs Pillow installed is a screenshot that stops
+    working the first time the venv is rebuilt, and this file's contract is
+    that it is stdlib only and therefore always runs. So the conversion is
+    written by hand — and hand-written image code is exactly the kind that
+    is subtly wrong in a way nobody notices until the vault is full of grey
+    rectangles.
+
+    Every shape Windows actually produces is checked against a decoder: 24-
+    and 32-bit, bottom-up and top-down, BI_RGB and BI_BITFIELDS.
+    """
+    section("clipboard bitmap → PNG")
+    import struct as _struct
+    import zlib as _zlib
+
+    src = (Path(__file__).resolve().parent.parent / "capture_hotkey.pyw").read_text(
+        encoding="utf-8")
+    ns = {}
+    exec(src[src.index("CF_DIB = 8"):src.index("# --8<-- end testable")], ns)
+    convert = ns["png_from_dib"]
+
+    def dib(pixels, w, h, bits, top_down=False, bitfields=False):
+        stride = ((w * bits + 31) // 32) * 4
+        rows = []
+        for y in range(h):
+            row = bytearray(stride)
+            for x in range(w):
+                r, g, b = pixels[y][x]
+                o = x * (bits // 8)
+                row[o:o + 3] = bytes((b, g, r))
+                # Windows leaves the fourth byte of a 32-bit BI_RGB pixel
+                # *undefined*, and screen capture leaves it at zero. Read as
+                # alpha, every screenshot comes out fully transparent.
+                if bits == 32:
+                    row[o + 3] = 0
+            rows.append(bytes(row))
+        if not top_down:
+            rows = rows[::-1]
+        head = _struct.pack("<IiiHHIIiiII", 40, w, -h if top_down else h, 1, bits,
+                            3 if bitfields else 0, stride * h, 2835, 2835, 0, 0)
+        masks = _struct.pack("<III", 0xFF0000, 0xFF00, 0xFF) if bitfields else b""
+        return head + masks + b"".join(rows)
+
+    def decode(png):
+        """Minimal PNG reader — enough to prove the bytes are a real image."""
+        check("it is a PNG", png[:8] == b"\x89PNG\r\n\x1a\n")
+        pos, chunks = 8, {}
+        while pos < len(png):
+            size = _struct.unpack(">I", png[pos:pos + 4])[0]
+            kind = png[pos + 4:pos + 8]
+            body = png[pos + 8:pos + 8 + size]
+            got = _struct.unpack(">I", png[pos + 8 + size:pos + 12 + size])[0]
+            check(f"the {kind.decode()} checksum is right",
+                  got == (_zlib.crc32(kind + body) & 0xFFFFFFFF))
+            chunks.setdefault(kind, b"")
+            chunks[kind] += body
+            pos += 12 + size
+        w, h, depth, colour = _struct.unpack(">IIBB", chunks[b"IHDR"][:10])
+        raw = _zlib.decompress(chunks[b"IDAT"])
+        out = []
+        for y in range(h):
+            start = y * (w * 3 + 1)
+            check("every scanline is unfiltered", raw[start] == 0)
+            line = raw[start + 1:start + 1 + w * 3]
+            out.append([tuple(line[x * 3:x * 3 + 3]) for x in range(w)])
+        return w, h, depth, colour, out
+
+    want = [[((x * 7) % 256, (y * 11) % 256, (x * y) % 256) for x in range(9)]
+            for y in range(5)]
+
+    for bits, top_down, bitfields in [
+        (24, False, False), (24, True, False),
+        (32, False, False), (32, True, False),
+        (32, False, True), (32, True, True),
+    ]:
+        png, w, h = convert(dib(want, 9, 5, bits, top_down, bitfields))
+        gw, gh, depth, colour, got = decode(png)
+        label = f"{bits}-bit{' top-down' if top_down else ''}{' bitfields' if bitfields else ''}"
+        check(f"{label}: the size survives", (gw, gh, w, h) == (9, 5, 9, 5), (gw, gh))
+        check(f"{label}: 8-bit RGB, no alpha channel to come out transparent",
+              (depth, colour) == (8, 2), (depth, colour))
+        check(f"{label}: every pixel is the pixel that went in", got == want)
+
+    # A bitmap we cannot read is said so, not guessed at: a wrong guess writes
+    # a corrupt file into the vault and calls it a note.
+    for bad, why in [
+        (b"", "an empty payload"),
+        (_struct.pack("<IiiHHIIiiII", 40, 4, 4, 1, 8, 0, 64, 0, 0, 0, 0), "8-bit colour"),
+        (_struct.pack("<IiiHHIIiiII", 40, 4, 4, 1, 24, 1, 64, 0, 0, 0, 0), "RLE compression"),
+        (_struct.pack("<IiiHHIIiiII", 40, 400, 400, 1, 24, 0, 0, 0, 0, 0, 0), "a truncated image"),
+    ]:
+        try:
+            convert(bad)
+            check(f"{why} is refused", False)
+        except ValueError:
+            check(f"{why} is refused", True)
+
+
+def test_collecting_is_told_apart_from_learning():
+    """Housekeeping 6 — the collector's fallacy, measured rather than scolded.
+
+    Two things count as having used a note, and lj picked both: a restatement
+    under `## In my own words`, or a card that has actually been answered.
+    What is *eligible* to be debt matters as much as the test, or the report
+    is noise nobody reads.
+    """
+    section("kept, but not used")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+        long_text = "clipping " * 120
+
+        kept = engine.capture(long_text, "resource", title="A long clipping")
+        said = engine.capture(long_text, "resource", title="One I restated")
+        drilled = engine.capture(long_text, "resource", title="One I carded")
+        drafted = engine.capture(long_text, "resource", title="One I carded and ignored")
+        tiny = engine.capture("Two words.", "resource", title="Tiny")
+        fresh = engine.capture(long_text, "resource", title="Written yesterday")
+        for row in (kept, said, drilled, drafted, tiny):
+            _age_note(engine, row["note"]["id"], 30)
+        _age_note(engine, fresh["note"]["id"], 1)
+
+        note = engine.note(said["note"]["id"])
+        note.body += "\n\n## In my own words\n\nIt means the thing.\n"
+        engine.vault.save(note)
+
+        engine.add_card(drilled["note"]["id"], "What does it mean?", "The thing.")
+        deck = engine.deck(drilled["note"]["id"])
+        deck.cards[0].reps = 3
+        engine.decks.save(deck)
+        # Cards that exist and have never been answered are collecting with
+        # extra steps, so this one is still a debt.
+        engine.add_card(drafted["note"]["id"], "Anything?", "Nothing yet.")
+
+        out = engine.collected_debt()
+        debts = {i["title"] for i in out["items"]}
+        check("a long clipping nobody touched is a debt", "A long clipping" in debts, debts)
+        check("a restatement discharges it", "One I restated" not in debts, debts)
+        check("so does a card that has been answered", "One I carded" not in debts, debts)
+        check("but a card nobody has answered does not",
+              "One I carded and ignored" in debts, debts)
+        check("a short note is not in scope at all", "Tiny" not in debts, debts)
+        check("nor is one written yesterday", "Written yesterday" not in debts, debts)
+
+        check("the ratio is over what is in scope, not over everything — "
+              "capturing more short notes cannot improve it",
+              (out["eligible"], out["used"], out["collected"]) == (4, 2, 2),
+              {k: out[k] for k in ("eligible", "used", "collected")})
+        check("it counts the cards nobody has answered separately",
+              out["carded_but_unreviewed"] == 1, out["carded_but_unreviewed"])
+        check("oldest first", [i["title"] for i in out["items"]][0] in debts, out["items"])
+        check("and it says so in one line without editorialising",
+              "kept but not used" in out["sentence"], out["sentence"])
+
+        # An empty heading is not a restatement — it is the normal state of a
+        # note filed from a template and never returned to.
+        from sb.collected import restatement
+        check("an absent heading is not a restatement", not restatement("# T\n\nbody"))
+        check("an empty one is not either",
+              not restatement("# T\n\n## In my own words\n\n## Source\n"))
+        check("nor is the prompt that asked for one",
+              not restatement("## In my own words\n\n*Write it in your own words.*\n"))
+        check("a sentence is", restatement("## In my own words\n\nBecause X causes Y.")
+              == "Because X causes Y.")
+
+        # Links are written automatically on every capture. Counting them
+        # would mark the whole vault processed on the day it was written —
+        # which is precisely the illusion being measured.
+        linked = engine.note(kept["note"]["id"])
+        linked.body += "\n\n## Related\n\n- [[One I restated]]\n"
+        engine.vault.save(linked)
+        check("an automatic link does not count as having used a note",
+              "A long clipping" in {i["title"] for i in engine.collected_debt()["items"]})
+
+
+def test_collected_debt_over_the_api():
+    section("kept, but not used: over HTTP")
+    from starlette.testclient import TestClient
+
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        app = build_app(cfg)
+        with TestClient(app) as client:
+            r = client.get("/api/collected")
+            check("the endpoint answers on an empty vault", r.status_code == 200, r.text)
+            check("and says nothing is in scope yet", r.json()["eligible"] == 0, r.json())
+
+            client.post("/api/capture/term", json={"term": "Framing"})
+            check("an undefined term rides along in its own list",
+                  [t["title"] for t in client.get("/api/collected").json()["undefined_terms"]]
+                  == ["Framing"], client.get("/api/collected").json()["undefined_terms"])
+
+            # Retiring is a real answer to "kept but not used", and the
+            # reason the archive exists.
+            note_id = client.get("/api/collected").json()["undefined_terms"][0]["id"]
+            r = client.post(f"/api/notes/{note_id}/retire", json={"reason": "not needed"})
+            check("and the panel's retire button has an endpoint", r.status_code == 200, r.text)
+            check("which moves rather than deletes",
+                  "_retired" in r.json()["path"], r.json())
+
+            w = client.get("/api/review/weekly").json()
+            check("the weekly review carries the same number",
+                  "collected" in w and "sentence" in w["collected"], list(w))
+
+
+def test_filing_several_notes_into_one_folder():
+    """Housekeeping 5 — the thing this replaces is dragging each note.
+
+    Which is fine for one note, and is exactly why forty notes stay where
+    they landed. The two rules that make it safe to point at forty: nothing
+    but the folder changes, and one bad id does not lose the other
+    thirty-nine.
+    """
+    section("group file")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+        (cfg.vault / "30-Resources" / "Federal Taxation").mkdir(parents=True)
+
+        res = engine.capture("Gross income is all income from whatever source derived.",
+                             "resource")
+        proj = engine.capture("Draft the tax memo by Friday", "project")
+        before = engine.note(proj["note"]["id"])
+        deadline, steps = before.project.deadline, len(before.project.steps)
+
+        out = engine.move_to_folder(
+            [res["note"]["id"], proj["note"]["id"], "no-such-note"], "fed tax"
+        )
+        check("the folder name is matched, not multiplied",
+              (out["folder"], out["matched"]) == ("Federal Taxation", "initials"), out)
+        check("one bad id does not lose the rest", len(out["moved"]) == 2, out)
+        check("and it is reported rather than swallowed",
+              len(out["failed"]) == 1 and "no-such-note" in out["failed"][0]["note_id"],
+              out["failed"])
+
+        where = engine.vault.folders_by_id()
+        check("each note keeps its own bucket and gains the folder",
+              where[res["note"]["id"]] == "30-Resources/Federal Taxation"
+              and where[proj["note"]["id"]] == "20-Projects/Federal Taxation", where)
+
+        after = engine.note(proj["note"]["id"])
+        check("a moved Project is still the same Project",
+              after.project.deadline == deadline
+              and len(after.project.steps) == steps
+              and after.updated == before.updated, after.project.deadline)
+        check("the old file is gone, not copied",
+              not Path(res["path"]).exists() and len(list(
+                  (cfg.vault / "30-Resources").rglob("*.md"))) == 1,
+              [str(p) for p in (cfg.vault / "30-Resources").rglob("*.md")])
+
+        try:
+            engine.move_to_folder([], "Federal Taxation")
+            check("filing nothing is refused", False)
+        except ValueError:
+            check("filing nothing is refused", True)
+
+        check("the folder list is offered so the box can match against it",
+              "Federal Taxation" in engine.folders()["all"], engine.folders())
+
+
+def test_group_file_over_the_api():
+    section("group file: over HTTP")
+    from starlette.testclient import TestClient
+
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        with TestClient(build_app(cfg)) as client:
+            ids = [client.post("/api/capture",
+                               json={"text": f"Reference note number {n} about things."}
+                               ).json()["note"]["id"] for n in range(3)]
+            r = client.post("/api/notes/folder",
+                            json={"note_ids": ids, "folder": "Negotiation"})
+            check("the endpoint files them", r.status_code == 200, r.text)
+            check("all three", len(r.json()["moved"]) == 3, r.json())
+            check("into a folder it says it created",
+                  r.json()["matched"] == "new", r.json())
+            check("and the folder now shows up in the list",
+                  "Negotiation" in client.get("/api/folders").json()["all"])
+
+            r = client.post("/api/notes/folder", json={"note_ids": "not a list"})
+            check("a malformed request is a 400, not a 500", r.status_code == 400,
+                  r.status_code)
+            r = client.post("/api/notes/folder", json={"note_ids": ids, "folder": ""})
+            check("and so is a nameless folder", r.status_code == 400, r.status_code)
+
+
+def test_a_capture_that_says_nothing_lands_in_resources():
+    """Housekeeping 4 — silence is not doubt.
+
+    A capture with no bucket used to go to `00-Inbox`. The Inbox is a queue,
+    and the failure mode of a queue is that nobody empties it — the note is
+    unreviewable, off the review cycle, and indistinguishable from the notes
+    the system genuinely could not classify. Most of what is captured in a
+    hurry is reference material, so that is where it goes.
+
+    The Drop folder's floor is untouched, and the distinction is the point: a
+    dropped file below `auto_floor` still waits in the Inbox, because there
+    the system formed an actual doubt and said so.
+    """
+    section("the default bucket")
+    from starlette.testclient import TestClient
+
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.use_model = False
+        cfg.intake.watch = False
+        check("resource is the default", cfg.capture.default_bucket == "resource")
+
+        with TestClient(build_app(cfg)) as client:
+            r = client.post("/api/capture", json={"text": "The tax basis of a gift carries over."})
+            check("a capture with no bucket is filed as a Resource",
+                  r.json()["note"]["bucket"] == "resource", r.json()["note"])
+            note_id = r.json()["note"]["id"]
+            check("and goes on the review cycle like any other Resource — "
+                  "reviewable from the moment it is written",
+                  bool(client.get(f"/api/notes/{note_id}").json()["review"]["next"]),
+                  client.get(f"/api/notes/{note_id}").json().get("review"))
+
+            # Saying where it goes still decides where it goes.
+            r = client.post("/api/capture", json={"text": "Nothing decided yet.",
+                                                  "bucket": "inbox"})
+            check("an explicit bucket is still obeyed",
+                  r.json()["note"]["bucket"] == "inbox", r.json()["note"])
+
+            # And the Drop floor is a separate decision, deliberately.
+            (cfg.drop_dir / "vague.md").write_text("Maybe do something about that",
+                                                   encoding="utf-8")
+            _age(cfg.drop_dir / "vague.md")
+            client.post("/api/intake")
+            d = client.get("/api/dashboard").json()
+            check("a dropped file the classifier doubts still waits in the Inbox",
+                  any(row.get("file") == "vague.md" for row in d["inbox"]), d["inbox"])
+
+        # One line of config moves it back.
+        cfg2 = Config(vault=Path(tmp) / "vault2")
+        cfg2.llm.provider = "heuristic"
+        cfg2.intake.watch = False
+        cfg2.capture.default_bucket = "inbox"
+        with TestClient(build_app(cfg2)) as client:
+            r = client.post("/api/capture", json={"text": "Back to the old way."})
+            check("and the old behaviour is one config line away",
+                  r.json()["note"]["bucket"] == "inbox", r.json()["note"])
+
+
+def test_two_notes_in_one_second_do_not_become_one():
+    """The id was the second plus the title slug, and the filename was built
+    from the same two things — so two notes with the same title, captured in
+    the same second, were one note. The second overwrote the first on disk and
+    `find` could not have told them apart anyway. No error, anywhere.
+
+    Two terms typed quickly into a lecture is exactly that shape of capture,
+    which is why this sits under the never-delete rule rather than beside it.
+    """
+    section("a capture cannot overwrite another capture")
+    from sb.models import new_id
+
+    ids = {new_id("Same Name") for _ in range(50)}
+    check("fifty ids for one title are fifty ids", len(ids) == 50, len(ids))
+    check("and they are still sortable, and still the same shape",
+          all(len(i.split("-", 1)[0]) == 15 for i in ids)
+          and sorted(ids) == sorted(ids, key=str), sorted(ids)[:3])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+        a = engine.capture("The first one, which must survive.", "resource", title="Same Name")
+        b = engine.capture("The second one.", "resource", title="Same Name")
+        check("two captures, two files", a["path"] != b["path"], (a["path"], b["path"]))
+        check("and the first still says what it said",
+              "must survive" in Path(a["path"]).read_text(encoding="utf-8"))
+        check("two captures, two ids", a["note"]["id"] != b["note"]["id"])
+
+        # Belt and braces: even handed the same destination, a write never
+        # lands on top of a different note.
+        note = engine.note(b["note"]["id"])
+        forced = engine.vault.write(note, Path(a["path"]))
+        check("a write aimed at another note's file goes beside it, not over it",
+              Path(forced) != Path(a["path"])
+              and "must survive" in Path(a["path"]).read_text(encoding="utf-8"),
+              str(forced))
+
+
+def test_nothing_in_the_system_deletes_a_note():
+    """Housekeeping 3 — a note can be read, moved and edited. Never deleted.
+
+    The rule is not "we currently happen to have no delete button". It is an
+    invariant, and an invariant nobody checks is a comment. So this walks
+    every removal call in `sb/` and requires each one to be on something that
+    is *not* a note — a temp file, a cache, a state file, a doctor report.
+    Anything else fails here and has to be argued for on purpose, which is
+    the entire point: the next delete path gets added deliberately or not at
+    all.
+
+    The asymmetry is the argument. Undoing a bad classification costs a drag
+    in Obsidian; undoing a deletion costs the note.
+    """
+    section("notes are never deleted")
+    import re as _re
+
+    root = Path(__file__).resolve().parent.parent / "sb"
+    # Each allowed removal, with what it removes. A path here is a promise
+    # that the thing being removed can be rebuilt or was never a note.
+    allowed = {
+        "atomic.py": "the temp file a failed atomic write left behind",
+        "cards.py": "a deck file (derived) and its own write temp",
+        "incidents.py": "the temp file behind an atomic state write",
+        "index.py": "the embeddings cache, which is rebuildable by definition",
+        "jobqueue.py": "the temp file behind an atomic queue write",
+        "session.py": "the open-session state file in _system/, disposable by design",
+        "vault.py": "the temp file behind an atomic note write — never the note",
+        "engine.py": "expired doctor reports, which are regenerated weekly",
+        "adopt.py": "adopted *assets*: byte-identical copies, hash-verified "
+                    "against a source file that still exists",
+    }
+    pattern = _re.compile(r"\.unlink\(|os\.remove\(|shutil\.rmtree\(")
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not pattern.search(line) or line.lstrip().startswith("#"):
+                continue
+            if path.name not in allowed:
+                offenders.append(f"{path.name}:{n}  {line.strip()}")
+    check("every removal in sb/ is on something that is not a note",
+          not offenders, offenders)
+
+    # And the positive half: the sanctioned operation keeps the file.
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+        out = engine.capture("Something I no longer want in the way.", "resource")
+        note_id = out["note"]["id"]
+        original = Path(out["path"])
+
+        gone = engine.retire_note(note_id, "changed my mind")
+        check("retiring moves the file", not original.exists())
+        check("into the archive, not into nothing",
+              Path(gone["path"]).exists() and "_retired" in gone["path"], gone)
+        check("and it is still a readable note, word for word",
+              "Something I no longer want in the way."
+              in Path(gone["path"]).read_text(encoding="utf-8"))
+        check("the log says what happened",
+              "retire" in (cfg.vault / "_system" / "logs" / "retire.log").read_text(encoding="utf-8")
+              or (cfg.vault / "_system" / "logs" / "retire.log").exists())
+
+        # Retiring two notes that share a filename must not lose either.
+        a = engine.capture("First one.", "resource", title="Same Name")
+        b = engine.capture("Second one.", "resource", title="Same Name")
+        engine.retire_note(a["note"]["id"])
+        engine.retire_note(b["note"]["id"])
+        retired = list((cfg.vault / "40-Archive" / "_retired").rglob("*.md"))
+        check("two retired notes are two files", len(retired) == 3, [p.name for p in retired])
+
+
+def test_a_course_folder_is_matched_not_multiplied():
+    """Housekeeping 2 — "fed tax" must find the folder that already exists.
+
+    The obvious implementation of "start a session on this class" is `mkdir`
+    whatever was typed, and its failure mode is a vault holding `Fed Tax`,
+    `fed tax` and `Federal Taxation`, each with a third of the subject in it
+    and none of them wrong enough to notice for a term.
+    """
+    section("sessions: finding the class folder")
+    from sb.session import resolve_folder
+
+    have = ["Federal Taxation", "Business Communication", "Negotiation"]
+    for asked, want, how in [
+        ("Federal Taxation", "Federal Taxation", "exact"),
+        ("federal taxation", "Federal Taxation", "exact"),
+        ("Federal", "Federal Taxation", "prefix"),
+        ("fed tax", "Federal Taxation", "initials"),
+        ("taxation federal", "Federal Taxation", "words"),
+        ("bus comm", "Business Communication", "initials"),
+        ("Personal Finance", "Personal Finance", "new"),
+    ]:
+        got, got_how = resolve_folder(have, asked)
+        check(f"{asked!r} -> {want!r} ({how})", (got, got_how) == (want, how), (got, got_how))
+
+    # Ambiguity is not a coin flip between two subjects' worth of notes.
+    two = ["Business Law", "Business Communication"]
+    got, how = resolve_folder(two, "bus")
+    check("an ambiguous name makes a new folder rather than guessing",
+          (got, how) == ("bus", "new"), (got, how))
+
+    from sb.session import clean_folder_name
+    check("a chapter keeps the name it was given",
+          clean_folder_name("Ch 4 — Gross Income") == "Ch 4 — Gross Income")
+    check("minus anything Windows or Obsidian would choke on",
+          clean_folder_name('Ch 4: "Gross" [Income]/x') == "Ch 4 Gross Income x",
+          clean_folder_name('Ch 4: "Gross" [Income]/x'))
+
+
+def test_a_session_routes_and_summarises():
+    section("sessions: end to end")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+        (cfg.vault / "30-Resources" / "Federal Taxation").mkdir(parents=True)
+
+        out = engine.session_start("fed tax", "Ch 4 — Gross Income")
+        check("it found the folder that already existed", out["matched"] == "initials", out)
+        check("the chapter folder is made straight away, not on first capture",
+              (cfg.vault / "30-Resources" / "Federal Taxation" / "Ch 4 — Gross Income").is_dir())
+
+        engine.capture_term("Basis", "What you paid, adjusted.")
+        engine.capture_term("Nexus")
+        engine.capture("Read chapter 5 before Thursday", "project")
+        engine.capture("Gross income is all income from whatever source derived.", "resource")
+
+        where = engine.vault.folders_by_id()
+        filed = {engine.note(i).title: where[i] for i in engine.sessions.open().note_ids}
+        check("a term lands in the session folder",
+              filed["Basis"] == "30-Resources/Federal Taxation/Ch 4 — Gross Income", filed)
+        # A session says which folder, never which bucket.
+        check("a Project captured in class is still a Project, under that class",
+              filed["Read chapter 5"] == "20-Projects/Federal Taxation/Ch 4 — Gross Income",
+              filed)
+
+        done = engine.session_end()
+        body = Path(done["path"]).read_text(encoding="utf-8")
+        check("the summary lands in the session folder",
+              "Ch 4 — Gross Income" in str(Path(done["path"]).parent), done["path"])
+        check("it counts what was captured", "4 notes · 2 terms" in body, body)
+        check("the undefined term gets its own list",
+              "## Look these up" in body and "[[Nexus]]" in body.split("## Terms")[0], body)
+        check("a defined one does not", "[[Basis]]" not in body.split("## Terms")[0], body)
+        check("every note is linked, not just named",
+              body.count("[[") == 5, body)  # 2 terms + 1 undefined repeat + 2 notes
+
+        check("the session is closed afterwards", engine.sessions.open() is None)
+        try:
+            engine.session_end()
+            check("closing nothing is an error, not a second summary", False)
+        except ValueError:
+            check("closing nothing is an error, not a second summary", True)
+
+        # Walking out of one lecture into the next without pressing anything
+        # must not cost the second session's notes.
+        engine.session_start("Negotiation", "Week 3")
+        again = engine.session_start("Business Communication", "Week 3")
+        check("starting a session closes the one already open",
+              again["closed"] and again["closed"]["session"]["course"] == "Negotiation",
+              again["closed"])
+        check("and the new one is the open one",
+              engine.sessions.open().course == "Business Communication")
+
+
+def test_captures_ignore_a_session_that_is_not_open():
+    """The routing is a default, and a default has to be absent by default."""
+    section("sessions: no session, no change")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+
+        out = engine.capture("Reference material about nothing much.", "resource")
+        check("with no session a note files where it always did",
+              Path(out["path"]).parent.name == "30-Resources", out["path"])
+
+        engine.session_start("Negotiation", "Week 3")
+        # Saying where a note goes is a decision; a session is a default.
+        out = engine.capture("Something else entirely.", "resource", folder="Somewhere Else")
+        check("an explicit folder still beats the open session",
+              Path(out["path"]).parent.name == "Somewhere Else", out["path"])
+
+        # A state file we cannot read is a state file we do not have; it must
+        # never be the reason a capture fails.
+        engine.sessions.path.write_text("{ not json", encoding="utf-8")
+        check("a corrupt session file reads as no session",
+              engine.sessions.open() is None)
+        out = engine.capture("Still works.", "resource")
+        check("and a capture still lands", Path(out["path"]).exists())
+
+
+def test_sessions_over_the_api():
+    section("sessions: over HTTP")
+    from starlette.testclient import TestClient
+
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        with TestClient(build_app(cfg)) as client:
+            check("nothing is open to begin with",
+                  client.get("/api/session").json()["session"] is None)
+
+            r = client.post("/api/session/start",
+                            json={"course": "Negotiation", "chapter": "Week 3"})
+            check("starting one works", r.status_code == 200, r.text)
+            check("and it says where captures are going",
+                  r.json()["session"]["folder"] == "Negotiation/Week 3", r.json())
+
+            client.post("/api/capture/term",
+                        json={"term": "Anchoring", "definition": "First number sticks."})
+            check("the open session is reported back",
+                  client.get("/api/session").json()["session"]["terms"] == 1,
+                  client.get("/api/session").json())
+
+            r = client.post("/api/session/end")
+            check("ending one writes a summary", r.status_code == 200, r.text)
+            check("that names the term", "[[Anchoring]]" in r.json()["summary"]["title"]
+                  or "Anchoring" in str(r.json()["terms"]), r.json()["terms"])
+
+            r = client.post("/api/session/start", json={"course": ""})
+            check("a session with no class is a 400, not a 500", r.status_code == 400,
+                  r.status_code)
+            r = client.post("/api/session/end")
+            check("ending nothing is a 400, not a 500", r.status_code == 400, r.status_code)
+
+
+def test_a_term_becomes_a_note_and_a_card():
+    """Housekeeping 1 — highlight a word, press the hotkey, be asked it later.
+
+    The thing that made this worth building is arithmetic, not design: a term
+    note is a dozen words, `generate_folder` skips anything under forty as too
+    thin, and so the notes lj most wants quizzing on were exactly the ones the
+    deck machinery would never touch. Writing the card here instead of
+    generating it also makes it the one study path an Ollama outage cannot
+    reach — front and back are what lj typed.
+    """
+    section("terms")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+
+        out = engine.capture_term(
+            "Elasticity", "How much quantity demanded moves when price moves.",
+            source="Econ — ch.4",
+        )
+        check("a defined term is carded on the spot", out["carded"], out)
+        note = engine.note(out["note"]["id"])
+        check("it is a Resource", note.bucket == Bucket.RESOURCE, note.bucket)
+        check("tagged as a term", "term" in note.tags, note.tags)
+        check("the template's headings are all there",
+              all(h in note.body for h in ("## Definition", "## In my own words", "## Seen in")),
+              note.body)
+        check("and where it was met is in it", "Econ — ch.4" in note.body, note.body)
+
+        deck = engine.deck(note.id)
+        card = deck.cards[0]
+        check("one card, term on the front", card.front == "Elasticity", card.front)
+        check("definition on the back",
+              card.back.startswith("How much quantity"), card.back)
+        # The draft rule exists to stop *generated* cards reaching the
+        # scheduler unread. lj wrote both sides of this one.
+        check("active, not draft — lj wrote both sides", card.status == "active", card.status)
+
+        # A term met and not understood is the most useful thing in the vault
+        # and the easiest to lose. It is filed, not refused.
+        out2 = engine.capture_term("Deadweight loss")
+        check("an undefined term is still filed", out2["needs_definition"], out2)
+        check("and carries no card it cannot answer", not out2["carded"], out2)
+        check("it is findable later",
+              [t["title"] for t in engine.undefined_terms()] == ["Deadweight loss"],
+              engine.undefined_terms())
+
+        check("a term can be filed straight into a subfolder",
+              Path(engine.capture_term("Basis", "What you paid, adjusted.",
+                                       folder="Federal Taxation/Ch 4")["path"]
+                   ).parent.name == "Ch 4")
+        # A folder is lj's, but it is not a path expression.
+        escaped = engine.capture_term("Nexus", "Enough presence to be taxed.",
+                                      folder="../../../etc")
+        check("and a folder cannot climb out of the bucket",
+              "30-Resources" in Path(escaped["path"]).parts and
+              str(Path(escaped["path"])).startswith(str(cfg.vault)), escaped["path"])
+
+        try:
+            engine.capture_term("   ")
+            check("an empty term is refused", False)
+        except ValueError:
+            check("an empty term is refused", True)
+        try:
+            engine.capture_term("x " * 200)
+            check("a passage is refused as a term", False)
+        except ValueError:
+            check("a passage is refused as a term", True)
+
+
+def test_term_over_the_api():
+    section("terms: over HTTP")
+    from starlette.testclient import TestClient
+
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.intake.watch = False
+        with TestClient(build_app(cfg)) as client:
+            r = client.post("/api/capture/term",
+                            json={"term": "Anchoring", "definition": "First number sticks.",
+                                  "source": "Negotiation, week 3"})
+            check("the hotkey's endpoint works", r.status_code == 200, r.text)
+            check("and says it made a card", r.json()["carded"], r.json())
+
+            r = client.post("/api/capture/term", json={"term": "Framing"})
+            check("no definition is still a 200", r.status_code == 200, r.text)
+            r = client.get("/api/terms/undefined")
+            check("and shows up in the backlog",
+                  [t["title"] for t in r.json()["terms"]] == ["Framing"], r.json())
+
+            r = client.post("/api/capture/term", json={"term": ""})
+            check("an empty term is a 400, not a 500", r.status_code == 400, r.status_code)
+
+
+def test_the_capture_box_reads_a_selection():
+    """The hotkey script is not importable off Windows — it opens user32 at
+    import time — so the parts worth testing are read out of the source and
+    exercised on their own. That is not ideal, and it is much better than the
+    two rules that decide what the box does being untested."""
+    section("capture box: term detection")
+    src = (Path(__file__).resolve().parent.parent / "capture_hotkey.pyw").read_text(encoding="utf-8")
+    ns = {}
+    exec(src[src.index("TERM_MAX_WORDS = 6"):src.index("user32.RegisterHotKey.argtypes")], ns)
+    looks = ns["looks_like_a_term"]
+    check("a highlighted word opens Term mode", looks("Elasticity"))
+    check("so does a short phrase", looks("marginal propensity to consume"))
+    check("a highlighted paragraph does not", not looks("x " * 40))
+    check("nor does anything with a line break", not looks("Elasticity\nis a thing"))
+    check("nor an empty selection", not looks(""))
+
+    exec(src[src.index("def term_markdown"):src.index("# --8<-- end testable")], ns)
+    md = ns["term_markdown"]("Basis", "What you paid, adjusted.", "Fed Tax ch.4")
+    check("the offline fallback writes the same shape the engine does",
+          all(h in md for h in ("## Definition", "## In my own words", "## Seen in")), md)
+    check("with the definition under the right heading",
+          md.index("What you paid") > md.index("## Definition")
+          and md.index("What you paid") < md.index("## In my own words"), md)
+
+
+def test_read_path_shortcuts_stay_honest():
+    """Phase 13 — the two places the read path stopped doing full work.
+
+    Both are optimisations that answer a question a slower path already
+    answered, so the only thing worth testing is that they give the *same*
+    answer. A faster `counts()` that disagrees with the dashboard about how
+    many notes exist is not a faster anything.
+    """
+    section("read path: the shortcuts agree with the long way round")
+    import io as _io
+
+    import yaml as _yaml
+
+    from sb import frontmatter as fm
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "vault"
+        v = Vault(root)
+        v.ensure_structure()
+
+        for bucket, title in ((Bucket.PROJECT, "A project"), (Bucket.AREA, "An area"),
+                              (Bucket.RESOURCE, "A resource"), (Bucket.INBOX, "Unfiled")):
+            v.write(Note.capture("Some body text about something.", bucket, title=title))
+
+        # The awkward files: ours but with no bucket, not ours at all, and one
+        # that is not even YAML. Each counts differently, and the shortcut has
+        # to agree with `Note` on every one of them.
+        (root / "30-Resources" / "no-bucket.md").write_text(
+            '---\nid: "20260101T000000-x"\ntitle: No bucket\n---\n\nbody\n', encoding="utf-8")
+        (root / "30-Resources" / "not-ours.md").write_text(
+            "# Just a note somebody wrote\n\nNo frontmatter at all.\n", encoding="utf-8")
+        (root / "30-Resources" / "broken.md").write_text(
+            "---\nid: [unclosed\n---\n\nbody\n", encoding="utf-8")
+        (root / "30-Resources" / "odd-bucket.md").write_text(
+            '---\nid: "20260101T000000-y"\ntitle: Odd\nbucket: nonsense\n---\n\nbody\n',
+            encoding="utf-8")
+
+        slow = {b.value: 0 for b in Bucket}
+        for bucket in ("00-Inbox", "10-Areas", "20-Projects", "30-Resources", "40-Archive"):
+            for path in (root / bucket).glob("*.md"):
+                note = v._try_read(path)
+                if note is not None:
+                    slow[note.bucket.value] += 1
+
+        check("counts() matches building every Note", v.counts() == slow, (v.counts(), slow))
+        check("a note with no bucket still counts, under the model default",
+              v.counts()["inbox"] == 2, v.counts())
+        check("a bucket the model would refuse counts nowhere — and does not "
+              "take /api/health down with it", sum(v.counts().values()) == 5, v.counts())
+
+        # The C loader is a different implementation of the same grammar. If
+        # it ever wrote frontmatter differently from the Python one, every
+        # save would rewrite the file and every diff would be noise.
+        note = v.read(next((root / "20-Projects").glob("*.md")))
+        meta = note.to_frontmatter() if hasattr(note, "to_frontmatter") else {
+            "id": note.id, "title": note.title, "bucket": note.bucket.value,
+            "tags": note.tags, "nested": {"steps": [{"id": "s1", "done": False}]},
+        }
+
+        def dumped(dumper):
+            buf = _io.StringIO()
+            _yaml.dump(meta, buf, Dumper=dumper, sort_keys=False,
+                       allow_unicode=True, default_flow_style=False, width=1000)
+            return buf.getvalue()
+
+        check("the C dumper writes byte-identical frontmatter",
+              dumped(_yaml.CSafeDumper) == dumped(_yaml.SafeDumper) if fm.ACCELERATED else True)
+        check("and the C loader reads back what we wrote",
+              fm.parse(fm.dump({"id": "x", "tags": ["a", "b"]}, "body"))[0]
+              == {"id": "x", "tags": ["a", "b"]})
+
+
 def test_drop_upload():
     """Files dragged onto the dashboard land in Drop/ and get filed.
 
@@ -6951,6 +8039,26 @@ def main():
         test_choice_grading_needs_no_model,
         test_folder_generation_skips_what_it_should,
         test_batch_capture_over_the_api,
+        # -- phase 13: housekeeping
+        test_read_path_shortcuts_stay_honest, test_drop_upload,
+        test_a_term_becomes_a_note_and_a_card, test_term_over_the_api,
+        test_every_template_builds_a_readable_note,
+        test_the_templates_on_disk_are_the_ones_in_the_code,
+        test_editing_a_template_changes_what_the_system_writes,
+        test_a_plain_capture_takes_the_atomic_note_shape,
+        test_doctor_catches_a_corrupted_template,
+        test_a_snip_becomes_a_note_with_the_picture_in_it,
+        test_a_clipboard_bitmap_becomes_a_png,
+        test_collecting_is_told_apart_from_learning, test_collected_debt_over_the_api,
+        test_filing_several_notes_into_one_folder, test_group_file_over_the_api,
+        test_a_capture_that_says_nothing_lands_in_resources,
+        test_two_notes_in_one_second_do_not_become_one,
+        test_nothing_in_the_system_deletes_a_note,
+        test_a_course_folder_is_matched_not_multiplied,
+        test_a_session_routes_and_summarises,
+        test_captures_ignore_a_session_that_is_not_open,
+        test_sessions_over_the_api,
+        test_the_capture_box_reads_a_selection,
     ]:
         try:
             fn()
@@ -6970,3 +8078,15 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_zzz_every_check_passed():
+    """`check()` records a failure and returns — it does not raise.
+
+    That is deliberate: a test with thirty checks should report all thirty,
+    not stop at the first. But it means pytest, which only sees exceptions,
+    reported a green suite over a list of failures — and pytest is what the
+    build logs quote. This runs last (the name sorts it there, and pytest
+    keeps file order) and is the one place the list is turned into a failure.
+    """
+    assert not FAILED, "checks failed:\n  " + "\n  ".join(FAILED)

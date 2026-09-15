@@ -14,7 +14,7 @@ type:
 2. **Key Concepts**: 
 
 
-![[Credit Terms.png]]
+![[docs/Drop/_Past/Accounting/Study Terms/Credit Terms.png]]
 
 
 

@@ -641,7 +641,8 @@ def verify_originals(vault: Vault, manifest: Dict[str, Any]) -> Dict[str, Any]:
 def undo(vault: Vault, manifest: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
     """Remove exactly what one run wrote — and only if the originals are back.
 
-    Three guards, because this is the one function here that deletes:
+    Three guards, because this is the one function here that takes a note
+    away:
 
       * the original must still exist and still hash the same, so undo can
         never be the step that loses a note;
@@ -649,6 +650,14 @@ def undo(vault: Vault, manifest: Dict[str, Any], dry_run: bool = False) -> Dict[
         in its own frontmatter, not by its path;
       * anything edited since adoption is left alone and reported, because an
         edit is lj's work and it is not this command's to throw away.
+
+    Even past all three, the note is **retired rather than deleted** — moved
+    to `40-Archive/_retired/` by `Vault.retire`. Nothing in this system
+    deletes a note, and "this note is a duplicate of a file you still have"
+    is an argument for getting it out of the way, not for destroying it. The
+    adopted *assets* are still deleted outright: those are byte-identical
+    copies, verified by hash against a source file that is right there, so
+    keeping a third copy is hoarding rather than caution.
     """
     removed: List[str] = []
     kept: List[Dict[str, str]] = []
@@ -670,7 +679,7 @@ def undo(vault: Vault, manifest: Dict[str, Any], dry_run: bool = False) -> Dict[
             kept.append({"dest": row["dest"], "why": "written by another run"})
             continue
         if not dry_run:
-            target.unlink()
+            vault.retire(target, f"adopt undo, run {manifest['run']}")
         removed.append(row["dest"])
 
     for row in manifest.get("assets", []):
