@@ -49,6 +49,7 @@ llm:
   # If the provider is unreachable, parse with rules instead of failing the
   # capture. Turn off only if you would rather a capture error out.
   fallback_to_heuristic: true
+  autostart: true               # start Ollama with the app if it is installed and off
 
   temperature: 0.1
   timeout_s: 120

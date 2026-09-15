@@ -32,7 +32,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import quality
+from . import frontmatter, quality
 from .cards import CLOZE, Card, Deck, fingerprint
 from .config import Config
 from .llm import resolve_provider
@@ -201,7 +201,7 @@ def chunk(text: str) -> List[str]:
     system's own rendered sections are dropped. Short trailing fragments are
     merged backwards so a stray line does not become its own request.
     """
-    text = _strip_frontmatter(text or "")
+    text = frontmatter.strip(text or "")
     passages: List[str] = []
     current: List[str] = []
     skipping = False
@@ -233,14 +233,6 @@ def chunk(text: str) -> List[str]:
         current.append(block)
     flush()
     return [p for p in passages if len(p.strip()) >= 60]
-
-
-def _strip_frontmatter(text: str) -> str:
-    if text.startswith("---"):
-        end = text.find("\n---", 3)
-        if end != -1:
-            return text[end + 4 :]
-    return text
 
 
 # --------------------------------------------------------------------------

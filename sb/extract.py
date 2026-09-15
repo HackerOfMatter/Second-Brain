@@ -93,6 +93,15 @@ NONE = "none"
 
 CONFIRMED_KINDS = (EXPLICIT, EXACT, MANUAL)
 
+_NUMERIC_PAIR = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b")
+_MARKED_BEFORE = re.compile(DATE_MARKERS + r"\s+$")
+
+#: Weekday abbreviations that are also everyday English words. "I sat the
+#: exam" and "the sun" are not deadlines, so these count only when something
+#: marks them as a day ("by sat", "next wed", "due sun").
+_WORDLIKE_DAYS = {"sat", "sun", "wed"}
+_DAY_MARKED = re.compile(r"\b(?:by|on|due|until|till|before|this|next|every)\s+$")
+
 
 class DateGuess:
     """A parsed deadline, and how much to trust it.
@@ -143,21 +152,21 @@ def parse_deadline_guess(text: str, today: Optional[dt.date] = None) -> DateGues
     if not text:
         return DateGuess()
     t = text.lower()
+    if len(t) != len(text):
+        # A few characters ("İ") lengthen when lowered, which would shift every
+        # `raw[m.start():m.end()]` slice below onto the wrong words.
+        text = t
+    return _run_rules(t, text, today, _RULES)
 
-    for rule in (
-        _explicit_prefix,
-        _iso_date,
-        _numeric_pair,
-        _month_name,
-        _day_of_month,
-        _interval,
-        _named_day,
-        _weekend,
-        _weekday_reference,
-        _end_of_period,
-        _next_period,
-    ):
-        guess = rule(t, text, today)
+
+def _run_rules(t: str, text: str, today: dt.date, rules) -> DateGuess:
+    for rule in rules:
+        try:
+            guess = rule(t, text, today)
+        except (ValueError, OverflowError):
+            # "in 99999999 days" is past the end of the calendar; that is no
+            # date, not a failed capture.
+            continue
         if guess and guess.date:
             return guess
     return DateGuess()
@@ -176,7 +185,8 @@ def _explicit_prefix(t: str, raw: str, today: dt.date) -> Optional[DateGuess]:
     m = re.search(r"\b(?:due|deadline)\s*[:=]\s*([^\n,;]+)", t)
     if not m:
         return None
-    inner = parse_deadline_guess(m.group(1), today)
+    # Every rule but this one: "due: due: due: ..." must not recurse.
+    inner = _run_rules(m.group(1), m.group(1), today, _RULES[1:])
     if not inner.date:
         return None
     return DateGuess(inner.date, raw[m.start() : m.end()].strip(), EXPLICIT)
@@ -205,12 +215,11 @@ def _numeric_pair(t: str, raw: str, today: dt.date) -> Optional[DateGuess]:
     "read pages 3/4" therefore parse to *no date*, which is the right answer:
     this module's own rule is that an absent deadline beats a wrong one.
     """
-    pattern = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b")
     whole = t.strip()
-    for m in pattern.finditer(t):
+    for m in _NUMERIC_PAIR.finditer(t):
         before = t[max(0, m.start() - 12) : m.start()]
         marked = (
-            bool(re.search(DATE_MARKERS + r"\s+$", before))
+            bool(_MARKED_BEFORE.search(before))
             or bool(m.group(3) and len(m.group(3)) == 4)
             or m.group(0) == whole
         )
@@ -356,6 +365,8 @@ def _weekday_reference(t: str, raw: str, today: dt.date) -> Optional[DateGuess]:
         if m.group(1) not in WEEKDAYS:
             continue
         prefix = t[max(0, m.start() - 24) : m.start()]
+        if m.group(1) in _WORDLIKE_DAYS and not _DAY_MARKED.search(prefix):
+            continue
         qualifier = ""
         q = re.search(r"\b(next|this)\s+$", prefix)
         if q:
@@ -398,6 +409,22 @@ def _next_period(t: str, raw: str, today: dt.date) -> Optional[DateGuess]:
     if m:
         return DateGuess(_add_months(today, 1), raw[m.start() : m.end()], AMBIGUOUS)
     return None
+
+
+#: Priority order — see `parse_deadline_guess`.
+_RULES = (
+    _explicit_prefix,
+    _iso_date,
+    _numeric_pair,
+    _month_name,
+    _day_of_month,
+    _interval,
+    _named_day,
+    _weekend,
+    _weekday_reference,
+    _end_of_period,
+    _next_period,
+)
 
 
 # -- date arithmetic --------------------------------------------------------
@@ -450,20 +477,29 @@ def _clamp_forward(today: dt.date, month: int, day: int) -> Optional[dt.date]:
 # --------------------------------------------------------------------------
 
 
+MAX_MINUTES = 100_000
+
+
 def parse_duration_minutes(text: str) -> Optional[int]:
     t = text.lower()
     total = 0
     found = False
-    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)\b", t):
+    for m in re.finditer(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)\b", t):
         total += int(float(m.group(1)) * 60)
         found = True
-    for m in re.finditer(r"(\d+)\s*(minutes?|mins?|m)\b", t):
-        total += int(m.group(1))
+    for m in re.finditer(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(minutes?|mins?|m)\b", t):
+        total += int(float(m.group(1)))
         found = True
-    for m in re.finditer(r"(\d+)\s*(days?)\b", t):
+    for m in re.finditer(r"(?<![\d.])(\d+)\s*days?\b", t):
+        # "in 3 days" / "3 days from now" / "3 days left" is when, not how long.
+        if re.search(r"\bin\s+$", t[max(0, m.start() - 8) : m.start()]) or re.match(
+            r"\s+(?:from|left|away|before|after|later|ago)\b", t[m.end() : m.end() + 10]
+        ):
+            continue
         total += int(m.group(1)) * 240  # a "day" of focused work, not 24h
         found = True
-    return total if found and total > 0 else None
+    # A typo like "40000 hours" must not hand the planner a decade of blocks.
+    return min(total, MAX_MINUTES) if found and total > 0 else None
 
 
 def guess_level(text: str) -> int:
@@ -481,14 +517,16 @@ def is_learning(text: str) -> bool:
     return any(v in t for v in LEARNING_VERBS)
 
 
+_STEP_LINE = re.compile(r"^(?:[-*+]\s+|\d+[.)]\s+)(?:\[[ xX]?\]\s*)?(.+)$")
+
+
 def extract_steps(text: str) -> List[str]:
     """Explicit steps only: markdown bullets, numbered lists, or 'then' chains.
     If the capture has no structure, return nothing and let the LLM propose a
     breakdown -- inventing steps with regex produces noise."""
     steps: List[str] = []
     for line in text.split("\n"):
-        s = line.strip()
-        m = re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)\[?[ xX]?\]?\s*(.+)$", s)
+        m = _STEP_LINE.match(line.strip())
         if m and m.group(1).strip():
             steps.append(m.group(1).strip())
     if steps:
@@ -534,6 +572,22 @@ def extract_materials(text: str) -> List[str]:
     return out[:8]
 
 
+_TITLE_CUTS = [re.compile(p, re.I) for p in (
+    r"\s*[,;—-]?\s*\bby\s+(?:next|this|the|tomorrow|today|mon|tue|wed|thu|fri|sat|sun|eod|end\b|\d).*$",
+    r"\s*[,;—-]?\s*\b(?:due|deadline|before|until|till)\b.*$",
+    r"\s*[,;—-]?\s*\bin\s+(?:a|an|\d+)\s+(?:day|week|month)s?\b.*$",
+    r"\s*[,;—-]?\s*\b(?:about|approx\.?|around|roughly|~)?\s*\d+(?:\.\d+)?\s*"
+    r"(?:hours?|hrs?|h|minutes?|mins?)\b.*$",
+    r"\s*[,;—-]?\s*\b(?:tomorrow|tonight|next week|next month|this week)\b.*$",
+    # bare scheduling clauses with no preposition in front of them:
+    # "Learn Rust generics next friday" should title as "Learn Rust generics"
+    r"\s*[,;—-]?\s*\b(?:next|this)\s+"
+    r"(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*\b.*$",
+    r"\s*[,;—-]?\s*\b(?:this|next)\s+weekend\b.*$",
+    r"\s*[,;—-]?\s*\b(?:eow|eom|end of (?:the )?(?:week|month|day))\b.*$",
+)]
+
+
 def derive_title(text: str, max_len: int = 80) -> str:
     """A note title should name the thing, not restate the whole capture.
     Strips the scheduling clauses -- "by next Friday", "about 4 hours",
@@ -550,23 +604,9 @@ def derive_title(text: str, max_len: int = 80) -> str:
     line = re.sub(r"^(?:todo|task|note|project|remember)\s*[:\-]\s*", "", line, flags=re.I)
     line = re.sub(r"^[-*+]\s+", "", line)
 
-    cuts = [
-        r"\s*[,;—-]?\s*\bby\s+(?:next|this|the|tomorrow|today|mon|tue|wed|thu|fri|sat|sun|eod|end\b|\d).*$",
-        r"\s*[,;—-]?\s*\b(?:due|deadline|before|until|till)\b.*$",
-        r"\s*[,;—-]?\s*\bin\s+(?:a|an|\d+)\s+(?:day|week|month)s?\b.*$",
-        r"\s*[,;—-]?\s*\b(?:about|approx\.?|around|roughly|~)?\s*\d+(?:\.\d+)?\s*"
-        r"(?:hours?|hrs?|h|minutes?|mins?)\b.*$",
-        r"\s*[,;—-]?\s*\b(?:tomorrow|tonight|next week|next month|this week)\b.*$",
-        # bare scheduling clauses with no preposition in front of them:
-        # "Learn Rust generics next friday" should title as "Learn Rust generics"
-        r"\s*[,;—-]?\s*\b(?:next|this)\s+"
-        r"(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*\b.*$",
-        r"\s*[,;—-]?\s*\b(?:this|next)\s+weekend\b.*$",
-        r"\s*[,;—-]?\s*\b(?:eow|eom|end of (?:the )?(?:week|month|day))\b.*$",
-    ]
     trimmed = line
-    for pattern in cuts:
-        trimmed = re.sub(pattern, "", trimmed, flags=re.I)
+    for pattern in _TITLE_CUTS:
+        trimmed = pattern.sub("", trimmed)
     trimmed = trimmed.strip(" ,;:-—.")
 
     if len(trimmed) < 3:  # over-trimmed; keep the original line

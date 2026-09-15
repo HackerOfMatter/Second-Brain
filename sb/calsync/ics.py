@@ -55,15 +55,52 @@ def render(
         "X-WR-CALDESC:Work blocks\\, recurring areas\\, reviews and due tasks",
     ]
     stamp = _utc(dt.datetime.now(dt.timezone.utc))
+    head = "\r\n".join(lines) + "\r\n"
+
+    # Every capture re-renders the whole calendar, and almost every event in
+    # it is the same as last time. Each event's folded text is cached against
+    # its own fields with the DTSTAMP left as a placeholder, so an unchanged
+    # event costs a dict lookup rather than ~20 formatted, escaped, folded
+    # lines. The cache is rebuilt from what this render used, so it never
+    # outgrows the calendar, and it is dropped when the colour config moves.
+    global _CACHE_CFG, _EVENT_CACHE
+    cfg_key = (cfg.calendar.color_events, taxonomy._register(cfg))
+    old = _EVENT_CACHE if cfg_key == _CACHE_CFG else {}
+    fresh: dict = {}
+    colours: dict = {}
+    parts = [head]
     for ev in events:
-        lines += _render_event(ev, stamp, cfg)
+        key = (
+            ev.uid, ev.summary, ev.start, ev.end, ev.all_day, ev.description,
+            tuple(ev.reminders), ev.kind, ev.note_id, ev.category, ev.rrule, ev.cue,
+        )
+        block = old.get(key)
+        if block is None:
+            block = _join(_render_event(ev, _STAMP, cfg, colours))
+        fresh[key] = block
+        parts.append(block)
+    _CACHE_CFG, _EVENT_CACHE = cfg_key, fresh
     for task in tasks or []:
-        lines += _render_todo(task, stamp, cfg)
-    lines.append("END:VCALENDAR")
-    return "\r\n".join(_fold(line) for line in lines) + "\r\n"
+        parts.append(_join(_render_todo(task, _STAMP, cfg, colours)))
+    parts.append("END:VCALENDAR\r\n")
+    return "".join(parts).replace(_STAMP, stamp)
 
 
-def _render_event(ev: CalEvent, stamp: str, cfg: Config) -> List[str]:
+#: Stands in for the DTSTAMP inside cached event text. Not valid .ics on its
+#: own, so it can never be confused with anything a note produced.
+_STAMP = "\x00STAMP\x00"
+_CACHE_CFG: tuple = ()
+_EVENT_CACHE: dict = {}
+
+
+def _join(lines: List[str]) -> str:
+    return "".join(
+        (line if len(line) <= 75 and line.isascii() else _fold(line)) + "\r\n"
+        for line in lines
+    )
+
+
+def _render_event(ev: CalEvent, stamp: str, cfg: Config, colours: dict | None = None) -> List[str]:
     out = ["BEGIN:VEVENT", f"UID:{ev.uid}", f"DTSTAMP:{stamp}"]
     if ev.all_day:
         start = ev.start if isinstance(ev.start, dt.date) else ev.start.date()
@@ -78,7 +115,7 @@ def _render_event(ev: CalEvent, stamp: str, cfg: Config) -> List[str]:
     out.append(f"SUMMARY:{_esc(ev.summary)}")
     if ev.description:
         out.append(f"DESCRIPTION:{_esc(ev.description)}")
-    out += _colour_lines(ev.kind, ev.category, cfg)
+    out += _colour_lines(ev.kind, ev.category, cfg, colours)
     out.append(f"X-SB-NOTE-ID:{ev.note_id}")
     out.append("TRANSP:" + ("TRANSPARENT" if ev.all_day else "OPAQUE"))
     out += _alarms(ev.reminders, ev.summary, ev.cue)
@@ -86,7 +123,7 @@ def _render_event(ev: CalEvent, stamp: str, cfg: Config) -> List[str]:
     return out
 
 
-def _render_todo(task: CalTask, stamp: str, cfg: Config) -> List[str]:
+def _render_todo(task: CalTask, stamp: str, cfg: Config, colours: dict | None = None) -> List[str]:
     """A Project deadline. VTODO rather than VEVENT because a due date is not
     an appointment — it has no duration, it can be completed, and it should
     stay visible until it is."""
@@ -99,7 +136,7 @@ def _render_todo(task: CalTask, stamp: str, cfg: Config) -> List[str]:
     ]
     if task.description:
         out.append(f"DESCRIPTION:{_esc(task.description)}")
-    out += _colour_lines("due", task.category, cfg)
+    out += _colour_lines("due", task.category, cfg, colours)
     out.append(f"PRIORITY:{task.priority}")
     out.append("STATUS:NEEDS-ACTION")
     if task.percent:
@@ -118,7 +155,12 @@ def _render_todo(task: CalTask, stamp: str, cfg: Config) -> List[str]:
     return out
 
 
-def _colour_lines(kind: str, category: str, cfg: Config) -> List[str]:
+def _colour_lines(kind: str, category: str, cfg: Config, memo: dict | None = None) -> List[str]:
+    if memo is not None:
+        hit = memo.get((kind, category))
+        if hit is None:
+            hit = memo[(kind, category)] = _colour_lines(kind, category, cfg)
+        return hit
     cat = taxonomy.get(category, cfg)
     out = [f"CATEGORIES:{kind.upper()},{cat.key.upper()}"]
     if cfg.calendar.color_events:
@@ -173,6 +215,8 @@ def _esc(text: str) -> str:
     return (
         str(text)
         .replace("\\", "\\\\")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
         .replace(";", "\\;")
         .replace(",", "\\,")
         .replace("\n", "\\n")

@@ -37,10 +37,12 @@ constructed object built from a deep copy of the cached frontmatter.
 
 from __future__ import annotations
 
+import bisect
 import copy
 import datetime as dt
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -108,6 +110,34 @@ def _clone(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+#: Top-level frontmatter keys that `Note` validates into objects of its own.
+#: Pydantic rebuilds every list, dict and sub-model for these, so the built
+#: note shares nothing mutable with the cached dict and cloning them first is
+#: pure waste — it was the largest line item of a vault read. Everything else
+#: (extra keys a human added, and `srs`/`habit`, whose `Dict[str, Any]`
+#: entries pydantic stores by reference) is still cloned.
+_REBUILT_KEYS = frozenset({
+    "id", "title", "bucket", "created", "updated", "tags", "source",
+    "history", "category", "project", "schedule", "review", "intake",
+})
+
+
+def _build(meta: Dict[str, Any], body: str) -> Note:
+    """A fresh `Note` from a cached frontmatter dict (which is never mutated)."""
+    return Note.from_frontmatter(
+        {k: (v if k in _REBUILT_KEYS else _clone(v)) for k, v in meta.items()},
+        body,
+    )
+
+
+#: A directory whose mtime is this close to the moment we recorded it may
+#: still change without its mtime moving: file timestamps come from a coarse
+#: clock (~15 ms on NTFS, a jiffy on Linux), so a second change in the same
+#: tick looks like no change. Such "racy" directories are re-listed — one
+#: `scandir`, not a walk — until they have been quiet this long.
+RACY_NS = 1_000_000_000
+
+
 def _mtime(path: Path) -> Optional[int]:
     """Directory mtime, or None if it does not exist. A missing directory is a
     real state, not an error: creating 40-Archive later must invalidate the
@@ -128,6 +158,10 @@ class Vault:
         # bumped on every rewalk; the derived indexes piggyback on it
         self._walks = 0
         self._title_index: Optional[Tuple[int, Dict[str, Path]]] = None
+        # dir -> wall-clock ns when its mtime was recorded (see RACY_NS)
+        self._stamp_at: Dict[Path, int] = {}
+        # dir -> (names of the .md files in it, names of its subdirectories)
+        self._children: Dict[Path, Tuple[set, set]] = {}
         self._stamps: Optional[Tuple[int, Dict[str, List[Path]], List[Path]]] = None
 
     # -- cache control ------------------------------------------------------
@@ -136,6 +170,8 @@ class Vault:
         """Drop every cache. Only needed when something outside this class
         rearranges the vault; ordinary writes invalidate themselves."""
         self._listings.clear()
+        self._stamp_at.clear()
+        self._children.clear()
         self._parsed.clear()
         self._title_index = None
         self._stamps = None
@@ -179,7 +215,7 @@ class Vault:
         cached = self._listings.get(bucket)
         if cached is not None:
             stamps, paths = cached
-            if all(_mtime(d) == m for d, m in stamps.items()):
+            if all(_mtime(d) == m for d, m in stamps.items()) and self._settled(stamps):
                 return paths
 
         root = self.dir_for(bucket)
@@ -191,15 +227,42 @@ class Vault:
             for dirpath, dirnames, filenames in os.walk(root):
                 d = Path(dirpath)
                 stamps[d] = _mtime(d)
-                for name in filenames:
-                    if name.endswith(".md"):
-                        paths.append(d / name)
+                self._stamp_at[d] = time.time_ns()
+                md = {name for name in filenames if name.endswith(".md")}
+                self._children[d] = (md, set(dirnames))
+                paths.extend(d / name for name in md)
             paths.sort()
 
         self._listings[bucket] = (stamps, paths)
         self._walks += 1
         self._title_index = None
         return paths
+
+    def _settled(self, stamps: Dict[Path, Optional[int]]) -> bool:
+        """False if a directory whose mtime cannot be trusted yet has in fact
+        changed. Re-lists only those directories."""
+        now = time.time_ns()
+        for d, m in stamps.items():
+            if m is None or m + RACY_NS <= self._stamp_at.get(d, 0):
+                continue
+            known = self._children.get(d)
+            if known is None:
+                return False
+            try:
+                with os.scandir(d) as it:
+                    files, subdirs = set(), set()
+                    for entry in it:
+                        if entry.is_dir():
+                            subdirs.add(entry.name)
+                        elif entry.name.endswith(".md"):
+                            files.add(entry.name)
+            except OSError:
+                return False
+            if files != known[0] or subdirs != known[1]:
+                return False
+            if now - m >= RACY_NS:
+                self._stamp_at[d] = now   # quiet long enough: trust it again
+        return True
 
     def _revalidate(self) -> int:
         """Re-check every bucket listing and return the walk generation.
@@ -254,7 +317,7 @@ class Vault:
         meta, body = self._meta(path)
         if not meta.get("id"):
             raise VaultError(f"{path} has no Second Brain frontmatter (missing id)")
-        return Note.from_frontmatter(_clone(meta), body)
+        return _build(meta, body)
 
     def iter_paths(self, bucket: Optional[Bucket] = None) -> Iterator[Path]:
         buckets = [bucket] if bucket else list(BUCKET_DIRS)
@@ -266,8 +329,13 @@ class Vault:
         existing vault full of hand-written notes coexists with the system."""
         out: List[Tuple[Path, Note]] = []
         for p in self.iter_paths(bucket):
+            # Hand-written files carry no id; skip them without paying for an
+            # exception each (a vault of loose notes is thousands per page).
             try:
-                out.append((p, self.read(p)))
+                meta, body = self._meta(p)
+                if not isinstance(meta.get("id"), str) or not meta["id"]:
+                    continue
+                out.append((p, _build(meta, body)))
             except UNREADABLE:
                 continue
         return out
@@ -501,17 +569,48 @@ class Vault:
         target = self._free_name(target, note.id)
         content = frontmatter.dump(note.frontmatter(), note.body)
         tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        before = _mtime(target.parent)
         try:
             tmp.write_text(content, encoding="utf-8")
             atomic.replace(tmp, target)
         except Exception:
             tmp.unlink(missing_ok=True)  # never leave debris in the vault
-            raise
-        finally:
-            # Both outcomes changed the directory: a stale listing would hide
-            # a new note, and a stale parse would serve the pre-write body.
             self._forget(target)
+            raise
+        self._wrote(target, before)
         return target
+
+    def _wrote(self, target: Path, before: Optional[int]) -> None:
+        """Bring the caches up to date after this process wrote `target`.
+
+        The temp-file-and-replace touches the directory, so the listing's
+        mtime check would otherwise throw the whole walk away on every save —
+        and the next `find` would re-walk the vault. When the directory's
+        mtime *before* the write is the one the listing already recorded,
+        nothing else changed in it, so the listing is patched in place: the
+        new mtime recorded, the path inserted if it is new. Anything else (a
+        new subfolder, an external edit the cache has not seen) falls back to
+        forgetting the listing, which is always correct.
+        """
+        self._parsed.pop(target, None)
+        parent = target.parent
+        for stamps, paths in self._listings.values():
+            if parent not in stamps:
+                continue
+            if before is None or stamps[parent] != before:
+                break
+            stamps[parent] = _mtime(parent)
+            self._stamp_at[parent] = time.time_ns()
+            i = bisect.bisect_left(paths, target)
+            if i == len(paths) or paths[i] != target:
+                paths.insert(i, target)
+                known = self._children.get(parent)
+                if known is not None:
+                    known[0].add(target.name)
+                self._walks += 1          # the set of notes changed
+                self._title_index = None
+            return
+        self._forget(target)
 
     def _free_name(self, target: Path, note_id: str) -> Path:
         """`target`, or the next free name beside it if another note is there.

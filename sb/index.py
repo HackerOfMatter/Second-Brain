@@ -57,6 +57,7 @@ from array import array
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from . import frontmatter
 from .config import Config
 from .llm import resolve_provider
 from .models import Bucket, Note
@@ -149,7 +150,7 @@ def chunk_note(note: Note) -> List[Dict[str, Any]]:
     a good one with its heading attached, and the embedding sees the
     difference.
     """
-    body = _strip_frontmatter(note.body or "")
+    body = frontmatter.strip(note.body or "")
     out: List[Dict[str, Any]] = []
     heading = ""
     buffer: List[str] = []
@@ -212,14 +213,6 @@ def _window(text: str) -> List[str]:
             break
         start = max(start + 1, end - CHUNK_OVERLAP)
     return [p for p in pieces if len(p) >= MIN_CHUNK]
-
-
-def _strip_frontmatter(text: str) -> str:
-    if text.startswith("---"):
-        end = text.find("\n---", 3)
-        if end != -1:
-            return text[end + 4 :]
-    return text
 
 
 def fingerprint(note: Note) -> str:

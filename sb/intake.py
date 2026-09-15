@@ -114,9 +114,28 @@ def read_file(path: Path) -> Dropped:
     return Dropped(path, error=f"unsupported file type {suffix or '(none)'}")
 
 
+def _decode(data: bytes) -> str:
+    """Text as Windows editors actually save it.
+
+    Notepad's "Unicode" is UTF-16 with a BOM and older files are cp1252;
+    reading either as UTF-8 with `errors="replace"` filed a note of NULs and
+    replacement characters. Newlines are normalised here once.
+    """
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = data.decode("utf-16", errors="replace")
+    else:
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                text = data.decode("cp1252")
+            except UnicodeDecodeError:
+                text = data.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _read_text(path: Path) -> Dropped:
-    raw = path.read_text(encoding="utf-8", errors="replace")
-    meta, body = frontmatter.parse(raw)
+    meta, body = frontmatter.parse(_decode(path.read_bytes()))
     # A file exported from this vault comes back with our own frontmatter on
     # it. Its title is worth keeping; its id is not — re-importing under the
     # old id would mean two files claiming to be the same note.
@@ -124,7 +143,7 @@ def _read_text(path: Path) -> Dropped:
     return Dropped(
         path,
         title=title or _title_from(body, path),
-        text=(body if meta else raw).strip(),
+        text=body.strip(),
         already_ours=bool(meta.get("id")),
     )
 

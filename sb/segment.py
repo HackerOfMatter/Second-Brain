@@ -42,6 +42,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from . import frontmatter
 from .extract import derive_title
 
 # --------------------------------------------------------------------------
@@ -146,12 +147,8 @@ def _block_kind(body: str) -> str:
 
 
 def strip_frontmatter(text: str) -> str:
-    """Drop a leading `---` block. Shared shape with `generate._strip_frontmatter`."""
-    if text.startswith("---"):
-        end = text.find("\n---", 3)
-        if end != -1:
-            return text[end + 4 :].lstrip("\n")
-    return text
+    """Drop a leading frontmatter block (see `frontmatter.strip`)."""
+    return frontmatter.strip(text)
 
 
 def pieces(text: str) -> List[Piece]:

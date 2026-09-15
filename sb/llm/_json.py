@@ -25,7 +25,7 @@ def extract(text: str) -> Dict[str, Any]:
         candidates.append(fenced.group(1))
     candidates.append(text)
 
-    # widest balanced {...} span
+    # widest {...} span
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
         candidates.append(text[start : end + 1])
@@ -39,10 +39,54 @@ def extract(text: str) -> Dict[str, Any]:
                 continue
             if isinstance(parsed, dict):
                 return parsed
+
+    # The first complete object, ignoring whatever prose follows it — a model
+    # that adds "Note: {x} is optional" after its JSON defeats the widest span.
+    if start != -1:
+        decoder = json.JSONDecoder()
+        for attempt in (text[start:], _repair(text[start:])):
+            try:
+                parsed, _ = decoder.raw_decode(attempt)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
     raise ValueError(f"could not parse JSON from model response: {text[:200]!r}")
 
 
 def _repair(raw: str) -> str:
-    raw = re.sub(r",\s*([}\]])", r"\1", raw)  # trailing commas
-    raw = re.sub(r"//[^\n]*", "", raw)  # line comments
-    return raw
+    """Drop `//` comments and trailing commas — outside strings only.
+
+    The old regexes ran over the whole text, so a URL in a material
+    (`"https://…"`) was cut at `//`, which broke the very string the repair
+    was meant to save.
+    """
+    out = []
+    i, n = 0, len(raw)
+    in_str = False
+    while i < n:
+        c = raw[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(raw[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif c == "/" and raw.startswith("//", i):
+            nl = raw.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        elif c == "," and _TRAILING.match(raw, i):
+            pass
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+_TRAILING = re.compile(r",\s*(?://[^\n]*\s*)*[}\]]")

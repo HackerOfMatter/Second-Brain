@@ -7968,6 +7968,211 @@ def test_batch_capture_over_the_api():
                   r4.status_code == 200 and "candidates" in r4.json(), r4.status_code)
 
 
+def test_parsing_and_creation_hardening():
+    section("parsing + note creation hardening (phase 15)")
+    from sb.calsync import ics as icsmod
+    from sb.llm import _json as jsonmod
+    today = dt.date(2026, 9, 15)
+
+    # frontmatter
+    meta, body = frontmatter.parse("\ufeff---\r\nid: a\r\n---\r\n\r\nline1\r\nline2")
+    check("a BOM + CRLF note still has frontmatter", meta == {"id": "a"})
+    check("and its body is LF", body == "line1\nline2")
+    check("a horizontal rule is not a fence", frontmatter.parse("----\nid: a\n---\n")[0] == {})
+    check("strip keeps a body that opens with a rule",
+          frontmatter.strip("---\nprose here\n---\nmore") == "---\nprose here\n---\nmore")
+    check("strip removes real frontmatter", frontmatter.strip("---\nid: a\n---\nbody") == "body")
+    check("dump never writes a CR", "\r" not in frontmatter.dump({"id": "a"}, "x\r\ny"))
+
+    # dates / durations / steps
+    check("'in 99999999 days' is no date, not a crash",
+          extract.parse_deadline("in 99999999 days", today) is None)
+    check("'due: due: friday' does not recurse forever",
+          extract.parse_deadline("due: " * 400 + "friday", today) is not None)
+    check("'I sat the exam' is not a Saturday deadline",
+          extract.parse_deadline("I sat the exam", today) is None)
+    check("'by sat' still is", extract.parse_deadline("by sat", today) == dt.date(2026, 9, 19))
+    check("'in 3 days' is a deadline, not 12 hours of work",
+          extract.parse_duration_minutes("finish essay in 3 days, about 2 hours") == 120)
+    check("'2.5 min' is 2 minutes, not 5", extract.parse_duration_minutes("2.5 min") == 2)
+    check("a huge duration is capped",
+          extract.parse_duration_minutes("40000000 hours") == extract.MAX_MINUTES)
+    check("'- xylophone' keeps its x",
+          extract.extract_steps("- xylophone practice\n- [x] done\n- [ ] todo")
+          == ["xylophone practice", "done", "todo"])
+
+    # model output
+    check("a URL survives JSON repair",
+          jsonmod.extract('{"a": "https://x.io/y", "b": [1,],}') == {"a": "https://x.io/y", "b": [1]})
+    check("prose after the JSON is ignored",
+          jsonmod.extract('{"a": 1} note: {x} optional') == {"a": 1})
+    prior = extract.project_prior("write report", today)
+    m = parser._merge({"steps": [None, {"text": "one"}, 5, "two"], "learning": "false",
+                       "level": float("nan"), "estimate_minutes": float("inf")}, prior, today)
+    check("step ids stay contiguous", [s.id for s in m.steps] == ["s1", "s2"])
+    check("a quoted false is false", m.learning is False)
+    check("NaN / inf numbers fall back", m.level == prior["level"] and m.estimate_minutes == 60)
+
+    class _ListModel:
+        name, is_llm = "stub", True
+        def complete_json(self, *a, **k):
+            return ["not", "a", "dict"]
+    cfg = Config(vault=Path(tempfile.gettempdir()) / "unused")
+    orig = parser.resolve_provider
+    parser.resolve_provider = lambda *a, **k: _ListModel()
+    try:
+        r = parser.parse_project("write report", cfg, today)
+        check("a non-object model reply degrades instead of crashing", r.degraded)
+    finally:
+        parser.resolve_provider = orig
+
+    # capture normalises CRLF
+    n = Note.capture("Title\r\nline")
+    check("a CRLF capture is stored with LF", "\r" not in n.body and n.title == "Title")
+    check("ics escapes a bare CR", "\r" not in icsmod._esc("a\r\nb\rc"))
+
+    # cache: writes patch the listing instead of re-walking the vault
+    with tempfile.TemporaryDirectory() as tmp:
+        v = Vault(Path(tmp))
+        v.ensure_structure()
+        a = Note.capture("alpha", Bucket.RESOURCE)
+        v.write(a)
+        v.notes()
+        walks = v._walks
+        v.save(a)
+        v.notes()
+        check("re-saving a note does not re-walk", v._walks == walks)
+        b = Note.capture("beta", Bucket.RESOURCE)
+        v.write(b)
+        check("a new note is listed at once", len(v.notes(Bucket.RESOURCE)) == 2)
+        (Path(tmp) / "30-Resources" / "hand.md").write_text("---\nid: h1\ntitle: hand\n---\nx")
+        check("a file added outside the app is still seen",
+              any(n.id == "h1" for _, n in v.notes()))
+        c = Note.capture("gamma", Bucket.RESOURCE)
+        v.write(c, v.path_in(c, "Sub/Deep"))
+        check("a write into a new subfolder is seen", v.find(c.id) is not None)
+        got = v.find(a.id)[1]
+        got.tags.append("mutated")
+        check("a read never shares lists with the cache", "mutated" not in v.find(a.id)[1].tags)
+
+    # ics render cache gives identical output
+    ev = calevents.CalEvent(uid="u1", summary="Study, hard; now", start=dt.datetime(2026, 9, 16, 9),
+                            description="x" * 200, reminders=[10])
+    first = icsmod.render([ev], cfg)
+    second = icsmod.render([ev], cfg)
+    strip_stamp = lambda s: re.sub(r"DTSTAMP:\S+", "", s)
+    check("cached render is byte-identical", strip_stamp(first) == strip_stamp(second))
+    check("no placeholder leaks", "\x00" not in second)
+    check("every line is <= 75 octets",
+          all(len(l.encode()) <= 75 for l in second.split("\r\n")))
+
+
+def test_ollama_doctor():
+    section("ollama: step-by-step check and fix")
+    import http.server
+    import socket as _socket
+    import threading as _th
+    from sb.llm import ollama_doctor as od
+    from sb.config import LLMConfig
+
+    def free_port():
+        s = _socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
+        return p
+
+    def serve(handler):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        _th.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    tags = {"models": [{"name": "llama3.1:8b"}]}
+
+    class FakeOllama(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def _send(self, code, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(code); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+        def do_GET(self):
+            if self.path == "/api/version": self._send(200, {"version": "0.9.9"})
+            elif self.path == "/api/tags": self._send(200, tags)
+            else: self._send(404, {"error": "no"})
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0); body = json.loads(self.rfile.read(n) or b"{}")
+            if self.path == "/api/generate":
+                if body["model"] == "big:70b": self._send(500, {"error": "model requires more system memory"})
+                else: self._send(200, {"response": "OK"})
+            elif self.path == "/api/embeddings": self._send(200, {"embedding": [0.1, 0.2]})
+            elif self.path == "/api/pull":
+                tags["models"].append({"name": body["model"]}); self._send(200, {"status": "success"})
+            else: self._send(404, {"error": "no"})
+
+    class NotOllama(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"<html>hi</html>")
+
+    # nothing listening
+    cfg = LLMConfig(ollama_url=f"http://127.0.0.1:{free_port()}")
+    c = od.check(cfg, deep=True)
+    check("nothing listening reads as offline", c["state"] == "offline")
+    check("and names the server step", any(s["key"] == "server" and s["status"] == "fail" for s in c["steps"]))
+
+    # something else on the port
+    other = serve(NotOllama)
+    try:
+        c = od.check(LLMConfig(ollama_url=f"http://127.0.0.1:{other.server_port}"))
+        check("a foreign program on the port is called out", "not Ollama" in c["headline"])
+        r = od.start_server(LLMConfig(ollama_url=f"http://127.0.0.1:{other.server_port}"))
+        check("and fix does not launch over it", not r["started"] and "port" in r["reason"])
+    finally:
+        other.shutdown()
+
+    fake = serve(FakeOllama)
+    base = f"http://127.0.0.1:{fake.server_port}"
+    try:
+        c = od.check(LLMConfig(ollama_url=base, embed_model=""), deep=True)
+        check("a working server with its model is ready", c["state"] == "ready", c["headline"])
+        check("the real generation was tested", any(s["key"] == "generate" and s["status"] == "ok" for s in c["steps"]))
+
+        cfg = LLMConfig(ollama_url=base, embed_model="nomic-embed-text")
+        c = od.check(cfg, deep=True)
+        check("a missing search model is degraded, not offline", c["state"] == "degraded")
+        check("with a pull action", c["action"] == "pull")
+        r = od.fix(cfg, pull=True)
+        check("fix --pull pulls it", r["pull"]["pulled"] == ["nomic-embed-text"])
+        check("and the check is ready afterwards", r["check"]["state"] == "ready", r["check"]["headline"])
+        check("start on a running server is a no-op", r["start"]["reason"] == "already running")
+
+        tags["models"].append({"name": "big:70b"})
+        c = od.check(LLMConfig(ollama_url=base, model="big:70b", embed_model=""), deep=True)
+        check("a model that cannot load fails the check", c["state"] == "degraded")
+        check("with a memory hint", "memory" in " ".join(s["fix"] for s in c["steps"]))
+
+        check("0.0.0.0 is dialled as 127.0.0.1",
+              od._endpoint(LLMConfig(ollama_url="http://0.0.0.0:11434"))[2] == "http://127.0.0.1:11434")
+        check("another provider is 'off'",
+              od.check(LLMConfig(provider="heuristic"))["state"] == "off")
+    finally:
+        fake.shutdown()
+
+    # API: fix refuses a request without the header
+    from starlette.testclient import TestClient
+    from sb.api import build_app
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.ollama_url = f"http://127.0.0.1:{free_port()}"
+        cfg.llm.autostart = False
+        client = TestClient(build_app(cfg))
+        r = client.get("/api/llm/check")
+        check("GET /api/llm/check answers", r.status_code == 200 and r.json()["state"] == "offline")
+        r = client.post("/api/llm/fix", json={})
+        check("POST /api/llm/fix needs the action header", r.status_code == 403)
+        r = client.get("/static/ollama.js")
+        check("the banner script is served", r.status_code == 200 and "sb-ollama" in r.text)
+        for page in ("/", "/dashboard", "/study", "/review", "/inbox"):
+            check(f"{page} loads the banner", "/static/ollama.js" in client.get(page).text)
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -8059,6 +8264,8 @@ def main():
         test_captures_ignore_a_session_that_is_not_open,
         test_sessions_over_the_api,
         test_the_capture_box_reads_a_selection,
+        test_parsing_and_creation_hardening,
+        test_ollama_doctor,
     ]:
         try:
             fn()

@@ -227,5 +227,6 @@ api("/api/review/weekly")
   .then(render)
   .catch(e => { $("#body").innerHTML = `<p class="empty">Could not load the review: ${esc(e.message)}</p>`; });
 </script>
+<script src="/static/ollama.js"></script>
 </body>
 </html>

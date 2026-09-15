@@ -4,6 +4,7 @@
     python run.py                 start the server (default)
     python run.py init            create the vault structure and templates
     python run.py doctor [--write]  check vault, Ollama and calendar wiring
+    python run.py ollama [--fix] [--pull]  test Ollama step by step, and fix it
     python run.py capture "..." --bucket project
     python run.py intake          file whatever is in the Drop folder
     python run.py next            print the execution queue
@@ -220,7 +221,7 @@ def cmd_doctor(args) -> int:
         if not model_ready:
             out(f"           configured model is not pulled — run: ollama pull {llm['model']}")
     elif not llm["available"]:
-        out("           start it with `ollama serve`, or captures use the rule-based parser")
+        out("           fix: `python run.py ollama --fix` (or check-ollama.bat)")
     lanes = llm.get("lanes")
     if lanes:
         study = lanes.get("study")
@@ -415,6 +416,39 @@ def _capture_split(engine, args) -> int:
     for row in out["failed"]:
         print(f"  !! {row['title']}  {row['error']}")
     return 1 if out["failed"] and not out["created"] else 0
+
+
+def cmd_ollama(args) -> int:
+    """Test Ollama step by step; `--fix` starts it, `--pull` pulls models."""
+    from sb.llm import ollama_doctor
+
+    cfg = load(args.config)
+    if args.fix or args.pull:
+        r = ollama_doctor.fix(cfg.llm, pull=args.pull)
+        s = r["start"]
+        print("start: " + ("started via " + str(s.get("via")) if s.get("started") else s.get("reason", "")))
+        if r["pull"] is not None:
+            print(f"pull:  pulled {r['pull']['pulled'] or 'nothing'}"
+                  + (f", failed {r['pull']['failed']}" if r["pull"]["failed"] else ""))
+        c = r["check"]
+    else:
+        c = ollama_doctor.check(cfg.llm, deep=not args.quick)
+    marks = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]", "skip": "[ -- ]"}
+    print()
+    print(c["headline"])
+    for s in c["steps"]:
+        print(f"  {marks.get(s['status'], s['status'])} {s['label']}: {s['detail']}")
+        if s["fix"]:
+            print(f"         fix: {s['fix']}")
+    if c["log"]:
+        print("\n  last lines of server.log:")
+        for line in c["log"]:
+            print("    " + line)
+    if c["action"] == "start":
+        print("\n  run:  python run.py ollama --fix")
+    elif c["action"] == "pull":
+        print("\n  run:  python run.py ollama --pull")
+    return 0 if c["state"] in ("ready", "off") else 1
 
 
 def cmd_capture(args) -> int:
@@ -778,6 +812,11 @@ def main() -> int:
     d.add_argument("--write", action="store_true",
                    help="also save the report to _system/logs/doctor-YYYYMMDD.txt")
     d.set_defaults(func=cmd_doctor)
+    o = sub.add_parser("ollama", help="test Ollama step by step, and fix it")
+    o.add_argument("--fix", action="store_true", help="start Ollama if it is not running")
+    o.add_argument("--pull", action="store_true", help="also pull missing models")
+    o.add_argument("--quick", action="store_true", help="skip the real generation test")
+    o.set_defaults(func=cmd_ollama)
     sub.add_parser("next", help="print the execution queue").set_defaults(func=cmd_next)
 
     t = sub.add_parser("today", help="what is going on today (F3')")

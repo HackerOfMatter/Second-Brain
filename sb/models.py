@@ -23,6 +23,7 @@ import re
 import threading
 import unicodedata
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -78,11 +79,18 @@ def now() -> dt.datetime:
     return dt.datetime.now().astimezone().replace(microsecond=0)
 
 
+_SLUG_DROP = re.compile(r"[^\w\s-]")
+_SLUG_JOIN = re.compile(r"[\s_-]+")
+
+
+@lru_cache(maxsize=8192)
 def slugify(text: str, max_len: int = 60) -> str:
+    # Pure, and called for every title in the vault by the link and filename
+    # indexes — memoised.
     text = unicodedata.normalize("NFKD", text)
     text = text.encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
-    text = re.sub(r"[\s_-]+", "-", text)
+    text = _SLUG_DROP.sub("", text).strip().lower()
+    text = _SLUG_JOIN.sub("-", text)
     return text[:max_len].strip("-") or "untitled"
 
 
@@ -453,6 +461,10 @@ class Note(BaseModel):
 
     @classmethod
     def capture(cls, text: str, bucket: Bucket = Bucket.INBOX, title: str = "") -> "Note":
+        if "\r" in text:
+            # Windows clipboard text is CRLF; written back through a text-mode
+            # file on Windows it would become CR CR LF.
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
         title = (title or first_line(text)).strip()
         note = cls(id=new_id(title), title=title, bucket=bucket, body=text.strip())
         note.log("captured", f"bucket={bucket.value}")
@@ -461,8 +473,9 @@ class Note(BaseModel):
     # -- mutation -----------------------------------------------------------
 
     def log(self, event: str, detail: Optional[str] = None) -> None:
-        self.history.append(HistoryEntry(at=now(), event=event, detail=detail))
-        self.updated = now()
+        at = now()
+        self.history.append(HistoryEntry(at=at, event=event, detail=detail))
+        self.updated = at
 
     def touch(self) -> None:
         self.updated = now()

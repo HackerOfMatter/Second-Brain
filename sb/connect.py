@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -160,12 +161,25 @@ def own_links(note: Note) -> set:
     Only links lj (or a template) put in the note count as reasons not to
     suggest something.
     """
-    return existing_links(strip_related(note.body or ""))
+    return set(_own_links_of(note.body or ""))
+
+
+# Link-on-write asks every other note in the vault "do you link here?" and "who
+# is your parent?" on every capture. The answers depend on the body alone, so
+# they are memoised on it; an edited note is a different string and misses.
+@lru_cache(maxsize=4096)
+def _own_links_of(body: str) -> frozenset:
+    return frozenset(existing_links(strip_related(body)))
 
 
 def parent_of(note: Note) -> Optional[str]:
     """The `*From:*` backlink an atomized note carries to its guide note."""
-    match = FROM_LINE.search(note.body or "")
+    return _parent_of_body(note.body or "")
+
+
+@lru_cache(maxsize=4096)
+def _parent_of_body(body: str) -> Optional[str]:
+    match = FROM_LINE.search(body)
     if not match:
         return None
     link = WIKILINK.search(match.group(1))
@@ -245,7 +259,7 @@ def structural_links(note: Note, others: Sequence[Note]) -> List[Link]:
         # `own_links`, not every link: if another note only points here because
         # a previous run suggested it, that is our own echo coming back, not
         # evidence of a relationship.
-        if own in own_links(other):
+        if own in _own_links_of(other.body or ""):
             add(other, "links here")
 
     return out
@@ -277,10 +291,18 @@ def title_matcher(others: Sequence[Note]) -> Optional[re.Pattern]:
     Cost" where both exist.
     """
     titles = sorted(
-        {n.title.strip() for n in others if _matchable(n.title)}, key=len, reverse=True
+        {n.title.strip() for n in others if _matchable(n.title)},
+        key=lambda t: (-len(t), t),
     )
     if not titles:
         return None
+    return _compile_titles(tuple(titles))
+
+
+@lru_cache(maxsize=8)
+def _compile_titles(titles: tuple) -> re.Pattern:
+    # A vault's worth of alternation is expensive to compile, and the title
+    # set is the same from one capture to the next.
     return re.compile(r"\b(" + "|".join(re.escape(t) for t in titles) + r")\b", re.I)
 
 

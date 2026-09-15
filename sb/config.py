@@ -69,6 +69,9 @@ class LLMConfig(BaseModel):
     # rule-based parser rather than failing the capture. Captures must never
     # be lost because a model is down.
     fallback_to_heuristic: bool = True
+    #: Start Ollama when the app starts, if it is installed locally and not
+    #: already running. See sb/llm/ollama_doctor.py.
+    autostart: bool = True
 
 
     def model_for(self, role: str = "") -> str:

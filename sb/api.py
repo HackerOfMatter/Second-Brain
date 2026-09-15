@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import threading
 import traceback
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +31,7 @@ from starlette.staticfiles import StaticFiles
 
 from . import digest as digestmod
 from . import freshness
+from . import incidents as incidentsmod
 from . import intake as intakemod
 from .config import Config, load
 from .engine import Engine
@@ -129,6 +131,38 @@ def build_app(cfg: Config | None = None) -> Starlette:
         it is opt-in and the dashboard footer does not ask for it."""
         want = request.query_params.get("progress") in ("1", "true", "yes")
         return ok(await run_in_threadpool(engine.health, want))
+
+    @guard
+    async def llm_check(request: Request):
+        """Ollama, step by step. `?deep=1` also makes the model answer once —
+        the only proof it loads — so the page-load poll leaves it off."""
+        from .llm import ollama_doctor
+
+        deep = request.query_params.get("deep") in ("1", "true", "yes")
+        result = await run_in_threadpool(ollama_doctor.check, engine.cfg.llm, deep)
+        if result["state"] == "ready":
+            await run_in_threadpool(engine.incidents.clear, incidentsmod.OLLAMA)
+        return ok(result)
+
+    @guard
+    async def llm_fix(request: Request):
+        """Start Ollama, and pull missing models when asked.
+
+        This launches a process, so it demands a custom header: a cross-site
+        page cannot send one without a CORS preflight, which this server never
+        answers. Only the model names in config.yaml are ever pulled.
+        """
+        from .llm import ollama_doctor
+
+        if request.headers.get("x-sb-action") != "1":
+            return ok({"error": "missing X-SB-Action header"}, status=403)
+        body = await body_of(request)
+        result = await run_in_threadpool(
+            ollama_doctor.fix, engine.cfg.llm, bool(body.get("pull"))
+        )
+        if result["check"]["state"] == "ready":
+            await run_in_threadpool(engine.incidents.clear, incidentsmod.OLLAMA)
+        return ok(result)
 
     @guard
     async def dashboard(request: Request):
@@ -807,6 +841,8 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/dashboard", dashboard_page),
         Route("/inbox", inbox_page),
         Route("/api/health", health),
+        Route("/api/llm/check", llm_check),
+        Route("/api/llm/fix", llm_fix, methods=["POST"]),
         Route("/api/problems", problems),
         Route("/api/problems/clear", problems_clear, methods=["POST"]),
         Route("/api/queue", queue_status),
@@ -892,12 +928,30 @@ def build_app(cfg: Config | None = None) -> Starlette:
         # purpose: they poll at different rates, and a Drop folder that cannot
         # be read must not stop the index following lj's edits.
         freshness.start(engine)
+        # A reboot leaves Ollama off unless its tray app is set to start at
+        # login. Start it in the background so the first capture of the day
+        # gets the model rather than the rule-based fallback.
+        if cfg.llm.autostart and (cfg.llm.provider or "ollama").lower() == "ollama":
+            threading.Thread(target=_autostart_ollama, args=(engine,), daemon=True).start()
         yield
 
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.engine = engine
     app.state.config = cfg
     return app
+
+
+def _autostart_ollama(engine: Engine) -> None:
+    from .llm import ollama_doctor
+
+    try:
+        result = ollama_doctor.start_server(engine.cfg.llm)
+        if result.get("started"):
+            engine.vault.log_line("llm", f"started Ollama via {result.get('via')}")
+        elif result.get("reason") != "already running":
+            engine.vault.log_line("llm", f"could not start Ollama: {result.get('reason')}")
+    except Exception as exc:  # never take the app down over this
+        engine.vault.log_line("llm", f"autostart failed: {exc!r}")
 
 
 def start_drop_watcher(engine: Engine) -> None:

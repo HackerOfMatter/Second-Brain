@@ -100,6 +100,15 @@ def parse_project(text: str, cfg: Config, today: Optional[dt.date] = None) -> Pa
             degraded=True,
             note=f"Model call failed ({type(exc).__name__}); used rule-based extraction.",
         )
+    if not isinstance(raw, dict):
+        # A small model will sometimes return a bare list of steps or a
+        # string. That is a failed call, not a crash on the capture path.
+        return ParseResult(
+            _from_prior(prior),
+            provider.name,
+            degraded=True,
+            note="Model returned no JSON object; used rule-based extraction.",
+        )
 
     return ParseResult(
         _merge(raw, prior, today),
@@ -168,14 +177,17 @@ def _from_prior(prior: Dict[str, Any]) -> ProjectMeta:
 
 
 def _split_minutes(total: int, n: int) -> int:
-    return max(15, int(total / n)) if n else 30
+    return max(15, total // n) if n else 30
 
 
 def _merge(raw: Dict[str, Any], prior: Dict[str, Any], today: dt.date) -> ProjectMeta:
     deadline, source, phrase, confirmed = _settle_deadline(raw, prior, today)
 
     steps: List[Step] = []
-    for i, item in enumerate(raw.get("steps") or []):
+    raw_steps = raw.get("steps")
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+    for item in raw_steps:
         if isinstance(item, str):
             text, minutes = item, 30
         elif isinstance(item, dict):
@@ -184,7 +196,8 @@ def _merge(raw: Dict[str, Any], prior: Dict[str, Any], today: dt.date) -> Projec
         else:
             continue
         if text:
-            steps.append(Step(id=f"s{i+1}", text=text[:200], minutes=minutes))
+            # ids stay contiguous even when the model slipped in junk items
+            steps.append(Step(id=f"s{len(steps) + 1}", text=text[:200], minutes=minutes))
     if not steps:
         return _from_prior({
             **prior,
@@ -210,8 +223,8 @@ def _merge(raw: Dict[str, Any], prior: Dict[str, Any], today: dt.date) -> Projec
         skills=_coerce_list(raw.get("skills")) or list(prior["skills"]),
         materials=_coerce_materials(raw.get("materials")) or list(prior["materials"]),
         steps=steps,
-        learning=bool(raw.get("learning", prior["learning"])),
-        ideal_end=(str(raw["ideal_end"])[:300] if raw.get("ideal_end") else None),
+        learning=_coerce_bool(raw.get("learning"), bool(prior["learning"])),
+        ideal_end=(str(raw["ideal_end"]).strip()[:300] or None) if raw.get("ideal_end") else None,
     )
 
 
@@ -259,10 +272,27 @@ def _coerce_date(value: Any, today: dt.date) -> Optional[dt.date]:
     return extract.parse_deadline(value, today)
 
 
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """`"false"` is truthy to `bool()`; a model that quotes its booleans must
+    not turn every capture into a learning Project."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "y", "1"):
+            return True
+        if v in ("false", "no", "n", "0", "", "null", "none"):
+            return False
+        return default
+    return bool(value)
+
+
 def _coerce_int(value: Any, default: int, lo: int, hi: int) -> int:
+    if isinstance(value, bool):
+        return default
     try:
         n = int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # NaN / inf included
         return default
     return max(lo, min(hi, n))
 
