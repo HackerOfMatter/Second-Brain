@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Second Brain — entry point.
 
-    python run.py                 start the server (default)
+    python run.py                 start the server (default); if one is already
+                                  running, open it — or restart it if the code changed
+    python run.py serve --restart stop the running copy and start fresh
+    python run.py stop            stop the running copy
     python run.py init            create the vault structure and templates
     python run.py doctor [--write]  check vault, Ollama and calendar wiring
     python run.py ollama [--fix] [--pull]  test Ollama step by step, and fix it
@@ -31,22 +34,47 @@ from sb.config import load  # noqa: E402
 from sb.engine import Engine  # noqa: E402
 
 
-def cmd_serve(args) -> int:
-    import uvicorn
-
-    from sb.api import build_app
-
-    cfg = load(args.config)
-    app = build_app(cfg)
-    url = f"http://{cfg.host}:{cfg.port}"
-    print(f"Second Brain  ·  vault: {cfg.vault}")
-    print(f"                 open: {url}")
-    if not args.no_browser:
+def _open(url: str, args) -> None:
+    if not getattr(args, "no_browser", False):
         try:
             webbrowser.open(url)
         except Exception:
             pass
-    uvicorn.run(
+
+
+def cmd_serve(args) -> int:
+    import uvicorn
+
+    from sb import instance
+    from sb.api import build_app
+
+    cfg = load(args.config)
+    url = f"http://{cfg.host}:{cfg.port}"
+
+    # Is something already on the port? (Usually: the copy started at login.)
+    running = instance.probe(cfg.host, cfg.port)
+    if running is not None:
+        if running.get("app") != instance.APP:
+            print(instance.describe_other(cfg.port))
+            return 1
+        current = instance.code_fingerprint()
+        stale = running.get("code") != current
+        if not stale and not getattr(args, "restart", False):
+            print(f"Second Brain is already running — opening {url}")
+            _open(url, args)
+            return 0
+        why = "restarting it" if getattr(args, "restart", False) else \
+            "it is running older code, restarting it so the update loads"
+        print(f"Second Brain is already running on {url} — {why}.")
+        if not instance.stop(cfg.host, cfg.port):
+            print("Could not stop it. Close the other Second Brain window "
+                  "(it may be minimized in the taskbar), then run start.bat again.")
+            return 1
+
+    app = build_app(cfg)
+    print(f"Second Brain  ·  vault: {cfg.vault}")
+    print(f"                 open: {url}")
+    config = uvicorn.Config(
         app,
         host=cfg.host,
         port=cfg.port,
@@ -56,7 +84,28 @@ def cmd_serve(args) -> int:
         # reports as a failed fetch.
         timeout_keep_alive=120,
     )
+    server = uvicorn.Server(config)
+    # POST /api/admin/shutdown (a newer copy starting) stops this one cleanly.
+    app.state.request_exit = lambda: setattr(server, "should_exit", True)
+    _open(url, args)
+    server.run()
     return 0
+
+
+def cmd_stop(args) -> int:
+    from sb import instance
+
+    cfg = load(args.config)
+    running = instance.probe(cfg.host, cfg.port)
+    if running is None:
+        print("Second Brain is not running.")
+        return 0
+    if running.get("app") != instance.APP:
+        print(instance.describe_other(cfg.port))
+        return 1
+    ok = instance.stop(cfg.host, cfg.port)
+    print("Stopped." if ok else "Could not stop it — close its window by hand.")
+    return 0 if ok else 1
 
 
 def cmd_init(args) -> int:
@@ -801,7 +850,10 @@ def main() -> int:
 
     s = sub.add_parser("serve", help="run the local web app (default)")
     s.add_argument("--no-browser", action="store_true")
+    s.add_argument("--restart", action="store_true",
+                   help="stop a copy that is already running, then start")
     s.set_defaults(func=cmd_serve)
+    sub.add_parser("stop", help="stop the running web app").set_defaults(func=cmd_stop)
 
     sub.add_parser("init", help="create vault folders and templates").set_defaults(func=cmd_init)
     t = sub.add_parser("templates", help="check the note templates, or put them back")
@@ -891,6 +943,7 @@ def main() -> int:
     if not getattr(args, "func", None):
         args.func = cmd_serve
         args.no_browser = False
+        args.restart = False
     return args.func(args)
 
 

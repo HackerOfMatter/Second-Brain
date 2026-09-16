@@ -8893,6 +8893,72 @@ def test_glossary_over_every_surface():
             check("the Obsidian plugin reports terms", "data.glossary" in plugin.read_text(encoding="utf-8"))
 
 
+
+def test_a_second_start_does_not_crash_on_the_port():
+    """lj's report: `[Errno 10048] ... bind on address ('127.0.0.1', 8787)`.
+    The copy started at login already holds the port."""
+    section("start.bat twice: one server, and updates load")
+    from sb import instance
+    from starlette.testclient import TestClient
+    from sb.api import build_app
+
+    netstat = (
+        "\n  Proto  Local Address          Foreign Address        State           PID\n"
+        "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1060\n"
+        "  TCP    127.0.0.1:8787         0.0.0.0:0              LISTENING       23456\n"
+        "  TCP    127.0.0.1:8787         127.0.0.1:50123        ESTABLISHED     23456\n"
+        "  TCP    127.0.0.1:18787        0.0.0.0:0              LISTENING       999\n"
+        "  TCP    [::1]:8788             [::]:0                 LISTENING       777\n"
+    )
+    check("netstat: the listener on the port", instance.parse_netstat(netstat, 8787) == 23456)
+    check("netstat: not a port that merely ends the same way",
+          instance.parse_netstat(netstat, 787) is None)
+    check("netstat: IPv6 addresses", instance.parse_netstat(netstat, 8788) == 777)
+    check("netstat: nothing there", instance.parse_netstat(netstat, 9999) is None)
+    check("tasklist: the image name",
+          instance.parse_tasklist('"python.exe","23456","Console","1","85,112 K"\r\n') == "python.exe")
+    check("tasklist: no match", instance.parse_tasklist("INFO: No tasks are running") == "")
+
+    import socket as _s
+    free = _s.socket(); free.bind(("127.0.0.1", 0)); port = free.getsockname()[1]; free.close()
+    check("a free port has nobody on it", instance.probe("127.0.0.1", port) is None)
+
+    fp = instance.code_fingerprint()
+    check("the code fingerprint is stable", fp == instance.code_fingerprint() and len(fp) == 12)
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "sb"
+        (copy / "web").mkdir(parents=True)
+        (copy / "a.py").write_text("x = 1\n")
+        (copy / "web" / "p.html").write_text("<p>")
+        before = instance.code_fingerprint(Path(tmp))
+        (copy / "a.py").write_text("x = 2\n")
+        check("and changes when the code does", instance.code_fingerprint(Path(tmp)) != before)
+
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        app = build_app(cfg)
+        client = TestClient(app)
+        ping = client.get("/api/ping").json()
+        check("/api/ping names the app and its code",
+              ping["app"] == "secondbrain" and ping["code"] == fp and ping["pid"], ping)
+        no_header = client.post("/api/admin/shutdown", json={})
+        check("shutdown needs the action header", no_header.status_code == 403)
+        unhooked = client.post("/api/admin/shutdown", json={}, headers={"X-SB-Action": "1"}).json()
+        check("and does nothing outside run.py", unhooked["stopping"] is False, unhooked)
+        stopped = []
+        app.state.request_exit = lambda: stopped.append(True)
+        hooked = client.post("/api/admin/shutdown", json={}, headers={"X-SB-Action": "1"}).json()
+        check("run.py's server is asked to exit", hooked["stopping"] is True and stopped == [True])
+
+    root = Path(__file__).resolve().parent.parent
+    run_py = (root / "run.py").read_text(encoding="utf-8")
+    check("run.py looks before it binds",
+          "instance.probe(" in run_py and "--restart" in run_py and "def cmd_stop" in run_py)
+    check("restart.bat and stop.bat exist",
+          (root / "restart.bat").exists() and (root / "stop.bat").exists())
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -8999,6 +9065,7 @@ def main():
         test_glossary_lines_are_recognised,
         test_a_pasted_glossary_files_terms,
         test_glossary_over_every_surface,
+        test_a_second_start_does_not_crash_on_the_port,
     ]:
         try:
             fn()

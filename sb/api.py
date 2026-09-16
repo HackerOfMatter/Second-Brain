@@ -14,6 +14,8 @@ signatures are shaped so a later swap is mechanical.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import base64
 import contextlib
 import json
@@ -55,6 +57,7 @@ def ok(payload: Any, status: int = 200) -> JSONResponse:
 
 from .cards import CardNotFound  # noqa: E402
 from . import glossary  # noqa: E402
+from . import instance  # noqa: E402
 
 
 def guard(handler: Callable):
@@ -171,6 +174,32 @@ def build_app(cfg: Config | None = None) -> Starlette:
         if result["check"]["state"] == "ready":
             await run_in_threadpool(engine.incidents.clear, incidentsmod.OLLAMA)
         return ok(result)
+
+    @guard
+    async def ping(request: Request):
+        """Who is on this port, and which code it runs — see sb/instance.py.
+        Cheap on purpose: no vault walk, no Ollama call."""
+        return ok(instance.ping_payload(cfg, request.app.state.code, request.app.state.started))
+
+    @guard
+    async def admin_shutdown(request: Request):
+        """Stop this server so a newer copy can take the port.
+
+        Same guard as /api/llm/fix: the custom header forces a CORS preflight
+        this server never answers, so another website cannot trigger it; and
+        only a caller on this machine is accepted.
+        """
+        if request.headers.get("x-sb-action") != "1":
+            return ok({"error": "missing X-SB-Action header"}, status=403)
+        client = request.client.host if request.client else ""
+        if client not in ("127.0.0.1", "::1", "localhost", "testclient"):
+            return ok({"error": "only from this machine"}, status=403)
+        stopper = getattr(request.app.state, "request_exit", None)
+        if stopper is None:
+            return ok({"stopping": False, "note": "not started by run.py"})
+        engine.vault.log_line("server", "shutdown requested by a newer copy")
+        stopper()
+        return ok({"stopping": True})
 
     @guard
     async def dashboard(request: Request):
@@ -951,6 +980,8 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/session/start", session_start, methods=["POST"]),
         Route("/api/session/end", session_end, methods=["POST"]),
         Route("/api/capture/term", capture_term, methods=["POST"]),
+        Route("/api/ping", ping),
+        Route("/api/admin/shutdown", admin_shutdown, methods=["POST"]),
         Route("/api/capture/glossary", capture_glossary, methods=["POST"]),
         Route("/api/terms/{note_id}/define", define_term, methods=["POST"]),
         Route("/api/terms/undefined", undefined_terms),
@@ -1042,6 +1073,10 @@ def build_app(cfg: Config | None = None) -> Starlette:
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.engine = engine
     app.state.config = cfg
+    app.state.code = instance.code_fingerprint()
+    app.state.started = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    # Set by run.py to a callable that stops uvicorn gracefully.
+    app.state.request_exit = None
     return app
 
 
