@@ -44,3 +44,35 @@ POST /api/decks/{note}/generate              {fill_gaps: true}
   `_triage.jsonl` drops are the labelled data to tune them with.
 - The model concept pass has only been tested with a fake provider. Before
   trusting it, run one real generation with Ollama up and read the output.
+
+## Terms in bulk — paste a glossary (`sb/glossary.py`)
+
+Write or paste one term per line. Each line becomes a Term note (from
+`_templates/Term.md`) with a card you wrote yourself: active right away, no
+model needed.
+
+```
+## Chapter 4 terms                     ← becomes "Seen in" for the terms below
+Elasticity: how much demand responds to price
+- **Opportunity cost** — the value of the next best alternative
+Marginal utility = the extra satisfaction from one more unit
+WIIFM :: What's in it for me?          ← `::` works even on a single line
+Sunk cost<TAB>a cost that cannot be recovered   ← spreadsheet / Quizlet rows
+```
+
+| Surface | What happens |
+|---|---|
+| Dashboard capture box | Two or more term lines turn on the preview. Press **Resource** to see and edit each term and definition, then **File them**. |
+| Ctrl+Alt+Z box (note mode) | Paste and press Enter. The server files the terms; the hotkey waits up to 30 s for a glossary instead of 2 s. |
+| Obsidian plugin | "Send to Second Brain" on a glossary files terms, and the notice says how many. |
+| Drop folder | A glossary file (including the offline fallbacks) is filed as terms. |
+| Class session | Terms go into the session's folder and are counted in its summary. |
+
+- A term already in the vault is not filed again. If it was saved without a
+  definition, the paste fills in `## Definition` (your `## In my own words` is
+  kept) and makes its card.
+- "Terms with no definition" on the dashboard now has an input on each row:
+  type the definition and press Enter.
+- Not treated as terms: label lines (`Due:`, `Room:`, `Speaker:`), links,
+  times, and pastes where fewer than 75% of the lines are term lines (60% for
+  the preview). `"glossary": false` on `/api/capture` turns routing off.

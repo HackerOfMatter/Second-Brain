@@ -355,7 +355,8 @@
   </section>
 
   <div class="capture">
-    <textarea id="capturebox" placeholder="Capture anything — “learn Rust generics by next Friday, ~4h, start with the Book ch.10”"></textarea>
+    <textarea id="capturebox" placeholder="Capture anything — “learn Rust generics by next Friday, ~4h, start with the Book ch.10”
+Several terms? One per line — “Elasticity: how much demand responds to price” — then Resource."></textarea>
     <div class="buttons">
       <button class="btn-area"     data-bucket="area">Area<kbd>1</kbd></button>
       <button class="btn-project"  data-bucket="project">Project<kbd>2</kbd></button>
@@ -657,7 +658,9 @@ async function runIntake(btn) {
 
 function renderCollected(out) {
   const box = $("#collectedbox");
-  if (!out || !out.eligible) { box.classList.add("hide"); return; }
+  // Undefined terms are one action from being cards, so they show even when
+  // there is no collected-note debt to report.
+  if (!out || (!out.eligible && !(out.undefined_terms || []).length)) { box.classList.add("hide"); return; }
   box.classList.remove("hide");
   $("#collectedcost").textContent = out.ratio === null ? ""
     : `${Math.round(out.ratio * 100)}% used · ${out.collected} outstanding`;
@@ -680,12 +683,30 @@ function renderCollected(out) {
   $("#undefinedlist").innerHTML = terms.length ? `
     <h2 style="margin-top:18px">Terms with no definition</h2>
     <p class="hint" style="margin:0 0 8px">
-      Each one is a card the moment it has a definition. Open it and fill in
-      <code>## Definition</code>.
+      Each one is a card the moment it has a definition. Type it here and press
+      Enter — or paste a glossary into the capture box and any of these it
+      names are filled in.
     </p>
     ${terms.map(t => `<div class="droprow"><strong>${esc(t.title)}</strong>
-       <span class="conf">${esc((t.created || "").slice(0, 10))}</span></div>`).join("")}` : "";
+       <span class="conf">${esc((t.created || "").slice(0, 10))}</span>
+       <input type="text" data-define="${esc(t.id)}" placeholder="definition…"
+              style="flex:1;min-width:180px;font:inherit;font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink)">
+       </div>`).join("")}` : "";
 }
+
+document.addEventListener("keydown", async e => {
+  const input = e.target.closest && e.target.closest("input[data-define]");
+  if (!input || e.key !== "Enter") return;
+  const definition = input.value.trim();
+  if (!definition) return;
+  input.disabled = true;
+  try {
+    const r = await api(`/api/terms/${input.dataset.define}/define`,
+      {method: "POST", body: JSON.stringify({definition})});
+    toast("Defined", `${r.note.title} — a card is ready to study.`);
+    load();
+  } catch (err) { input.disabled = false; toast("Could not save it", err.message, "err"); }
+});
 
 document.addEventListener("click", async e => {
   const card = e.target.closest("[data-card-note]");
@@ -1334,11 +1355,23 @@ function planWordCount() {
 let SPLIT_TOUCHED = false;
 $("#splitmode").addEventListener("change", () => { SPLIT_TOUCHED = true; updateSplitHint(); });
 
+/* A rough, client-side echo of sb/glossary.py — only to decide whether to
+   show the preview. The server makes the real decision. */
+function looksLikeGlossary(text) {
+  const lines = text.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
+  const hits = lines.filter(l =>
+    /^(?:[-*+•]\s+|\d{1,3}[.)]\s+)?[^\t:=—–]{1,60}?\s*(?:::|\t|:|=|\s[—–-]\s|[—–])\s*\S/.test(l)).length;
+  return hits >= 2 && hits / lines.length >= 0.6 ? hits : 0;
+}
+
 function updateSplitHint() {
   const words = planWordCount();
-  if (!SPLIT_TOUCHED && words >= 120 && !$("#splitmode").checked) $("#splitmode").checked = true;
+  const terms = looksLikeGlossary($("#capturebox").value);
+  if (!SPLIT_TOUCHED && (words >= 120 || terms) && !$("#splitmode").checked) $("#splitmode").checked = true;
   const on = $("#splitmode").checked;
-  $("#splithint").textContent = on
+  $("#splithint").textContent = terms && on
+    ? `Looks like ${terms} terms — press Resource to see each one as a term note and a card before anything is written.`
+    : on
     ? `${words} word${words === 1 ? "" : "s"} — you'll see what it becomes before anything is written.`
     : "Classification is yours. Everything after it is automatic.";
 }
@@ -1360,8 +1393,10 @@ async function planCapture(bucket) {
 function renderPlan() {
   const d = PLAN;
   const n = d.items.length;
-  $("#planhead").textContent =
-    n === 1 ? "This is one note" : `This becomes ${n} ${d.mode === "tasks" ? "Projects" : "notes"}`;
+  const terms = d.mode === "terms";
+  $("#planhead").textContent = terms
+    ? `This becomes ${n} term${n === 1 ? "" : "s"} — a note and a card each`
+    : n === 1 ? "This is one note" : `This becomes ${n} ${d.mode === "tasks" ? "Projects" : "notes"}`;
   $("#planstrategy").textContent =
     `split on ${esc(d.strategy)}${d.provider ? " · " + esc(d.provider) : ""} · ${d.words} words in`;
 
@@ -1376,6 +1411,26 @@ function renderPlan() {
 
   $("#plannote").textContent = d.note ||
     (d.lossless === false ? "" : "Every line you typed is in exactly one of these. Edit anything, then file.");
+
+  if (terms) {
+    $("#plannote").textContent = d.note;
+    if (d.lossless === false) warn.classList.add("hide");   // leftover lines are listed in the note
+    $("#planlist").innerHTML = d.items.map((it, i) => `
+      <div class="planitem" data-i="${i}" data-kind="term">
+        <div class="top">
+          <span class="n">${i + 1}</span>
+          <input type="text" data-f="title" value="${esc(it.term)}" placeholder="Term">
+          ${it.source ? `<span class="sub">${esc(it.source)}</span>` : ""}
+          ${it.existing ? `<span class="pill">${esc(it.existing)}</span>` : ""}
+          <button data-act="drop" title="Do not file this one">✕</button>
+        </div>
+        <textarea data-f="body" rows="2" placeholder="Definition — the back of the card">${esc(it.definition)}</textarea>
+        <input type="hidden" data-f="source" value="${esc(it.source || "")}">
+      </div>`).join("");
+    $("#planbox").classList.remove("hide");
+    $("#planbox").scrollIntoView({behavior: "smooth", block: "nearest"});
+    return;
+  }
 
   $("#planlist").innerHTML = d.items.map((it, i) => {
     const bits = [`${it.words} words`, esc(it.boundary)];
@@ -1421,6 +1476,10 @@ $("#planfile").addEventListener("click", async () => {
     if (row.classList.contains("gone")) return;
     const get = f => row.querySelector(`[data-f="${f}"]`).value;
     const body = get("body").trim();
+    if (row.dataset.kind === "term") {
+      if (get("title").trim()) items.push({kind: "term", title: get("title").trim(), body, source: get("source")});
+      return;
+    }
     if (body) items.push({title: get("title").trim(), body, bucket: get("bucket"), due: get("due") || null});
   });
   if (!items.length) { toast("Nothing selected", "Every item is set to skip.", "warn"); return; }
@@ -1458,7 +1517,9 @@ async function capture(bucket) {
     box.value = "";
     $("#duepick").value = "";
     const p = r.note.project;
-    if (bucket === "project" && p) {
+    if (r.glossary) {
+      toast("Terms filed", r.glossary.note, r.glossary.failed.length ? "warn" : "");
+    } else if (bucket === "project" && p) {
       const bits = [];
       if (p.deadline) bits.push("due " + p.deadline);
       bits.push(`${(p.steps || []).length} steps`, `~${p.estimate_minutes}m`, `L${p.level}`);

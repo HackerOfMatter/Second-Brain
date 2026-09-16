@@ -142,6 +142,18 @@ def _load_endpoint() -> tuple[str, Path]:
 API_URL, DROP_DIR = _load_endpoint()
 TERM_URL = API_URL.rsplit("/", 1)[0] + "/capture/term"
 API_TIMEOUT_SECONDS = 2.0  # generous for a local hung server; instant on refusal
+#: A pasted glossary files one term note and card per line, which can take
+#: longer than one capture. A timeout here would send the same paste to Drop
+#: as well; the server skips terms it already has, but waiting is cleaner.
+GLOSSARY_TIMEOUT_SECONDS = 30.0
+_GLOSSARY_LINE = re.compile(r"^\s*(?:[-*+•]\s+|\d{1,3}[.)]\s+)?[^\t:=—–]{1,60}?\s*(?:::|\t|:|=|\s[—–-]\s|[—–])\s*\S")
+
+
+def looks_like_glossary(text: str) -> bool:
+    """Two or more `term: definition` lines (the server decides for real)."""
+    lines = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    hits = sum(1 for l in lines if _GLOSSARY_LINE.match(l))
+    return hits >= 2 and hits >= 0.6 * len(lines)
 
 # -- capture: API first, Drop/ fallback --------------------------------------
 
@@ -154,7 +166,8 @@ def try_api(text: str) -> bool:
     # `capture.default_bucket` is where that decision belongs, and it is one
     # line in config.yaml rather than an edit to a startup script.
     payload = json.dumps({"text": text}).encode("utf-8")
-    return _post(API_URL, payload)
+    timeout = GLOSSARY_TIMEOUT_SECONDS if looks_like_glossary(text) else API_TIMEOUT_SECONDS
+    return _post(API_URL, payload, timeout=timeout)
 
 
 def _get(url: str):
@@ -174,13 +187,13 @@ def try_term_api(term: str, definition: str, source: str) -> bool:
     return _post(TERM_URL, payload)
 
 
-def _post(url: str, payload: bytes) -> bool:
+def _post(url: str, payload: bytes, timeout: float = API_TIMEOUT_SECONDS) -> bool:
     req = urllib.request.Request(
         url, data=payload, method="POST",
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as exc:
         log(f"API non-2xx: HTTP {exc.code}")
@@ -559,7 +572,7 @@ def handle_capture(text: str) -> None:
     if try_api(text):
         log(f"filed via API: {text[:60]!r}")
         beep_ok()
-        notify("Captured.")
+        notify("Terms captured — a card each." if looks_like_glossary(text) else "Captured.")
         return
     try:
         path = write_drop_fallback(text)

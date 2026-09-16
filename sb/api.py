@@ -54,6 +54,7 @@ def ok(payload: Any, status: int = 200) -> JSONResponse:
 
 
 from .cards import CardNotFound  # noqa: E402
+from . import glossary  # noqa: E402
 
 
 def guard(handler: Callable):
@@ -195,13 +196,61 @@ def build_app(cfg: Config | None = None) -> Starlette:
         queue is that it is not emptied. See CaptureConfig.
         """
         body = await request.json()
+        text = body.get("text", "")
+        bucket = body.get("bucket") or cfg.capture.default_bucket
+        # A pasted glossary files as terms from every surface that posts here
+        # — the dashboard, the hotkey box, the Obsidian plugin — unless the
+        # caller says otherwise. `note` stays in the answer (the first term)
+        # because every one of those callers reads it.
+        if (
+            body.get("glossary", True) is not False
+            and bucket in ("resource", "inbox")
+            and not body.get("title")
+            and glossary.detect(text or "") is not None
+        ):
+            done = await run_in_threadpool(
+                lambda: engine.capture_glossary(
+                    text, folder=str(body.get("folder") or "")
+                )
+            )
+            first = (done["created"] + done["defined"])[:1]
+            return ok({
+                "note": first[0] if first else {"title": done["note"]},
+                "glossary": done,
+                "links": {"linked": 0},
+            })
         return ok(await run_in_threadpool(
             engine.capture,
-            body.get("text", ""),
-            body.get("bucket") or cfg.capture.default_bucket,
+            text,
+            bucket,
             body.get("title", ""),
             body.get("due") or None,
             str(body.get("folder") or ""),
+        ))
+
+    @guard
+    async def capture_glossary(request: Request):
+        """Many `term: definition` lines, one term note and card each."""
+        body = await body_of(request)
+        entries = body.get("entries")
+        return ok(await run_in_threadpool(
+            lambda: engine.capture_glossary(
+                str(body.get("text") or ""),
+                source=str(body.get("source") or ""),
+                folder=str(body.get("folder") or ""),
+                entries=entries if isinstance(entries, list) else None,
+            )
+        ))
+
+    @guard
+    async def define_term(request: Request):
+        body = await body_of(request)
+        return ok(await run_in_threadpool(
+            lambda: engine.define_term(
+                request.path_params["note_id"],
+                str(body.get("definition") or ""),
+                source=str(body.get("source") or ""),
+            )
         ))
 
     @guard
@@ -902,6 +951,8 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/session/start", session_start, methods=["POST"]),
         Route("/api/session/end", session_end, methods=["POST"]),
         Route("/api/capture/term", capture_term, methods=["POST"]),
+        Route("/api/capture/glossary", capture_glossary, methods=["POST"]),
+        Route("/api/terms/{note_id}/define", define_term, methods=["POST"]),
         Route("/api/terms/undefined", undefined_terms),
         Route("/api/folders", folders),
         Route("/api/collected", collected_debt),

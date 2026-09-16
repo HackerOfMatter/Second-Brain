@@ -26,6 +26,7 @@ from . import (
     forecasting,
     frontmatter as frontmattermod,
     generate,
+    glossary as glossarymod,
     guide as guidemod,
     habits as habitsmod,
     incidents as incidentsmod,
@@ -378,6 +379,31 @@ class Engine:
         the thing you did not know, which is the whole point — so it is filed
         and tagged `needs-definition` rather than refused.
         """
+        where, session = self._session_folder(folder)
+        snapshot = self._snapshot()
+        out, snapshot = self._file_term(
+            term, definition, source=source, where=where, session=session,
+            snapshot=snapshot,
+        )
+        self._sync_calendar_quiet(snapshot)
+        return out
+
+    def _file_term(
+        self,
+        term: str,
+        definition: str,
+        *,
+        source: str,
+        where: str,
+        session: Any,
+        snapshot: List[Note],
+    ) -> Tuple[Dict[str, Any], List[Note]]:
+        """One term note and its card, against a snapshot the caller owns.
+
+        Split out of `capture_term` so a pasted glossary of thirty terms
+        reads the vault once and rewrites the calendar once, not thirty
+        times each.
+        """
         term = (term or "").strip()
         definition = (definition or "").strip()
         if not term:
@@ -396,8 +422,6 @@ class Engine:
         if not definition:
             note.tags = list(note.tags) + [self.UNDEFINED_TAG]
 
-        where, session = self._session_folder(folder)
-        snapshot = self._snapshot()
         info = self._apply_bucket(note, Bucket.RESOURCE, snapshot, shape=False)
         path = self.vault.write(
             note, self.vault.path_in(note, where) if where else None
@@ -417,14 +441,152 @@ class Engine:
             self.decks.save(deck)
             carded = True
 
-        self._sync_calendar_quiet(self._replacing(snapshot, note))
         return {
             "note": _note_dict(note),
             "path": str(path),
             "carded": carded,
             "needs_definition": not definition,
             **info,
+        }, self._replacing(snapshot, note)
+
+    # -- glossaries: many terms in one paste --------------------------------
+
+    def _existing_terms(self, snapshot: List[Note]) -> Dict[str, Note]:
+        """Term notes already in the vault, by lower-cased title."""
+        out: Dict[str, Note] = {}
+        for n in snapshot:
+            if n.bucket == Bucket.ARCHIVE:
+                continue
+            if "term" in (n.tags or []) or self.UNDEFINED_TAG in (n.tags or []):
+                out.setdefault((n.title or "").strip().lower(), n)
+        return out
+
+    def capture_glossary(
+        self,
+        text: str = "",
+        *,
+        source: str = "",
+        folder: str = "",
+        entries: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Every `term: definition` line in a paste, filed as a term.
+
+        A term already in the vault is not filed twice. If it was captured
+        without a definition, this paste supplies it (`define_term`); if it
+        already has one, it is reported and left alone — two notes for one
+        word is the duplicate this system spends effort preventing.
+
+        `entries` (term, definition, source) is what the dashboard preview
+        sends after lj edited it; otherwise `text` is parsed here.
+        """
+        if entries is None:
+            parsed = glossarymod.parse(text, source)
+            rows = [e.as_dict() for e in parsed.entries]
+            leftover = parsed.leftover
+        else:
+            rows, leftover = list(entries), []
+        rows = [r for r in rows if str(r.get("term") or "").strip()]
+        if not rows:
+            raise ValueError("no `term: definition` lines found")
+
+        where, session = self._session_folder(folder)
+        snapshot = self._snapshot()
+        known = self._existing_terms(snapshot)
+        created: List[Dict[str, Any]] = []
+        defined: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for row in rows:
+            term = str(row.get("term") or "").strip()
+            definition = str(row.get("definition") or "").strip()
+            seen_in = str(row.get("source") or source or "").strip()
+            try:
+                have = known.get(term.lower())
+                if have is not None:
+                    if self.UNDEFINED_TAG in (have.tags or []) and definition:
+                        done = self.define_term(have.id, definition, source=seen_in, sync=False)
+                        defined.append(done["note"])
+                    else:
+                        skipped.append({"term": term, "note_id": have.id,
+                                        "reason": "already in your vault"})
+                    continue
+                out, snapshot = self._file_term(
+                    term, definition, source=seen_in, where=where,
+                    session=session, snapshot=snapshot,
+                )
+                new_id = out["note"]["id"]
+                fresh = next((n for n in snapshot if n.id == new_id), None)
+                if fresh is not None:
+                    known[term.lower()] = fresh
+                created.append({**out["note"], "carded": out["carded"]})
+            except Exception as exc:  # noqa: BLE001 - one bad line, not the batch
+                self.vault.log_line("capture", f"glossary line failed  {term}  {exc!r}")
+                failed.append({"term": term, "error": f"{type(exc).__name__}: {exc}"})
+        if created or defined:
+            self._sync_calendar_quiet(snapshot)
+        self.vault.log_line(
+            "capture",
+            f"glossary  {len(created)} new, {len(defined)} defined, {len(skipped)} skipped",
+        )
+        cards = sum(1 for c in created if c.get("carded")) + len(defined)
+        bits = [f"{len(created)} term{'s' if len(created) != 1 else ''} filed"]
+        if defined:
+            bits.append(f"{len(defined)} defined")
+        if skipped:
+            bits.append(f"{len(skipped)} already in your vault")
+        if failed:
+            bits.append(f"{len(failed)} failed")
+        return {
+            "created": created,
+            "defined": defined,
+            "skipped": skipped,
+            "failed": failed,
+            "leftover": leftover[:20],
+            "count": len(created),
+            "cards": cards,
+            "note": ", ".join(bits) + f" — {cards} card{'s' if cards != 1 else ''} ready to study.",
         }
+
+    def define_term(
+        self, note_id: str, definition: str, *, source: str = "", sync: bool = True
+    ) -> Dict[str, Any]:
+        """Give a term captured without a definition its definition — and its card.
+
+        Only the `## Definition` section is written; whatever lj put under
+        `## In my own words` stays as it is.
+        """
+        definition = (definition or "").strip()
+        if not definition:
+            raise ValueError("a definition is needed")
+        path, note = self.vault.get(note_id)
+        body = note.body or ""
+        section = re.compile(r"(^##\s+Definition[ \t]*\n)(.*?)(?=^##\s|\Z)", re.M | re.S)
+        if section.search(body):
+            body = section.sub(lambda m: f"{m.group(1)}\n{definition}\n\n", body, count=1)
+        else:
+            lines = body.split("\n")
+            at = 1 if lines and lines[0].startswith("# ") else 0
+            lines[at:at] = ["", "## Definition", "", definition, ""]
+            body = "\n".join(lines)
+        if source:
+            seen = re.compile(r"(^##\s+Seen in[ \t]*\n)", re.M)
+            if seen.search(body) and f"- {source}" not in body:
+                body = seen.sub(lambda m: f"{m.group(1)}\n- {source}\n", body, count=1)
+        note.body = body
+        note.tags = [t for t in (note.tags or []) if t != self.UNDEFINED_TAG]
+        if "term" not in note.tags:
+            note.tags.append("term")
+        note.updated = _now()
+        self.vault.write(note, path)
+
+        deck = self.deck(note.id, create=True)
+        if not any(generate._norm(c.front) == generate._norm(note.title) for c in deck.cards):
+            deck.add(front=note.title, back=definition, source=source, status="active")
+            self.decks.save(deck)
+        self.vault.log_line("capture", f"defined  {note.id}  {note.title}")
+        if sync:
+            self._sync_calendar_quiet()
+        return {"note": _note_dict(note), "carded": True}
 
     # -- screenshots (housekeeping 7) ---------------------------------------
 
@@ -800,6 +962,18 @@ class Engine:
         if not text:
             raise ValueError("empty capture")
         target = Bucket(bucket)
+        if mode == "terms" or (
+            mode == "auto" and target in (Bucket.RESOURCE, Bucket.INBOX)
+        ):
+            if mode == "terms":
+                found = glossarymod.parse(text)
+                found = found if found.entries else None
+            else:
+                found = glossarymod.detect(text, share=glossarymod.PREVIEW_SHARE)
+            if found is not None:
+                return self._plan_terms(text, found)
+            if mode == "terms":
+                raise ValueError("no `term: definition` lines found")
         shape = mode if mode in ("tasks", "notes", "one") else (
             "tasks" if target in (Bucket.PROJECT, Bucket.AREA) else "notes"
         )
@@ -888,6 +1062,41 @@ class Engine:
             "items": items,
         }
 
+    def _plan_terms(self, text: str, found: Any) -> Dict[str, Any]:
+        known = self._existing_terms(self._snapshot())
+        items = []
+        for i, e in enumerate(found.entries, start=1):
+            have = known.get(e.term.lower())
+            status = ""
+            if have is not None:
+                status = ("will add the missing definition"
+                          if self.UNDEFINED_TAG in (have.tags or []) else "already in your vault")
+            items.append({
+                "kind": "term", "title": e.term, "body": e.definition,
+                "term": e.term, "definition": e.definition, "source": e.source,
+                "bucket": "resource", "ordinal": i, "boundary": "glossary line",
+                "words": len(e.definition.split()), "heading_path": [e.source] if e.source else [],
+                "due": "", "due_phrase": "", "due_source": "", "due_confirmed": False,
+                "inherited_date": "", "existing": status,
+            })
+        return {
+            "mode": "terms",
+            "bucket": "resource",
+            "strategy": "term: definition lines",
+            "provider": "",
+            "degraded": False,
+            "note": (
+                "Each line becomes a Term note and a card."
+                + (f" {len(found.leftover)} line(s) were not term lines and are not filed: "
+                   + "; ".join(f'"{l[:40]}"' for l in found.leftover[:3]) if found.leftover else "")
+                + (f" Duplicates skipped: {', '.join(found.duplicates[:5])}." if found.duplicates else "")
+            ),
+            "words": len(text.split()),
+            "lossless": not found.leftover,
+            "lost_lines": found.leftover[:10],
+            "items": items,
+        }
+
     def _plan_item(
         self,
         body: str,
@@ -945,7 +1154,21 @@ class Engine:
         captures because the third had a bad date is exactly the behaviour
         that makes a capture box untrustworthy.
         """
-        rows = [r for r in (items or []) if str(r.get("body") or "").strip()]
+        terms = [r for r in (items or []) if r.get("kind") == "term"]
+        rows = [r for r in (items or [])
+                if r.get("kind") != "term" and str(r.get("body") or "").strip()]
+        if terms:
+            done = self.capture_glossary(entries=[{
+                "term": str(r.get("title") or r.get("term") or "").strip(),
+                "definition": str(r.get("body") or r.get("definition") or "").strip(),
+                "source": str(r.get("source") or "").strip(),
+            } for r in terms])
+            if not rows:
+                return {
+                    **done,
+                    "created": done["created"] + done["defined"],
+                    "count": len(done["created"]) + len(done["defined"]),
+                }
         if not rows:
             raise ValueError("nothing to file")
 
@@ -1100,6 +1323,29 @@ class Engine:
                     {"file": path.name, "status": "unreadable", "error": reason}
                 )
                 continue
+
+            gloss = glossarymod.detect(dropped.text, source=dropped.title)
+            if gloss is not None:
+                # A glossary written to Drop — usually the hotkey or the
+                # Obsidian plugin's offline fallback — files as terms, the
+                # same as it would have through the API.
+                if dry_run:
+                    results.append({"file": path.name, "title": dropped.title,
+                                    "bucket": "resource", "status": "would file terms",
+                                    "terms": len(gloss.entries)})
+                    continue
+                try:
+                    done = self.capture_glossary(dropped.text, source=dropped.title)
+                except Exception as exc:  # noqa: BLE001
+                    self.vault.log_line("intake", f"glossary failed  {path.name}  {exc!r}")
+                else:
+                    intakemod.file_away(path, drop, intakemod.FILED_DIR)
+                    snapshot = self._snapshot()
+                    filed += 1
+                    results.append({"file": path.name, "title": dropped.title,
+                                    "bucket": "resource", "status": "filed terms",
+                                    "terms": done["count"], "note": done["note"]})
+                    continue
 
             verdict = intakemod.classify(
                 dropped.text,

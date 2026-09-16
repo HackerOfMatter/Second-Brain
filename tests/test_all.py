@@ -8707,6 +8707,192 @@ def test_a_gone_card_is_skipped_not_a_crash():
               "skipGone" in page and "e.repeat" in page and "BUSY" in page)
 
 
+
+GLOSSARY_PASTE = """## Chapter 4 terms
+- **Elasticity** — how much quantity demanded responds to a change in price
+- Opportunity cost: the value of the next best alternative
+  given up when a choice is made
+Marginal utility = the extra satisfaction from consuming one more unit
+WIIFM :: What's in it for me?
+Sunk cost - a cost already incurred that cannot be recovered
+"""
+
+
+def test_glossary_lines_are_recognised():
+    section("glossary: which pastes are term lists")
+    from sb import glossary as G
+
+    g = G.detect(GLOSSARY_PASTE)
+    check("five terms found", g is not None and [e.term for e in g.entries] == [
+        "Elasticity", "Opportunity cost", "Marginal utility", "WIIFM", "Sunk cost"],
+          g and [e.term for e in g.entries])
+    by = {e.term: e for e in g.entries}
+    check("bold and bullets are stripped", "Elasticity" in by)
+    check("a wrapped definition is joined",
+          by["Opportunity cost"].definition.endswith("given up when a choice is made"),
+          by["Opportunity cost"].definition)
+    check("the heading becomes where it was seen",
+          all(e.source == "Chapter 4 terms" for e in g.entries))
+    check("every separator shape works",
+          by["Marginal utility"].definition.startswith("the extra")
+          and by["WIIFM"].definition == "What's in it for me?"
+          and by["Sunk cost"].definition.startswith("a cost"))
+    check("tab-separated rows (a spreadsheet or Quizlet export) are terms",
+          len(G.detect("Elasticity\tresponsiveness to price\nSunk cost\ta cost already paid").entries) == 2)
+    check("one explicit `::` line is a glossary of one",
+          len(G.detect("elasticity :: responsiveness of demand to price").entries) == 1)
+    check("one plain colon line is not", G.detect("Reminder: call the bank tomorrow") is None)
+    check("meeting details are not terms",
+          G.detect("Speaker: Dr Lee\nRoom: 204\nTime: 10:30") is None)
+    check("a project with labelled lines is not a glossary",
+          G.detect("Due: Friday\nSteps: read chapter 4\nEstimate: 3h") is None)
+    check("a link is not a term",
+          G.detect("https://example.com/page\nhttp://other.org") is None)
+    check("prose with one colon line is not a glossary",
+          G.detect("Read the chapter tonight.\nThen outline the essay.\n"
+                   "Note to self: start early.\nAsk about the rubric.") is None)
+    mixed = G.parse("Elasticity: price response\nSunk cost: already paid\nbuy milk\nElasticity: again")
+    check("leftover lines are reported, not dropped silently", mixed.leftover == ["buy milk"],
+          mixed.leftover)
+    check("a repeated term is reported once", mixed.duplicates == ["Elasticity"], mixed.duplicates)
+    check("the preview bar is lower than the automatic one",
+          G.detect("A term: one\nB term: two\nthird line\n", share=G.PREVIEW_SHARE) is not None
+          and G.detect("A term: one\nB term: two\nthird line\n") is None)
+
+
+def test_a_pasted_glossary_files_terms():
+    section("glossary: one paste, a term note and a card per line")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        cfg.intake.watch = False
+        engine = Engine(cfg)
+
+        blank = engine.capture_term("Sunk cost")          # met, not yet understood
+        note = engine.note(blank["note"]["id"])
+        note.body = note.body.replace("## In my own words\n",
+                                      "## In my own words\n\nMoney you can't get back.\n")
+        engine.vault.save(note)
+        engine.capture_term("WIIFM", "What is in it for me")   # already defined
+
+        started = engine.session_start("Economics", "Ch 4")
+        out = engine.capture_glossary(GLOSSARY_PASTE)
+        check("three new terms", out["count"] == 3, out["note"])
+        check("the undefined one is defined, not duplicated",
+              [d["title"] for d in out["defined"]] == ["Sunk cost"], out["defined"])
+        check("the defined one is left alone",
+              [s["term"] for s in out["skipped"]] == ["WIIFM"], out["skipped"])
+        check("four cards ready", out["cards"] == 4, out)
+        check("the summary sentence says so", "3 terms filed" in out["note"], out["note"])
+
+        titles = [n.title for n in engine.notes()]
+        check("no second Sunk cost note", titles.count("Sunk cost") == 1, titles)
+        for c in out["created"]:
+            deck = engine.deck(c["id"])
+            check(f"{c['title']} has an active written card",
+                  len(deck.cards) == 1 and deck.cards[0].status == "active"
+                  and deck.cards[0].front == c["title"], deck.cards)
+        elastic = next(n for n in engine.notes() if n.title == "Elasticity")
+        check("the heading is where it was seen", "Chapter 4 terms" in elastic.body, elastic.body)
+        path, _ = engine.vault.get(elastic.id)
+        check("filed in the open session's folder",
+              "Economics/Ch 4" in path.as_posix(), path)
+        status = engine.session_status()["session"]
+        check("the session counts them as terms", status["terms"] == 3, status)
+
+        sunk = engine.note(blank["note"]["id"])
+        check("the definition was written into the note",
+              "a cost already incurred" in sunk.body, sunk.body)
+        check("what lj wrote in their own words is kept",
+              "Money you can't get back." in sunk.body, sunk.body)
+        check("the needs-definition tag is gone",
+              engine.UNDEFINED_TAG not in sunk.tags, sunk.tags)
+        check("and it has its card", engine.deck(sunk.id).cards[0].back.startswith("a cost"))
+        check("it is off the undefined list",
+              all(t["id"] != sunk.id for t in engine.undefined_terms()))
+        engine.session_end()
+
+        again = engine.capture_glossary(GLOSSARY_PASTE)
+        check("pasting it twice files nothing new", again["count"] == 0
+              and len(again["skipped"]) == 5, again["note"])
+        try:
+            engine.capture_glossary("just a sentence with no terms in it")
+            check("a paste with no term lines is refused", False)
+        except ValueError:
+            check("a paste with no term lines is refused", True)
+
+
+def test_glossary_over_every_surface():
+    section("glossary: capture box, preview, define, Drop, hotkey, plugin")
+    from starlette.testclient import TestClient
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        cfg.intake.use_model = False
+        cfg.intake.watch = False
+        client = TestClient(build_app(cfg))
+
+        r = client.post("/api/capture", json={"text": GLOSSARY_PASTE}).json()
+        check("the plain capture endpoint files a glossary as terms",
+              r["glossary"]["count"] == 5 and r["note"]["title"] == "Elasticity", r)
+        one = client.post("/api/capture", json={
+            "text": "Elasticity: study this for Friday\nSunk cost: review", "bucket": "project"}).json()
+        check("a Project capture is never turned into terms", "glossary" not in one, one)
+        off = client.post("/api/capture", json={
+            "text": "Alpha term: first meaning here\nBeta term: second meaning here",
+            "glossary": False}).json()
+        check("glossary: false files one note", "glossary" not in off, off)
+
+        plan = client.post("/api/capture/plan", json={
+            "text": "Gamma ray: high energy light\nDelta wave: slow brain wave\nElasticity: dup",
+            "bucket": "resource"}).json()
+        check("the preview proposes terms", plan["mode"] == "terms" and len(plan["items"]) == 3, plan)
+        check("and says which ones already exist",
+              plan["items"][2]["existing"] == "already in your vault", plan["items"][2])
+        items = [{"kind": "term", "title": it["term"], "body": it["definition"] + " (edited)",
+                  "source": it["source"]} for it in plan["items"][:2]]
+        done = client.post("/api/capture/commit", json={"items": items}).json()
+        check("committing the preview files the edited terms",
+              done["count"] == 2 and {c["title"] for c in done["created"]} == {"Gamma ray", "Delta wave"},
+              done)
+        overview = client.get("/api/study/overview").json()
+        gamma = next(d for d in overview["decks"] if d["subject"] == "Gamma ray")
+        deck = client.get(f"/api/decks/{gamma['note_id']}").json()
+        check("with the edit on the card", deck["cards"][0]["back"].endswith("(edited)"), deck["cards"])
+        forced = client.post("/api/capture/plan", json={
+            "text": "Just one line: of text", "bucket": "resource", "mode": "terms"}).json()
+        check("mode=terms takes even a single colon line", forced["mode"] == "terms", forced)
+
+        blank = client.post("/api/capture/term", json={"term": "Tariff"}).json()
+        tid = blank["note"]["id"]
+        d = client.post(f"/api/terms/{tid}/define", json={"definition": "a tax on imports"}).json()
+        check("a term is defined in one call", d["carded"] and "needs-definition" not in d["note"]["tags"], d)
+        empty = client.post(f"/api/terms/{tid}/define", json={"definition": ""})
+        check("an empty definition is refused", empty.status_code == 400)
+
+        drop = cfg.drop_dir
+        drop.mkdir(parents=True, exist_ok=True)
+        (drop / "vocab.md").write_text("Quota: a limit on imports\nEmbargo: a ban on trade\n", encoding="utf-8")
+        res = Engine(cfg).intake(settle_seconds=0)
+        check("a glossary dropped into Drop files as terms",
+              {"Quota", "Embargo"} <= {d["subject"] for d in client.get("/api/study/overview").json()["decks"]},
+              res)
+
+        page = client.get("/dashboard").text
+        check("the dashboard recognises a pasted glossary", "looksLikeGlossary" in page
+              and 'data-kind="term"' in page and "data-define" in page)
+        hot = (Path(__file__).resolve().parent.parent / "capture_hotkey.pyw").read_text(encoding="utf-8")
+        check("the hotkey waits longer for a glossary",
+              "GLOSSARY_TIMEOUT_SECONDS" in hot and "looks_like_glossary(text)" in hot)
+        plugin = Path(__file__).resolve().parent.parent / ".obsidian/plugins/second-brain-capture/main.js"
+        if plugin.exists():
+            check("the Obsidian plugin reports terms", "data.glossary" in plugin.read_text(encoding="utf-8"))
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -8810,6 +8996,9 @@ def main():
         test_leeches_are_suspended_and_rewritten,
         test_triage_source_and_debrief_over_the_api,
         test_a_gone_card_is_skipped_not_a_crash,
+        test_glossary_lines_are_recognised,
+        test_a_pasted_glossary_files_terms,
+        test_glossary_over_every_surface,
     ]:
         try:
             fn()
