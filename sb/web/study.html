@@ -549,7 +549,11 @@ const md = s => esc(s)
 async function api(path, opts) {
   const r = await fetch(path, Object.assign({headers: {"Content-Type": "application/json"}}, opts));
   const data = await r.json().catch(() => ({error: "bad response"}));
-  if (data && data.error) throw new Error(data.error);
+  if (data && data.error) {
+    const err = new Error(data.error);
+    err.gone = !!data.gone;   // the card was dropped/deleted since the queue was built
+    throw err;
+  }
   return data;
 }
 
@@ -877,17 +881,25 @@ async function triage(action, extra) {
 }
 
 async function dropDraft() {
-  if (!CARD || CARD.reason !== "draft" || REVEALED) return;
+  if (!CARD || CARD.reason !== "draft" || REVEALED || BUSY) return;
+  BUSY = true;
   try {
-    await triage("drop");
-    SESSION.dropped = (SESSION.dropped || 0) + 1;
+    const r = await triage("drop");
+    if (!r.already) SESSION.dropped = (SESSION.dropped || 0) + 1;
+    const {note_id, id} = CARD;
+    // A fixed copy of this card may be waiting further down the queue.
+    SESSION.queue = SESSION.queue.filter((q, k) =>
+      k <= SESSION.i || !(q.note_id === note_id && q.id === id));
     SESSION.i += 1;
     showCard();
-  } catch (e) { toast("Could not drop it", e.message, "err"); }
+  } catch (e) {
+    if (e.gone) { BUSY = false; return skipGone(e.message); }
+    toast("Could not drop it", e.message, "err");
+  } finally { BUSY = false; }
 }
 
 async function openFix() {
-  if (!CARD || CARD.reason !== "draft" || REVEALED) return;
+  if (!CARD || CARD.reason !== "draft" || REVEALED || BUSY) return;
   try {
     const full = await api(`/api/study/${CARD.note_id}/${CARD.id}/reveal`);
     $("#fixfront").value = full.front;
@@ -897,13 +909,17 @@ async function openFix() {
       .forEach(sel => $(sel).classList.add("hide"));
     $("#fixbox").classList.remove("hide");
     setTimeout(() => $("#fixfront").focus(), 30);
-  } catch (e) { toast("Could not open the card", e.message, "err"); }
+  } catch (e) {
+    if (e.gone) return skipGone(e.message);
+    toast("Could not open the card", e.message, "err");
+  }
 }
 
 /* A fixed card is not graded now — you have just read its answer. It goes
    back in the queue a few cards later, as the question you wrote. */
 async function saveFix() {
-  if (!CARD) return;
+  if (!CARD || BUSY) return;
+  BUSY = true;
   try {
     const r = await triage("fix", {front: $("#fixfront").value, back: $("#fixback").value});
     if (r.warning) toast("Saved — one thing to know", r.warning, "warn");
@@ -913,7 +929,10 @@ async function saveFix() {
     SESSION.fixed = (SESSION.fixed || 0) + 1;
     SESSION.i += 1;
     showCard();
-  } catch (e) { toast("Could not save it", e.message, "err"); }
+  } catch (e) {
+    if (e.gone) { BUSY = false; return skipGone(e.message); }
+    toast("Could not save it", e.message, "err");
+  } finally { BUSY = false; }
 }
 
 $("#tfix").addEventListener("click", openFix);
@@ -927,6 +946,24 @@ $("#fixcancel").addEventListener("click", () => showCard());
 $("#quit").addEventListener("click", () => endSession(false));
 
 let CARD = null, REVEALED = false, SHOWN_AT = 0, CONFIDENCE = null, PENDING_WHY = null;
+/* One request about the current card at a time. A held key, or a click and
+   a key press together, used to send the same grade or drop twice — the
+   second drop then asked about a card that no longer existed. */
+let BUSY = false;
+
+/* A card that was dropped or deleted since this session was built: skip it,
+   and any later copy of it, instead of stopping the session. */
+function skipGone(message) {
+  if (!SESSION || !CARD) return;
+  const {note_id, id} = CARD;
+  SESSION.queue = SESSION.queue.filter((q, k) =>
+    k <= SESSION.i || !(q.note_id === note_id && q.id === id));
+  PENDING_WHY = null;
+  $("#whyfirst").classList.add("hide");
+  toast("Skipped a card", message || "It was already removed from its deck.", "warn");
+  SESSION.i += 1;
+  showCard();
+}
 
 function showCard() {
   if (!SESSION) return;
@@ -1019,7 +1056,11 @@ async function reveal() {
     $("#explainrow").classList.remove("hide");
     $("#revealrow").classList.add("hide");
     $("#typedbox").classList.add("hide");
-  } catch (e) { toast("Could not load the answer", e.message, "err"); REVEALED = false; }
+  } catch (e) {
+    REVEALED = false;
+    if (e.gone) return skipGone(e.message);
+    toast("Could not load the answer", e.message, "err");
+  }
 }
 
 function renderChoices() {
@@ -1040,7 +1081,8 @@ $("#choices").addEventListener("click", e => {
    marked by string comparison, so this path needs no model at all and works
    exactly the same with Ollama closed. */
 async function pickChoice(picked) {
-  if (!CARD || REVEALED) return;
+  if (!CARD || REVEALED || BUSY) return;
+  BUSY = true;
   CARD.typed = picked;
   CARD.picked_choice = true;
   $$("#choices button").forEach(b => b.disabled = true);
@@ -1060,9 +1102,10 @@ async function pickChoice(picked) {
     box.classList.remove("hide");
     await reveal();
   } catch (e) {
+    if (e.gone) return skipGone(e.message);
     toast("Could not mark that", e.message, "err");
     $$("#choices button").forEach(b => b.disabled = false);
-  }
+  } finally { BUSY = false; }
 }
 
 $("#explainskip").addEventListener("click", () => {
@@ -1149,7 +1192,8 @@ $("#grades").addEventListener("click", e => {
 });
 
 async function grade(g) {
-  if (!CARD || !REVEALED) return;
+  if (!CARD || !REVEALED || BUSY || PENDING_WHY) return;
+  BUSY = true;
   $$("#grades button").forEach(b => b.disabled = true);
   try {
     const r = await api(`/api/study/${CARD.note_id}/${CARD.id}/answer`, {
@@ -1197,8 +1241,11 @@ async function grade(g) {
     }
     SESSION.i += 1;
     showCard();
-  } catch (e) { toast("Could not save the answer", e.message, "err"); }
-  finally { $$("#grades button").forEach(b => b.disabled = false); }
+  } catch (e) {
+    if (e.gone) { BUSY = false; return skipGone(e.message); }
+    toast("Could not save the answer", e.message, "err");
+  }
+  finally { BUSY = false; $$("#grades button").forEach(b => b.disabled = false); }
 }
 
 function nextAfterWhy() {
@@ -1258,6 +1305,7 @@ async function explainCard() {
 document.addEventListener("keydown", e => {
   const typing = ["TEXTAREA", "INPUT"].includes(document.activeElement.tagName);
   if (!SESSION) return;
+  if (e.repeat && !typing) return;   // a held key is one press, not twenty
   if (!typing && !REVEALED && ["j", "k", "l"].includes(e.key)) {
     e.preventDefault();
     setConfidence({j: "sure", k: "think-so", l: "no-idea"}[e.key]);

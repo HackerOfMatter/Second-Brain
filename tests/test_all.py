@@ -8657,6 +8657,56 @@ def test_triage_source_and_debrief_over_the_api():
               all(k in page for k in ('id="triagebar"', 'id="sourcebox2"', "/debrief", "fill_gaps")))
 
 
+
+def test_a_gone_card_is_skipped_not_a_crash():
+    """lj's report: a second drop of the same card put a KeyError traceback
+    on the screen. The drop is idempotent now, every other question about a
+    missing card is a 404 the page skips, and a doubled answer counts once."""
+    section("a dropped card, asked about again")
+    from starlette.testclient import TestClient
+    from sb.api import build_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        client = TestClient(build_app(cfg))
+        nid = client.post("/api/capture", json={
+            "text": "Mitochondria are the organelles that generate most of the cell's ATP. "
+                    "The citric acid cycle is a series of reactions that releases stored energy.",
+            "bucket": "resource"}).json()["note"]["id"]
+        client.post(f"/api/decks/{nid}/generate", json={})
+        first = client.post(f"/api/study/{nid}/c1/triage", json={"action": "drop"})
+        again = client.post(f"/api/study/{nid}/c1/triage", json={"action": "drop"})
+        check("the first drop works", first.status_code == 200 and not first.json().get("already"))
+        check("a second drop is done, not an error",
+              again.status_code == 200 and again.json()["already"] is True, again.text)
+        keep = client.post(f"/api/study/{nid}/c1/triage", json={"action": "keep"})
+        check("keeping a dropped card is a 404 marked gone",
+              keep.status_code == 404 and keep.json()["gone"] is True, keep.text)
+        check("with a message a person can read",
+              "no longer in" in keep.json()["error"] and "KeyError" not in keep.json()["error"],
+              keep.json())
+        ans = client.post(f"/api/study/{nid}/c1/answer", json={"grade": 3})
+        check("answering it is the same 404", ans.status_code == 404 and ans.json()["gone"])
+        rev = client.get(f"/api/study/{nid}/c1/reveal")
+        check("so is revealing it", rev.status_code == 404 and rev.json()["gone"])
+        check("the missing card is still a KeyError to Python code",
+              issubclass(cardsmod.CardNotFound, KeyError))
+
+        a1 = client.post(f"/api/study/{nid}/c2/answer", json={"grade": 2}).json()
+        a2 = client.post(f"/api/study/{nid}/c2/answer", json={"grade": 2}).json()
+        log = [l for l in (Path(tmp) / "vault" / "_decks" / "_reviews.jsonl").read_text().splitlines()
+               if '"c2"' in l]
+        check("a doubled answer is logged once", len(log) == 1, len(log))
+        check("and the second says so", a2.get("duplicate") is True and not a1.get("duplicate"), a2)
+        a3 = client.post(f"/api/study/{nid}/c2/answer", json={"grade": 3}).json()
+        check("a different grade is a real answer", not a3.get("duplicate"), a3)
+        page = client.get("/study").text
+        check("the page skips gone cards and ignores held keys",
+              "skipGone" in page and "e.repeat" in page and "BUSY" in page)
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -8759,6 +8809,7 @@ def main():
         test_exam_dates_cap_the_schedule,
         test_leeches_are_suspended_and_rewritten,
         test_triage_source_and_debrief_over_the_api,
+        test_a_gone_card_is_skipped_not_a_crash,
     ]:
         try:
             fn()

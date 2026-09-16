@@ -105,6 +105,19 @@ MODES = ("", "recall", "explain")
 OPTION_MARK = re.compile(r"^\s*(?:[-*+•]|\(?[A-Za-z][.)]|\d{1,2}[.)])\s+")
 
 
+class CardNotFound(KeyError):
+    """A card id that is not (or no longer) in its deck.
+
+    A KeyError, so every existing `except KeyError` still catches it; its own
+    class so the API can answer "that card is gone" (404) rather than a 500
+    traceback. The usual cause is a session tab holding a card that was
+    dropped a moment earlier — a double key press, or a second tab.
+    """
+
+    def __str__(self) -> str:  # KeyError would quote the message
+        return str(self.args[0]) if self.args else "card not found"
+
+
 # --------------------------------------------------------------------------
 # models
 # --------------------------------------------------------------------------
@@ -329,7 +342,10 @@ class Deck(BaseModel):
         for c in self.cards:
             if c.id == card_id:
                 return c
-        raise KeyError(f"no card {card_id!r} in deck {self.note_id!r}")
+        raise CardNotFound(
+            f"Card {card_id} is no longer in “{self.subject or self.note_id}” — "
+            "it was dropped or deleted."
+        )
 
     @property
     def active(self) -> List[Card]:

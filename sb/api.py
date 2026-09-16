@@ -53,12 +53,19 @@ def ok(payload: Any, status: int = 200) -> JSONResponse:
     )
 
 
+from .cards import CardNotFound  # noqa: E402
+
+
 def guard(handler: Callable):
     """Turn exceptions into JSON the UI can display, and log the traceback."""
 
     async def wrapper(request: Request):
         try:
             return await handler(request)
+        except CardNotFound as exc:
+            # Not a crash: the page asked about a card that has since been
+            # dropped. The study page skips it when it sees `gone`.
+            return ok({"error": str(exc), "gone": True}, status=404)
         except ValueError as exc:
             return ok({"error": str(exc)}, status=400)
         except Exception as exc:

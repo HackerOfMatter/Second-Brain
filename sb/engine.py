@@ -3339,6 +3339,28 @@ class Engine:
         deck = self.deck(note_id)
         card = deck.card(card_id)
 
+        # The same answer posted twice — a key held down, a click and a key
+        # together — must count once. A real second look at a card is
+        # minutes away (the Again re-queue is four cards later).
+        if (
+            grade is not None and card.last_review is not None
+            and (_now() - card.last_review).total_seconds() < self.DUPLICATE_ANSWER_SECONDS
+        ):
+            last = self._last_review_of(note_id, card_id)
+            if last and int(last.get("grade") or 0) == int(grade):
+                return {
+                    "card": self._card_payload(deck, card),
+                    "grade": int(grade), "duplicate": True,
+                    "interval_days": (last.get("after") or {}).get("interval"),
+                    "due": card.due, "again": int(grade) == 1,
+                    "retrievability_before": last.get("r_before"),
+                    "intervals": tutor.button_intervals(card, self.cfg),
+                    "marking": None, "deck": tutor.deck_progress(deck, self.cfg),
+                    "graduation": None, "confidence": None, "overconfident": False,
+                    "ask_why": False, "leech": False,
+                    "suspended": card.status == "suspended", "capped_to": None,
+                }
+
         # A typed answer is marked here only when the caller has not already
         # settled on a grade. The UI marks first (see `study_mark`) and shows
         # you the verdict *before* it counts, so a model that marks you wrong
@@ -3487,6 +3509,15 @@ class Engine:
 
     # -- Anki x NotebookLM: the loop around a card ---------------------------
 
+    DUPLICATE_ANSWER_SECONDS = 2.0
+
+    def _last_review_of(self, note_id: str, card_id: str) -> Optional[Dict[str, Any]]:
+        last = None
+        for rec in self.decks.reviews(since=dt.date.today()):
+            if rec.get("note_id") == note_id and rec.get("card") == card_id:
+                last = rec
+        return last
+
     def _exam_deadline(self, note_id: str) -> Optional[dt.date]:
         """The date a deck must be known by, or None.
 
@@ -3623,6 +3654,11 @@ class Engine:
         if action not in ("keep", "fix", "drop", "suspend"):
             raise ValueError(f"unknown triage action {action!r}")
         deck = self.deck(note_id)
+        if action == "drop" and not any(c.id == card_id for c in deck.cards):
+            # Dropping what is already gone is done, not an error — a second
+            # press of `x` must not put a traceback on the screen.
+            return {"action": "drop", "card": None, "already": True,
+                    "deck": tutor.deck_progress(deck, self.cfg)}
         card = deck.card(card_id)
         before = {"front": card.front, "back": card.back, "source": card.source,
                   "status": card.status, "kind": card.kind}
