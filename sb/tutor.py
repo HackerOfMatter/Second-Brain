@@ -48,7 +48,7 @@ from .llm import resolve_provider
 class QueuedCard:
     deck: Deck
     card: Card
-    reason: str  # "due" | "new" | "overconfident"
+    reason: str  # "due" | "new" | "overconfident" | "draft"
 
     @property
     def key(self) -> str:
@@ -97,6 +97,9 @@ class Session:
     capped: bool = False
     subjects: List[str] = field(default_factory=list)
     message: str = ""
+    #: Drafts waiting for a first look, and siblings held back for the day.
+    drafts_available: int = 0
+    buried: int = 0
 
 
 def build_session(
@@ -142,13 +145,27 @@ def build_session(
 
     due_all: List[QueuedCard] = []
     new_all: List[QueuedCard] = []
+    drafts: List[QueuedCard] = []
+    with_drafts = bool(getattr(study, "drafts_in_session", False))
     for deck in pool:
         for card in deck.due(on):
             due_all.append(QueuedCard(deck, card, "due"))
         for card in deck.new():
             new_all.append(QueuedCard(deck, card, "new"))
+        if with_drafts:
+            # Triage while studying. A draft is shown as a new card with
+            # Keep / Fix / Drop beside it; answering it is reading it, which
+            # is the approval the generator's rule asks for. They share the
+            # new-card budget, so a 40-card bulk run is a week of ten a day
+            # rather than one evening of forty.
+            for card in deck.drafts:
+                drafts.append(QueuedCard(deck, card, "draft"))
 
-    session = Session(due_available=len(due_all), new_available=len(new_all))
+    session = Session(
+        due_available=len(due_all),
+        new_available=len(new_all),
+        drafts_available=len(drafts),
+    )
     session.subjects = sorted({d.subject or d.note_id for d in pool})
 
     # Most overdue first — a card three weeks late has decayed furthest and
@@ -163,8 +180,18 @@ def build_session(
     due_all.sort(key=lambda q: (q.key not in hot, q.card.due or on, q.deck.subject))
     rng = random.Random(seed if seed is not None else _daily_seed(on))
     rng.shuffle(new_all)
+    # Approved cards are introduced before unread ones; drafts keep the
+    # order they were written in, which is the order of the note.
+    fresh = new_all + drafts
 
-    picked = due_all[:due_budget] + new_all[:new_budget]
+    if getattr(study, "bury_siblings", True):
+        before = len(due_all) + len(fresh)
+        seen: set = set()
+        due_all = _bury(due_all, seen)
+        fresh = _bury(fresh, seen)
+        session.buried = before - len(due_all) - len(fresh)
+
+    picked = due_all[:due_budget] + fresh[:new_budget]
     cap = limit or study.session_size
     session.capped = len(picked) > cap
 
@@ -173,6 +200,25 @@ def build_session(
 
     session.message = _session_message(session, due_budget, new_budget)
     return session
+
+
+def _bury(items: List[QueuedCard], seen: set) -> List[QueuedCard]:
+    """Keep the first card of each sibling group; hold the rest for a day.
+
+    Anki's sibling burying. Three cloze cards cut from one sentence answer
+    each other: the second shows the first blank filled in. `seen` is shared
+    across calls so a due sibling also buries a new one.
+    """
+    out = []
+    for item in items:
+        key = item.card.sibling_key
+        if key:
+            full = (item.deck.note_id, key)
+            if full in seen:
+                continue
+            seen.add(full)
+        out.append(item)
+    return out
 
 
 def _lane(item: QueuedCard) -> str:
@@ -226,7 +272,8 @@ def _session_message(session: Session, due_budget: int, new_budget: int) -> str:
         return "Nothing due. Everything you know is still known."
     bits = []
     due = sum(1 for q in session.queue if q.reason in ("due", "overconfident"))
-    new = len(session.queue) - due
+    drafts = sum(1 for q in session.queue if q.reason == "draft")
+    new = len(session.queue) - due - drafts
     if due:
         bits.append(f"{due} due")
     hot = sum(1 for q in session.queue if q.reason == "overconfident")
@@ -234,6 +281,8 @@ def _session_message(session: Session, due_budget: int, new_budget: int) -> str:
         bits.append(f"{hot} you were sure about")
     if new:
         bits.append(f"{new} new")
+    if drafts:
+        bits.append(f"{drafts} to look over")
     subjects = len({q.deck.note_id for q in session.queue})
     tail = f" across {subjects} subjects" if subjects > 1 else ""
     return " · ".join(bits) + tail
@@ -260,6 +309,11 @@ class AnswerResult:
     again: bool
     intervals: Dict[str, int]
     feedback: str = ""
+    #: Anki's leech: forgotten `study.leech_lapses` times.
+    leech: bool = False
+    #: The day this review was pulled forward to, when the deck's deadline
+    #: would otherwise have been skipped over.
+    capped_to: Optional[dt.date] = None
     score: Optional[float] = None
     correct: Optional[bool] = None
     confidence: Optional[float] = None
@@ -280,6 +334,7 @@ def answer(
     feedback: str = "",
     score: Optional[float] = None,
     confidence: Optional[float] = None,
+    deadline: Optional[dt.date] = None,
 ) -> AnswerResult:
     """Apply one answer: schedule it, persist it, log it.
 
@@ -313,6 +368,19 @@ def answer(
     card.apply(scheduled)
     if card.status == "draft":
         card.status = "active"
+    capped_to = None
+    interval_days = scheduled.interval_days
+    if deadline is not None and getattr(study, "exam_cap", True):
+        today = (card.last_review or dt.datetime.now()).date()
+        capped = exam_cap(card.due, deadline, today)
+        if capped != card.due:
+            capped_to = card.due = capped
+            interval_days = max(1, (capped - today).days)
+    leech = False
+    if int(grade) == fsrs.AGAIN and is_leech(card, cfg):
+        leech = True
+        if (getattr(study, "leech_action", "suspend") or "suspend").lower() == "suspend":
+            card.status = "suspended"
     store.save(deck)
     store.log_review(
         {
@@ -330,26 +398,22 @@ def answer(
             "after": {
                 "s": round(card.stability, 4),
                 "d": round(card.difficulty, 4),
-                "interval": scheduled.interval_days,
+                "interval": interval_days,
                 "due": card.due.isoformat() if card.due else None,
             },
             "r_before": round(scheduled.retrievability_before, 4),
+            **({"exam_cap": capped_to.isoformat()} if capped_to else {}),
+            **({"leech": True} if leech else {}),
         }
     )
     return AnswerResult(
         card=card,
         grade=int(grade),
-        interval_days=scheduled.interval_days,
-        due=scheduled.due,
+        interval_days=interval_days,
+        due=card.due or scheduled.due,
         retrievability_before=scheduled.retrievability_before,
         again=scheduled.again,
-        intervals=fsrs.preview_intervals(
-            card.memory,
-            last_review=card.last_review,
-            desired_retention=study.desired_retention,
-            maximum_interval=study.maximum_interval_days,
-            w=weights(cfg),
-        ),
+        intervals=button_intervals(card, cfg, deadline),
         feedback=feedback,
         score=score,
         correct=None if score is None else score >= 0.6,
@@ -359,7 +423,32 @@ def answer(
             and confidence >= calibration.OVERCONFIDENT_AT
             and not calibration.is_correct(grade)
         ),
+        leech=leech,
+        capped_to=capped_to,
     )
+
+
+def exam_cap(due: Optional[dt.date], deadline: Optional[dt.date], today: dt.date) -> Optional[dt.date]:
+    """Pull a due date back to the day before a deadline it would skip.
+
+    FSRS schedules for long-term retention and knows nothing about an exam
+    on Thursday; a card due in three weeks is a card not seen before the
+    test. A learning Project's deadline is exactly that test, so the next
+    review is moved to the eve of it. Reviewing early costs FSRS nothing it
+    cannot account for — the retrievability term prices an early review as
+    a smaller gain — and after the deadline the ordinary schedule resumes.
+    """
+    if due is None or deadline is None:
+        return due
+    eve = deadline - dt.timedelta(days=1)
+    if eve <= today or due <= eve:
+        return due
+    return eve
+
+
+def is_leech(card: Card, cfg: Config) -> bool:
+    threshold = int(getattr(cfg.study, "leech_lapses", 8) or 0)
+    return threshold > 0 and card.lapses >= threshold
 
 
 def weights(cfg: Config):
@@ -380,15 +469,28 @@ def weights(cfg: Config):
     return fsrs.DEFAULT_W
 
 
-def button_intervals(card: Card, cfg: Config) -> Dict[str, int]:
-    """What each button would schedule, for the buttons themselves."""
-    return fsrs.preview_intervals(
+def button_intervals(
+    card: Card, cfg: Config, deadline: Optional[dt.date] = None
+) -> Dict[str, int]:
+    """What each button would schedule, for the buttons themselves.
+
+    With a deadline, the numbers are the capped ones — a button that says
+    three weeks when the card will come back on Wednesday is lying.
+    """
+    out = fsrs.preview_intervals(
         card.memory,
         last_review=card.last_review,
         desired_retention=cfg.study.desired_retention,
         maximum_interval=cfg.study.maximum_interval_days,
         w=weights(cfg),
     )
+    if deadline is not None and getattr(cfg.study, "exam_cap", True):
+        today = dt.date.today()
+        room = (deadline - dt.timedelta(days=1) - today).days
+        if room >= 1:
+            out = {k: (min(v, room) if isinstance(v, (int, float)) and v >= 1 else v)
+                   for k, v in out.items()}
+    return out
 
 
 # --------------------------------------------------------------------------

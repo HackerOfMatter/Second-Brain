@@ -215,6 +215,28 @@ class StudyConfig(BaseModel):
     mature_stability_days: float = 21.0
     min_cards_to_graduate: int = 6
 
+    # Anki x NotebookLM (docs/study-loop.md).
+    #: Read the whole note first — one extra model call over an outline — and
+    #: steer every passage's cards toward its key ideas. Rules-only key terms
+    #: are used either way.
+    study_guide: bool = True
+    #: Drop a drafted card no sentence of its passage supports, instead of
+    #: keeping it without a citation.
+    require_grounding: bool = True
+    #: Drafts appear in review sessions (inside the new-card budget) with
+    #: Keep / Fix / Drop, so approving cards happens while studying.
+    drafts_in_session: bool = True
+    #: Cards cut from the same sentence are siblings: one per session.
+    bury_siblings: bool = True
+    #: Anki's leech rule. A card forgotten this many times is suspended
+    #: (`leech_action: suspend`) or only flagged (`tag`), and offered for a
+    #: rewrite from its source.
+    leech_lapses: int = 8
+    leech_action: str = "suspend"
+    #: A learning Project with a deadline never schedules a card past the day
+    #: before it — the exam is the one review that cannot be late.
+    exam_cap: bool = True
+
     # A daily study block on the calendar, like any other recurring commitment.
     calendar_event: bool = True
     study_time: str = "19:30"

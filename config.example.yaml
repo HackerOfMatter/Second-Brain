@@ -170,6 +170,23 @@ study:
   max_answer_words: 15
   enforce_card_quality: true
 
+  # Anki x NotebookLM (docs/study-loop.md).
+  # Making cards: read the whole note first (key terms by rule, plus one model
+  # call over an outline when study_guide is on), spread the card budget over
+  # the whole note, and drop any card no sentence of its passage supports.
+  study_guide: true
+  require_grounding: true
+  # Studying: drafts come up in sessions with Keep / Fix / Drop (inside
+  # new_cards_per_day); cards cut from one sentence appear one per session;
+  # a card forgotten leech_lapses times is suspended (or only flagged with
+  # leech_action: tag) and can be rewritten from its source; a Project with
+  # a deadline never schedules a card past the day before it.
+  drafts_in_session: true
+  bury_siblings: true
+  leech_lapses: 8
+  leech_action: suspend
+  exam_cap: true
+
   # Metacognitive calibration. How far back the "you were sure and wrong"
   # priority queue looks. A confident miss from four months ago is a card you
   # have since relearned, not a belief you still hold.

@@ -223,6 +223,29 @@
   #toast .t-head { font-weight: 600; margin-bottom: 3px; }
   #toast.warn { border-left-color: var(--warn); }
   #toast.err  { border-left-color: var(--danger); }
+
+  /* ---- Anki x NotebookLM (phase 17) ---- */
+  .triage { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12.5px;
+            color: var(--muted); background: var(--panel-2); border-radius: 8px; padding: 7px 10px; }
+  .triage button { padding: 3px 10px; font-size: 12px; }
+  .pill.draft { color: var(--warn); border-color: var(--warn); }
+  .pill.exam  { color: var(--accent); border-color: var(--accent); }
+  .fixbox { display: grid; gap: 8px; }
+  button.ghost { background: transparent; }
+  .ctx { font-size: 14px; line-height: 1.6; background: var(--panel-2); border-radius: 8px; padding: 12px 14px; }
+  .ctx mark, .debrief mark { background: var(--accent-soft); color: inherit;
+             border-bottom: 2px solid var(--accent); padding: 0 1px; }
+  .ctx .edge { color: var(--faint); font-size: 12.5px; }
+  .ctx .head, .debrief .head { font: 11px var(--mono); text-transform: uppercase; letter-spacing: .05em;
+             color: var(--muted); margin-bottom: 6px; }
+  .debrief .reread { border-top: 1px solid var(--line); padding: 12px 0; }
+  .debrief blockquote { margin: 6px 0 6px; padding-left: 10px; border-left: 2px solid var(--accent);
+             font-size: 14px; white-space: pre-wrap; }
+  .debrief .shaky { font-size: 13.5px; padding: 5px 0; border-top: 1px dashed var(--line); }
+  .debrief h3 { font-size: 13px; margin: 16px 0 6px; }
+  .cover { display: flex; gap: 2px; height: 10px; margin: 4px 0 6px; }
+  .cover i { flex: 1; border-radius: 2px; background: var(--panel-2); border: 1px solid var(--line); }
+  .cover i.on { background: var(--accent); opacity: .6; border-color: transparent; }
   .hide { display: none !important; }
 </style>
 </head>
@@ -260,6 +283,11 @@
         more productive and remembers worse — the context never changes, so you
         recall from working memory instead of from storage.
       </p>
+      <p class="hint" style="margin:8px 0 0">
+        Drafted cards come up here too, inside the daily new-card limit, marked
+        <span class="pill draft">draft</span>. Answering one keeps it; <kbd>f</kbd> fixes it,
+        <kbd>x</kbd> drops it. After the reveal, <kbd>n</kbd> shows the card's line in your note.
+      </p>
     </section>
 
     <div id="runner" class="hide">
@@ -277,6 +305,23 @@
           <span id="cflags"></span>
         </div>
         <div class="q" id="cq"></div>
+
+        <!-- Triage while studying: a draft is read where it will be used. -->
+        <div id="triagebar" class="triage hide">
+          <span>First look — drafted from your notes. Answering it keeps it.</span>
+          <span class="spacer"></span>
+          <button id="tfix">Fix<kbd style="margin-left:6px">f</kbd></button>
+          <button id="tdrop">Drop<kbd style="margin-left:6px">x</kbd></button>
+        </div>
+        <div id="fixbox" class="fixbox hide">
+          <textarea id="fixfront" rows="2" placeholder="Question — wrap a phrase in {{double braces}} for a cloze"></textarea>
+          <textarea id="fixback" rows="2" placeholder="Answer"></textarea>
+          <div class="hint" id="fixsrc"></div>
+          <div class="row">
+            <button class="primary" id="fixsave">Save — ask me later<kbd style="margin-left:7px">⌃⏎</kbd></button>
+            <button id="fixcancel" class="ghost">Cancel</button>
+          </div>
+        </div>
 
         <div id="choices" class="choices hide"></div>
 
@@ -300,8 +345,11 @@
         <div id="markresult" class="marking hide"></div>
         <div class="a hide" id="ca"></div>
         <div class="why hide" id="cwhy"></div>
+        <!-- NotebookLM's citation click: the line, in its passage. -->
+        <div id="sourcebox2" class="ctx hide"></div>
 
         <div class="row hide" id="explainrow">
+          <button id="ctxbtn">In my note<kbd style="margin-left:7px">n</kbd></button>
           <button id="explainbtn">Explain this<kbd style="margin-left:7px">e</kbd></button>
           <input type="text" id="explainq" placeholder="or ask something specific…" style="flex:1;min-width:180px">
         </div>
@@ -346,7 +394,7 @@
 
     <section id="donepanel" class="hide">
       <h2>Session finished</h2>
-      <div id="donebody"></div>
+      <div id="donebody" class="debrief"></div>
     </section>
 
     <section id="gradpanel" class="hide">
@@ -386,7 +434,10 @@
       <p class="hint" style="margin:10px 0 0">
         Cards land as drafts. Nothing is scheduled until you have read it — a wrong
         flashcard is worse than no flashcard, because spaced repetition will drill
-        the error into you on a perfect schedule.
+        the error into you on a perfect schedule. Drafts also come up in your
+        review sessions, a few a day, with Keep / Fix / Drop. Every card must
+        point at a line of your note; a card that cannot is dropped as
+        <code>ungrounded</code>.
       </p>
     </section>
     <section>
@@ -576,13 +627,13 @@ function inFolders(folder, scopes) {
   return false;
 }
 
-const studyableDecks = d => d.decks.filter(x => x.active > 0);
+const studyableDecks = d => d.decks.filter(x => x.active > 0 || x.drafts > 0);
 const visibleDecks = d => studyableDecks(d).filter(x => inFolders(x.folder, STATE.folders));
 
 function renderFolders(d) {
   const el = $("#folders");
   // One folder is not a choice — don't spend a row of UI saying so.
-  const list = (d.folders || []).filter(f => f.path && f.cards > 0);
+  const list = (d.folders || []).filter(f => f.path && (f.cards > 0 || f.drafts > 0));
   if (list.length < 2) { el.innerHTML = ""; return; }
   el.innerHTML =
     `<button data-folder="" class="${STATE.folders.size ? "" : "on"}">All folders</button>` +
@@ -590,7 +641,7 @@ function renderFolders(d) {
       <button data-folder="${esc(f.path)}" title="${esc(f.path)}"
               class="${STATE.folders.has(f.path) ? "on" : ""}">
         ${f.depth > 1 ? `<span class="nest">${"› ".repeat(f.depth - 1)}</span>` : ""}${esc(f.label)}
-        <span class="pill" style="margin-left:5px">${f.due}${f.new ? "+" + f.new : ""}</span>
+        <span class="pill" style="margin-left:5px">${f.due}${f.new ? "+" + f.new : ""}${f.drafts ? " · " + f.drafts + " draft" : ""}</span>
       </button>`).join("");
 }
 
@@ -623,15 +674,16 @@ function renderSubjects(d) {
   el.innerHTML = decks.map(x => `
     <button data-subject="${esc(x.note_id)}" class="${STATE.selected.has(x.note_id) ? "on" : ""}">
       ${swatch(x.category)} ${esc(x.subject)}
-      <span class="pill" style="margin-left:5px">${x.due}${x.new ? "+" + x.new : ""}</span>
+      <span class="pill" style="margin-left:5px">${x.due}${x.new ? "+" + x.new : ""}${x.drafts ? " · " + x.drafts + " draft" : ""}</span>
     </button>`).join("");
   const due = decks.reduce((a, x) => a + x.due, 0);
   const fresh = decks.reduce((a, x) => a + x.new, 0);
+  const drafts = decks.reduce((a, x) => a + (x.drafts || 0), 0);
   const scope = STATE.folders.size
     ? `${STATE.folders.size} folder(s)`
     : (STATE.selected.size ? "" : "all subjects");
   $("#availability").textContent =
-    `${due} due, ${fresh} new · ${d.today.reviewed} done today` +
+    `${due} due, ${fresh} new${drafts ? `, ${drafts} drafts` : ""} · ${d.today.reviewed} done today` +
     (STATE.selected.size ? ` · ${STATE.selected.size} subject(s) selected` : "") +
     (scope ? ` · ${scope}` : "");
 }
@@ -684,7 +736,9 @@ async function startSession() {
     const body = {subjects: [...STATE.selected], folders: [...STATE.folders]};
     const d = await api("/api/study/session", {method: "POST", body: JSON.stringify(body)});
     if (!d.queue.length) { toast("Nothing to review", d.message); return; }
-    SESSION = {queue: d.queue, i: 0, total: d.queue.length, done: 0, again: 0, started: Date.now()};
+    SESSION = {queue: d.queue, i: 0, total: d.queue.length, done: 0, again: 0, started: Date.now(),
+               started_at: d.started_at, leeches: [], capped: false};
+    if (d.buried) toast("Siblings held back", `${d.buried} card(s) cut from the same sentence as one in this session — they come up another day.`);
     $("#startpanel").classList.add("hide");
     $("#donepanel").classList.add("hide");
     $("#runner").classList.remove("hide");
@@ -694,17 +748,181 @@ async function startSession() {
 
 function endSession(silent) {
   if (!SESSION) return;
-  const {done, again} = SESSION;
+  const sess = SESSION;
+  const {done, again} = sess;
   SESSION = null;
   $("#runner").classList.add("hide");
   $("#startpanel").classList.remove("hide");
-  if (!silent && done) {
+  if (!silent && (done || sess.dropped || sess.fixed)) {
     $("#donepanel").classList.remove("hide");
     $("#donebody").innerHTML =
-      `<p>${done} card${done === 1 ? "" : "s"} reviewed${again ? `, ${again} to see again` : ""}.</p>`;
+      `<p>${done} card${done === 1 ? "" : "s"} reviewed${again ? `, ${again} to see again` : ""}.</p>` +
+      `<p class="hint">Putting the debrief together…</p>`;
+    renderDebrief(sess);
   }
   loadOverview();
 }
+
+/* The debrief. Anki's half is the tally; NotebookLM's half is sending the
+   misses back to the source — the passages behind the cards that failed,
+   grouped so a paragraph three cards came from is read once. */
+async function renderDebrief(sess) {
+  try {
+    const d = await api("/api/study/debrief",
+      {method: "POST", body: JSON.stringify({since: sess.started_at || ""})});
+    $("#donebody").innerHTML = debriefHtml(d, sess);
+  } catch (e) {
+    $("#donebody").querySelector(".hint")?.remove();
+  }
+}
+
+function debriefHtml(d, sess) {
+  const tri = d.triaged || {};
+  const kpi = (v, l) => `<div class="kpi"><b>${v}</b><span>${l}</span></div>`;
+  let h = `<p style="margin:0 0 12px">${esc(d.message)}</p><div class="kpis">` +
+    kpi(d.reviewed, "answered") +
+    kpi(d.accuracy == null ? "—" : Math.round(d.accuracy * 100) + "%", "remembered") +
+    kpi(d.minutes, "minutes") +
+    kpi(d.due_tomorrow, "due tomorrow") + `</div>`;
+  if (Object.keys(tri).length) {
+    h += `<p class="hint" style="margin:10px 0 0">Drafts looked over: ${tri.keep || 0} kept outright · ` +
+         `${tri.fix || 0} fixed · ${tri.drop || 0} dropped. Answered drafts are kept too.</p>`;
+  }
+  if ((d.by_subject || []).length > 1) {
+    h += `<p class="hint" style="margin:6px 0 0">` + d.by_subject.map(b =>
+      `${esc(b.subject)} ${b.correct}/${b.reviewed}`).join(" · ") + `</p>`;
+  }
+  if ((d.reread || []).length) {
+    h += `<h3>Re-read before next time</h3>` + d.reread.map(g => `
+      <div class="reread">
+        <div class="head">${esc(g.note_title || g.subject)}${g.heading ? " › " + esc(g.heading) : ""} · ${g.cards} missed</div>
+        <blockquote>${highlight(g.passage, (g.quotes || [])[0])}</blockquote>
+        ${g.obsidian_uri ? `<a href="${esc(g.obsidian_uri)}" style="font-size:13px">Open in Obsidian ↗</a>` : ""}
+      </div>`).join("");
+  }
+  if ((d.shaky || []).length) {
+    h += `<h3>The ones that slipped</h3>` + d.shaky.map(c => `
+      <div class="shaky">
+        ${c.overconfident ? `<span class="pill warn">you were sure</span> ` : ""}
+        ${md(c.question)} <span class="hint">→ ${md(c.answer)}</span>
+      </div>`).join("");
+  }
+  const leeches = d.leeches || [];
+  if (leeches.length) {
+    h += `<h3>Leeches — suspended</h3><p class="hint" style="margin:0 0 6px">Forgotten ${esc(String(d.leech_lapses || 8))}+ times. That is usually the card, not you.</p>` +
+      leeches.map(c => `
+      <div class="shaky row">
+        <span style="flex:1">${md(c.question)}</span>
+        <button data-rewrite="${esc(c.note_id)}|${esc(c.card_id)}">Rewrite from source</button>
+      </div>`).join("");
+  }
+  return h;
+}
+
+$("#donebody").addEventListener("click", async e => {
+  const b = e.target.closest("button[data-rewrite]");
+  if (!b) return;
+  const [nid, cid] = b.dataset.rewrite.split("|");
+  b.disabled = true; b.textContent = "Reading the source…";
+  try {
+    const r = await api(`/api/study/${nid}/${cid}/rewrite`, {method: "POST", body: "{}"});
+    b.replaceWith(Object.assign(document.createElement("span"),
+      {className: "hint", textContent: r.note}));
+    loadOverview();
+  } catch (err) { b.disabled = false; b.textContent = "Rewrite from source"; toast("Could not rewrite", err.message, "err"); }
+});
+
+// ------------------------------------------------------------------ citation in context
+function highlight(passage, quote) {
+  const text = esc(passage || "");
+  const q = esc(quote || "").trim();
+  if (!q) return text;
+  const words = q.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  try {
+    const re = new RegExp(words.join("\\s+"), "i");
+    return text.replace(re, m => `<mark>${m}</mark>`);
+  } catch (e) { return text; }
+}
+
+function renderContext(s) {
+  const link = s.obsidian_uri
+    ? `<a href="${esc(s.obsidian_uri)}">Open “${esc(s.note_title)}” in Obsidian ↗</a>` : "";
+  if (!s.found) {
+    return `<div class="hint">This card's line is not in the note any more — the note has changed since the card was made.</div>` +
+           `<div style="margin-top:8px;font-size:13px">${link}</div>`;
+  }
+  return `<div class="head">${esc(s.note_title)}${s.heading ? " › " + esc(s.heading) : ""} · passage ${s.index + 1} of ${s.passages}</div>` +
+    (s.before ? `<div class="edge">…${esc(s.before)}</div>` : "") +
+    `<div style="white-space:pre-wrap;margin:6px 0">${highlight(s.passage, s.quote)}</div>` +
+    (s.after ? `<div class="edge">${esc(s.after)}…</div>` : "") +
+    `<div style="margin-top:8px;font-size:13px">${link}</div>`;
+}
+
+async function showContext() {
+  if (!CARD || !REVEALED) return;
+  const box = $("#sourcebox2");
+  if (!box.classList.contains("hide")) { box.classList.add("hide"); return; }
+  box.classList.remove("hide");
+  box.innerHTML = `<span class="hint">Finding it in your note…</span>`;
+  try {
+    box.innerHTML = renderContext(await api(`/api/study/${CARD.note_id}/${CARD.id}/source`));
+  } catch (e) { box.innerHTML = `<span class="hint">${esc(e.message)}</span>`; }
+}
+$("#ctxbtn").addEventListener("click", showContext);
+
+// ------------------------------------------------------------------ triage
+async function triage(action, extra) {
+  return api(`/api/study/${CARD.note_id}/${CARD.id}/triage`,
+    {method: "POST", body: JSON.stringify(Object.assign({action}, extra || {}))});
+}
+
+async function dropDraft() {
+  if (!CARD || CARD.reason !== "draft" || REVEALED) return;
+  try {
+    await triage("drop");
+    SESSION.dropped = (SESSION.dropped || 0) + 1;
+    SESSION.i += 1;
+    showCard();
+  } catch (e) { toast("Could not drop it", e.message, "err"); }
+}
+
+async function openFix() {
+  if (!CARD || CARD.reason !== "draft" || REVEALED) return;
+  try {
+    const full = await api(`/api/study/${CARD.note_id}/${CARD.id}/reveal`);
+    $("#fixfront").value = full.front;
+    $("#fixback").value = full.back;
+    $("#fixsrc").textContent = full.source ? "From your note: " + full.source : "";
+    ["#revealrow", "#conf", "#choices", "#typedbox", "#explainfirst", "#worked", "#triagebar"]
+      .forEach(sel => $(sel).classList.add("hide"));
+    $("#fixbox").classList.remove("hide");
+    setTimeout(() => $("#fixfront").focus(), 30);
+  } catch (e) { toast("Could not open the card", e.message, "err"); }
+}
+
+/* A fixed card is not graded now — you have just read its answer. It goes
+   back in the queue a few cards later, as the question you wrote. */
+async function saveFix() {
+  if (!CARD) return;
+  try {
+    const r = await triage("fix", {front: $("#fixfront").value, back: $("#fixback").value});
+    if (r.warning) toast("Saved — one thing to know", r.warning, "warn");
+    const later = Object.assign({}, CARD, r.card,
+      {reason: "draft", typed: undefined, picked_choice: undefined});
+    SESSION.queue.splice(Math.min(SESSION.queue.length, SESSION.i + 5), 0, later);
+    SESSION.fixed = (SESSION.fixed || 0) + 1;
+    SESSION.i += 1;
+    showCard();
+  } catch (e) { toast("Could not save it", e.message, "err"); }
+}
+
+$("#tfix").addEventListener("click", openFix);
+$("#tdrop").addEventListener("click", dropDraft);
+$("#fixsave").addEventListener("click", saveFix);
+$("#fixcancel").addEventListener("click", () => showCard());
+["#fixfront", "#fixback"].forEach(sel => $(sel).addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); saveFix(); }
+}));
 
 $("#quit").addEventListener("click", () => endSession(false));
 
@@ -720,7 +938,13 @@ function showCard() {
   $("#csw").style.background = (CATS[CARD.category] || {}).hex || "transparent";
   $("#csubject").textContent = CARD.subject;
   const KINDLABEL = {cloze: "cloze", mcq: "multiple choice", recall: "type it", explain: "explain it"};
+  const draft = CARD.reason === "draft";
+  $("#triagebar").classList.toggle("hide", !draft);
+  $("#fixbox").classList.add("hide");
+  $("#sourcebox2").classList.add("hide");
   $("#cflags").innerHTML =
+    (draft ? `<span class="pill draft">draft</span> ` : "") +
+    (CARD.exam ? `<span class="pill exam">exam ${esc(CARD.exam)}</span> ` : "") +
     (CARD.reason === "new" ? `<span class="pill new">new</span> ` : "") +
     (CARD.overdue_days > 0 ? `<span class="pill warn">${CARD.overdue_days}d overdue</span> ` : "") +
     (KINDLABEL[CARD.kind] ? `<span class="pill">${KINDLABEL[CARD.kind]}</span>` : "");
@@ -942,7 +1166,17 @@ async function grade(g) {
     if (r.overconfident) {
       toast("You were sure about that one", "It goes to the front of your next session.", "warn");
     }
-    if (r.again) {
+    if (r.leech) {
+      SESSION.leeches.push({note_id: CARD.note_id, card_id: CARD.id});
+      toast(r.suspended ? "Leech — suspended" : "Leech",
+        "Forgotten again and again usually means the card is the problem. " +
+        "You can rewrite it from your note at the end of the session.", "warn");
+    }
+    if (r.capped_to && !SESSION.capped) {
+      SESSION.capped = true;
+      toast("Exam date", `Scheduled for ${r.capped_to}, the day before the deadline — the ordinary schedule resumes after it.`);
+    }
+    if (r.again && !r.suspended) {
       // A forgotten card comes back before the session ends, not tomorrow.
       SESSION.again += 1;
       const spot = Math.min(SESSION.queue.length, SESSION.i + 4);
@@ -1033,6 +1267,12 @@ document.addEventListener("keydown", e => {
      no answer to reveal until you have committed to an option, and a reveal
      button that works before you answer is a reveal button that gets pressed
      before you answer. */
+  if (!typing && !REVEALED && CARD && CARD.reason === "draft"
+      && !(CARD.kind === "mcq" && (CARD.options || []).length > 5)) {
+    if (e.key === "f") { e.preventDefault(); openFix(); return; }
+    if (e.key === "x") { e.preventDefault(); dropDraft(); return; }
+  }
+  if (!typing && REVEALED && e.key === "n") { e.preventDefault(); showContext(); return; }
   if (!typing && !REVEALED && CARD && CARD.kind === "mcq" && (CARD.options || []).length) {
     const idx = "abcdefg".indexOf(e.key.toLowerCase());
     if (idx >= 0 && idx < CARD.options.length) {
@@ -1139,7 +1379,7 @@ $("#gen").addEventListener("click", async () => {
     const r = await api(`/api/decks/${id}/generate`, {method: "POST", body: JSON.stringify({})});
     toast(
       r.generated ? `${r.generated} draft cards` : "No cards made",
-      (r.note || `From ${r.passages} passages${r.repaired ? `, ${r.repaired} rewritten as cloze` : ""}${r.rejected ? `, ${r.rejected} dropped${Object.keys(r.rejections || {}).length ? ` (${Object.entries(r.rejections).map(([k, v]) => `${v} ${k}`).join(", ")})` : ""}` : ""}. Review them below.`),
+      (r.note || `From ${r.visited || r.passages} of ${r.passages} passages${(r.grounding || {}).recovered ? `, ${r.grounding.recovered} citations found for paraphrased quotes` : ""}${r.repaired ? `, ${r.repaired} rewritten as cloze` : ""}${r.rejected ? `, ${r.rejected} dropped${Object.keys(r.rejections || {}).length ? ` (${Object.entries(r.rejections).map(([k, v]) => `${v} ${k}`).join(", ")})` : ""}` : ""}. Review them below.`),
       r.generated ? (r.degraded ? "warn" : "") : "warn"
     );
     await loadOverview();
@@ -1178,12 +1418,15 @@ $("#decklist").addEventListener("click", e => {
 
 async function openDeck(noteId) {
   try {
-    const deck = await api(`/api/decks/${noteId}`);
+    const [deck, cov] = await Promise.all([
+      api(`/api/decks/${noteId}`),
+      api(`/api/decks/${noteId}/coverage`).catch(() => null),
+    ]);
     STATE.openDeck = noteId;
     $("#deckdetail").classList.remove("hide");
     $("#deckname").textContent = deck.subject;
     const drafts = deck.cards.filter(c => c.status === "draft");
-    $("#deckcards").innerHTML =
+    $("#deckcards").innerHTML = coverageHtml(cov) +
       (drafts.length ? `<div class="row" style="margin-bottom:10px">
           <span class="pill warn">${drafts.length} drafts</span>
           <button class="primary" id="approveall">Approve all</button>
@@ -1209,9 +1452,38 @@ async function openDeck(noteId) {
   } catch (e) { toast("Could not open deck", e.message, "err"); }
 }
 
+/* Which parts of the note have cards. NotebookLM reads a whole source; a
+   deck made passage by passage can quietly skip half of it. */
+function coverageHtml(cov) {
+  if (!cov || !cov.passages) return "";
+  const cells = cov.rows.map(r =>
+    `<i class="${r.cards ? "on" : ""}" title="${esc((r.heading ? r.heading + ": " : "") + r.preview)} — ${r.cards} card(s)"></i>`).join("");
+  const missing = (cov.missing_concepts || []).slice(0, 6);
+  const gaps = cov.passages - cov.covered;
+  return `<div style="margin-bottom:12px">
+      <div class="hint">${cov.covered} of ${cov.passages} passages have cards${
+        missing.length ? ` · not yet tested: ${missing.map(esc).join(", ")}` : ""}</div>
+      <div class="cover">${cells}</div>
+      ${gaps ? `<button id="fillgaps">Fill ${gaps} gap${gaps === 1 ? "" : "s"}</button>` : ""}
+    </div>`;
+}
+
 $("#deckdetail").addEventListener("click", async e => {
   const id = STATE.openDeck;
   if (!id) return;
+  if (e.target.id === "fillgaps") {
+    e.target.disabled = true;
+    e.target.textContent = "Reading the rest of the note…";
+    try {
+      const r = await api(`/api/decks/${id}/generate`,
+        {method: "POST", body: JSON.stringify({fill_gaps: true})});
+      toast(r.generated ? `${r.generated} draft cards for the gaps` : "No new cards",
+        r.note || `${r.coverage ? r.coverage.covered + " of " + r.coverage.passages + " passages now have cards." : ""}`,
+        r.generated ? "" : "warn");
+      await openDeck(id); loadOverview();
+    } catch (err) { toast("Could not fill the gaps", err.message, "err"); }
+    return;
+  }
   const post = async (cardId, patch) => {
     await api(`/api/decks/${id}/cards/${cardId}`, {method: "POST", body: JSON.stringify(patch)});
     await openDeck(id); loadOverview();

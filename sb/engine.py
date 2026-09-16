@@ -24,7 +24,9 @@ from . import (
     extract,
     fit as fitmod,
     forecasting,
+    frontmatter as frontmattermod,
     generate,
+    guide as guidemod,
     habits as habitsmod,
     incidents as incidentsmod,
     intake as intakemod,
@@ -2640,7 +2642,10 @@ class Engine:
             },
         }
 
-    def _card_payload(self, deck: Deck, card: Card, *, reveal: bool = True) -> Dict[str, Any]:
+    def _card_payload(
+        self, deck: Deck, card: Card, *, reveal: bool = True,
+        deadline: Optional[dt.date] = None,
+    ) -> Dict[str, Any]:
         """`reveal=False` is what a session queue gets.
 
         Everything that contains the answer is withheld, not merely hidden by
@@ -2678,7 +2683,9 @@ class Engine:
             "due": card.due,
             "is_new": card.is_new,
             "retrievability": round(card.retrievability(), 3),
-            "intervals": tutor.button_intervals(card, self.cfg),
+            "intervals": tutor.button_intervals(card, self.cfg, deadline),
+            "leech": tutor.is_leech(card, self.cfg),
+            "exam": deadline.isoformat() if deadline else None,
         }
 
     def _link_resolver(self):
@@ -2703,7 +2710,8 @@ class Engine:
         return resolve
 
     def generate_cards(
-        self, note_id: str, *, max_cards: Optional[int] = None, source: str = ""
+        self, note_id: str, *, max_cards: Optional[int] = None, source: str = "",
+        fill_gaps: bool = False,
     ) -> Dict[str, Any]:
         """Draft cards from a note (or from pasted source text).
 
@@ -2765,6 +2773,7 @@ class Engine:
             material,
             self.cfg,
             max_cards=max_cards or self.cfg.study.generate_max_cards,
+            fill_gaps=fill_gaps,
         )
         self.decks.save(deck)
         self.vault.log_line(
@@ -2786,6 +2795,11 @@ class Engine:
             "queued": False,
             "pending": self.card_queue.count(),
             "note": result.note,
+            "grounding": result.grounding,
+            "concepts": result.concepts,
+            "coverage": result.coverage,
+            "visited": len(result.visited),
+            "fill_gaps": fill_gaps,
         }
 
     def _model_outage(self, role: str = "") -> str:
@@ -3170,6 +3184,11 @@ class Engine:
                 "retention": self.cfg.study.desired_retention,
             },
             "graduation": self.graduation_candidates(),
+            "leeches": [
+                {"note_id": d.note_id, "subject": d.subject, "card_id": c.id,
+                 "question": c.question(), "lapses": c.lapses, "status": c.status}
+                for d in decks for c in d.cards if tutor.is_leech(c, self.cfg)
+            ][:30],
             "candidates": self._deckable_notes(decks),
             "categories": taxonomy.as_dicts(self.cfg),
         }
@@ -3185,20 +3204,25 @@ class Engine:
         would contradict the session you get when you click it.
         """
         agg: Dict[str, Dict[str, int]] = {}
+        with_drafts = bool(getattr(self.cfg.study, "drafts_in_session", False))
         for deck in decks:
             due, new, active = len(deck.due(today)), len(deck.new()), len(deck.active)
-            if not active:
-                continue  # a deck of drafts is not somewhere you can study
+            drafts = len(deck.drafts) if with_drafts else 0
+            if not active and not drafts:
+                continue  # nothing here can come up in a session
             folder = tutor.normalize_folder(where.get(deck.note_id, ""))
             parts = folder.split("/") if folder else []
             # "" is the vault root, and every note is under it
             for depth in range(len(parts) + 1):
                 key = "/".join(parts[:depth])
-                row = agg.setdefault(key, {"decks": 0, "due": 0, "new": 0, "cards": 0})
+                row = agg.setdefault(
+                    key, {"decks": 0, "due": 0, "new": 0, "cards": 0, "drafts": 0}
+                )
                 row["decks"] += 1
                 row["due"] += due
                 row["new"] += new
                 row["cards"] += active
+                row["drafts"] += drafts
         out = [
             {
                 "path": path,
@@ -3264,10 +3288,13 @@ class Engine:
             introduced_today=introduced,
             priority=priority,
         )
+        exams = {nid: self._exam_deadline(nid) for nid in {q.deck.note_id for q in session.queue}}
         return {
             "queue": [
                 {
-                    **self._card_payload(q.deck, q.card, reveal=False),
+                    **self._card_payload(
+                        q.deck, q.card, reveal=False, deadline=exams.get(q.deck.note_id)
+                    ),
                     "reason": q.reason,
                     "overdue_days": q.overdue_days,
                 }
@@ -3275,15 +3302,20 @@ class Engine:
             ],
             "due_available": session.due_available,
             "new_available": session.new_available,
+            "drafts_available": session.drafts_available,
+            "buried": session.buried,
             "capped": session.capped,
             "message": session.message,
+            "started_at": _now().isoformat(),
         }
 
     def study_reveal(self, note_id: str, card_id: str) -> Dict[str, Any]:
         """The answer side, fetched only when asked for — so the answer is
         never sitting in the page while you are trying to recall it."""
         deck = self.deck(note_id)
-        return self._card_payload(deck, deck.card(card_id), reveal=True)
+        return self._card_payload(
+            deck, deck.card(card_id), reveal=True, deadline=self._exam_deadline(note_id)
+        )
 
     def study_answer(
         self,
@@ -3341,6 +3373,7 @@ class Engine:
             feedback=grading.feedback if grading else "",
             score=grading.score if grading else None,
             confidence=calibration.clamp(confidence),
+            deadline=self._exam_deadline(note_id),
         )
         graduation = self._check_graduation(deck)
         return {
@@ -3369,6 +3402,9 @@ class Engine:
             # Chi et al.: the prompt is the intervention. Asking only on
             # Again/Hard keeps it from becoming the thing that ends sessions.
             "ask_why": tutor.wants_self_explanation(result.grade),
+            "leech": result.leech,
+            "suspended": card.status == "suspended",
+            "capped_to": result.capped_to,
         }
 
     def study_mark(self, note_id: str, card_id: str, typed: str) -> Dict[str, Any]:
@@ -3447,6 +3483,366 @@ class Engine:
             # The tutor's own explanation, shown *after* theirs. Order is the
             # whole point: reading it first is the passive path this replaces.
             "answer": tutor.explain(card, note.body, "", self.cfg),
+        }
+
+    # -- Anki x NotebookLM: the loop around a card ---------------------------
+
+    def _exam_deadline(self, note_id: str) -> Optional[dt.date]:
+        """The date a deck must be known by, or None.
+
+        An open Project with a deadline still ahead. `exam_cap` in
+        sb/tutor.py pulls reviews back to the eve of it.
+        """
+        if not getattr(self.cfg.study, "exam_cap", True):
+            return None
+        try:
+            note = self.note(note_id)
+        except Exception:
+            return None
+        project = note.project
+        if note.bucket != Bucket.PROJECT or not project or not project.deadline:
+            return None
+        if project.status == ProjectStatus.DONE or project.deadline <= dt.date.today():
+            return None
+        return project.deadline
+
+    def _obsidian_uri(self, path: Optional[Path]) -> str:
+        if not path:
+            return ""
+        from urllib.parse import quote
+
+        try:
+            rel = Path(path).resolve().relative_to(Path(self.vault.root).resolve())
+        except (ValueError, OSError):
+            return ""
+        name = Path(self.vault.root).resolve().name
+        return (
+            "obsidian://open?vault=" + quote(name, safe="")
+            + "&file=" + quote(rel.as_posix(), safe="")
+        )
+
+    def _material(self, note_id: str, cache: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """A note's card material, split the way the generator split it."""
+        if cache is not None and note_id in cache:
+            return cache[note_id]
+        path, note = self.vault.get(note_id)
+        text = generate.expand_links(note.body, self._link_resolver())
+        passages = generate.chunk(text)
+        out = {
+            "note": note,
+            "path": path,
+            "passages": passages,
+            "guide": guidemod.Guide(
+                passages=passages,
+                headings=guidemod.headings_for(frontmattermod.strip(text), passages),
+            ),
+        }
+        if cache is not None:
+            cache[note_id] = out
+        return out
+
+    def _quoted_in(self, note: Note, path: Path, quote: str) -> Tuple[str, Optional[Path]]:
+        """Which note a citation actually came from — the deck's own note, or
+        one of the notes it links to (generation reads those too)."""
+        needle = guidemod.norm(quote)
+        if not needle or needle in guidemod.norm(note.body):
+            return note.title, path
+        index = self.vault.title_index()
+        for match in generate.WIKILINK.finditer(note.body or ""):
+            title = match.group(1).strip()
+            try:
+                other = self.vault.resolve_title(title, index)
+            except Exception:
+                other = None
+            if other and needle in guidemod.norm(other.body):
+                try:
+                    other_path, _ = self.vault.get(other.id)
+                except Exception:
+                    other_path = None
+                return other.title, other_path
+        return note.title, path
+
+    def _source_context(
+        self, deck: Deck, card: Card, cache: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        mat = self._material(deck.note_id, cache)
+        passages = mat["passages"]
+        index = guidemod.passage_of(card, passages)
+        title, where = self._quoted_in(mat["note"], mat["path"], card.source or "")
+        out: Dict[str, Any] = {
+            "note_id": deck.note_id,
+            "card_id": card.id,
+            "quote": card.source,
+            "found": index is not None,
+            "index": index,
+            "passages": len(passages),
+            "note_title": title,
+            "obsidian_uri": self._obsidian_uri(where),
+            "passage": "",
+            "heading": "",
+            "before": "",
+            "after": "",
+        }
+        if index is not None:
+            flat = lambda t: re.sub(r"\s+", " ", t or "").strip()
+            out["passage"] = passages[index].strip()
+            out["heading"] = mat["guide"].heading(index)
+            if index > 0:
+                out["before"] = flat(passages[index - 1])[-160:]
+            if index + 1 < len(passages):
+                out["after"] = flat(passages[index + 1])[:160]
+        return out
+
+    def study_source(self, note_id: str, card_id: str) -> Dict[str, Any]:
+        """NotebookLM's citation click: the card's line, in its passage, with
+        a link that opens the note in Obsidian."""
+        deck = self.deck(note_id)
+        return self._source_context(deck, deck.card(card_id))
+
+    def deck_coverage(self, note_id: str) -> Dict[str, Any]:
+        """Which passages of the note have cards, and which key ideas none."""
+        deck = self.deck(note_id)
+        mat = self._material(note_id)
+        g = guidemod.build(
+            frontmattermod.strip(generate.expand_links(mat["note"].body, self._link_resolver())),
+            mat["passages"],
+        )
+        return guidemod.coverage(deck.cards, g)
+
+    def study_triage(
+        self, note_id: str, card_id: str, action: str,
+        front: Optional[str] = None, back: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Keep, fix, drop or suspend a card from inside a session.
+
+        Every action is logged with the text before and after, to
+        `_decks/_triage.jsonl`. A drop is the most useful label this system
+        collects: a card the generator wrote that a human would not.
+        """
+        action = (action or "").strip().lower()
+        if action not in ("keep", "fix", "drop", "suspend"):
+            raise ValueError(f"unknown triage action {action!r}")
+        deck = self.deck(note_id)
+        card = deck.card(card_id)
+        before = {"front": card.front, "back": card.back, "source": card.source,
+                  "status": card.status, "kind": card.kind}
+        warning = ""
+        if action == "drop":
+            deck.cards = [c for c in deck.cards if c.id != card_id]
+        elif action == "keep":
+            if card.status == "draft":
+                card.status = "active"
+        elif action == "suspend":
+            card.status = "suspended"
+        else:
+            new_front = (front if front is not None else card.front).strip()
+            new_back = (back if back is not None else card.back).strip()
+            if not new_front or not new_back:
+                raise ValueError("a card needs both a question and an answer")
+            card.front, card.back = new_front, new_back
+            if card.kind not in ("cloze", "mcq", "explain"):
+                verdict = quality.assess(new_front, new_back,
+                                         max_words=self.cfg.study.max_answer_words)
+                warning = "" if verdict.ok else verdict.reason
+        self.decks.save(deck)
+        self.decks.log_triage({
+            "at": _now().isoformat(),
+            "note_id": note_id,
+            "subject": deck.subject,
+            "card": card_id,
+            "action": action,
+            "before": before,
+            "after": None if action == "drop" else {
+                "front": card.front, "back": card.back, "status": card.status,
+            },
+        })
+        if action in ("keep", "drop", "suspend"):
+            self._sync_calendar_quiet()
+        out: Dict[str, Any] = {
+            "action": action,
+            "deck": tutor.deck_progress(deck, self.cfg),
+            "card": None if action == "drop" else self._card_payload(
+                deck, card, reveal=False, deadline=self._exam_deadline(note_id)
+            ),
+        }
+        if warning:
+            out["warning"] = warning
+        return out
+
+    def study_rewrite(self, note_id: str, card_id: str) -> Dict[str, Any]:
+        """A leech, rewritten from its own passage.
+
+        Anki's advice for a leech is to fix the card, not to keep failing it;
+        NotebookLM's contribution is doing the fixing from the source. The
+        replacements go through the same grounding and quality gates as any
+        generated card and land as drafts, so they come up in the next
+        session with Keep / Fix / Drop. The leech stays suspended with its
+        history intact.
+        """
+        deck = self.deck(note_id)
+        card = deck.card(card_id)
+        ctx = self._source_context(deck, card)
+        material = ctx["passage"] or card.source or self.note(note_id).body
+        focus = (
+            f'The learner keeps forgetting this card. Q: "{card.question()}" '
+            f'A: "{card.back}". Write up to 3 better cards that test the same '
+            "idea from this passage: split it into smaller facts, give the "
+            "context that makes it memorable, or make it a cloze. Do not "
+            "repeat the card as it is."
+        )
+        result = generate.generate(
+            material, self.cfg, subject=deck.subject, max_cards=3, per_chunk=3,
+            focus=focus,
+        )
+        taken = {generate._norm(c.front) for c in deck.cards}
+        made: List[Card] = []
+        for new in result.cards:
+            if generate._norm(new.front) in taken:
+                continue
+            taken.add(generate._norm(new.front))
+            made.append(deck.add(
+                front=new.front, back=new.back, source=new.source, topic=new.topic,
+                choices=list(new.choices), mode=new.mode, status="draft",
+            ))
+        if not made:
+            clozed = quality.to_cloze(card.front, card.back, card.source, material)
+            if clozed and generate._norm(clozed[0]) not in taken:
+                made.append(deck.add(front=clozed[0], back=clozed[1], source=clozed[2],
+                                     status="draft"))
+        if card.status != "suspended":
+            card.status = "suspended"
+        self.decks.save(deck)
+        self.decks.log_triage({
+            "at": _now().isoformat(), "note_id": note_id, "subject": deck.subject,
+            "card": card_id, "action": "rewrite",
+            "before": {"front": card.front, "back": card.back, "lapses": card.lapses},
+            "after": {"made": [c.id for c in made]},
+        })
+        if result.degraded:
+            self._note_degradation("rewriting a leech", result.note)
+        return {
+            "made": len(made),
+            "cards": [self._card_payload(deck, c) for c in made],
+            "provider": result.provider,
+            "degraded": result.degraded,
+            "note": (
+                f"{len(made)} replacement draft(s) — they come up in your next session."
+                if made else
+                "Nothing better came out of the source. Edit the card by hand in Decks & cards."
+            ),
+        }
+
+    def study_debrief(self, since: str = "") -> Dict[str, Any]:
+        """What a session showed, and what to re-read.
+
+        The Anki half is the tally. The NotebookLM half is turning the misses
+        back into source: the passages behind the cards that failed, grouped
+        so one paragraph that three cards came from is read once.
+        """
+        started = _parse_moment(since) or dt.datetime.combine(
+            dt.date.today(), dt.time.min
+        ).astimezone()
+        reviews = []
+        for rec in self.decks.reviews(since=started.date()):
+            at = _parse_moment(rec.get("at"))
+            if at and at >= started:
+                reviews.append(rec)
+        decks = {d.note_id: d for d in self.decks.all()}
+
+        by_subject: Dict[str, Dict[str, int]] = {}
+        worst: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        seconds = 0.0
+        correct = 0
+        for rec in reviews:
+            grade = int(rec.get("grade") or 0)
+            ok = grade >= 3
+            correct += ok
+            seconds += float(rec.get("seconds") or 0)
+            row = by_subject.setdefault(rec.get("subject") or rec.get("note_id") or "?",
+                                        {"reviewed": 0, "correct": 0})
+            row["reviewed"] += 1
+            row["correct"] += ok
+            conf = rec.get("confidence")
+            over = conf is not None and float(conf) >= calibration.OVERCONFIDENT_AT and grade == 1
+            if grade <= 2 or over:
+                key = (str(rec.get("note_id")), str(rec.get("card")))
+                have = worst.get(key)
+                if not have or grade < have["grade"]:
+                    worst[key] = {"grade": grade, "overconfident": over or bool(have and have["overconfident"]),
+                                  "leech": bool(rec.get("leech"))}
+                elif over:
+                    have["overconfident"] = True
+
+        cache: Dict[str, Any] = {}
+        shaky: List[Dict[str, Any]] = []
+        groups: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+        for (note_id, card_id), info in worst.items():
+            deck = decks.get(note_id)
+            if not deck:
+                continue
+            try:
+                card = deck.card(card_id)
+            except KeyError:
+                continue
+            shaky.append({
+                "note_id": note_id, "card_id": card_id, "subject": deck.subject,
+                "question": card.question(),
+                # A cloze's full answer repeats its question; the blank is enough.
+                "answer": card.back if card.kind == "cloze" else card.answer(),
+                "source": card.source, **info,
+                "status": card.status,
+            })
+            try:
+                ctx = self._source_context(deck, card, cache)
+            except Exception:
+                continue
+            gkey = (note_id, ctx["index"] if ctx["found"] else f"q:{card.source}")
+            group = groups.setdefault(gkey, {
+                "note_id": note_id, "subject": deck.subject,
+                "note_title": ctx["note_title"], "heading": ctx["heading"],
+                "passage": (ctx["passage"] or card.source)[:900],
+                "quotes": [], "cards": 0, "obsidian_uri": ctx["obsidian_uri"],
+            })
+            group["cards"] += 1
+            if card.source and card.source not in group["quotes"]:
+                group["quotes"].append(card.source)
+        shaky.sort(key=lambda r: (not r["overconfident"], r["grade"], r["subject"]))
+        reread = sorted(groups.values(), key=lambda g: -g["cards"])[:6]
+
+        triaged: Dict[str, int] = {}
+        for rec in self.decks.triage():
+            at = _parse_moment(rec.get("at"))
+            if at and at >= started:
+                action = str(rec.get("action"))
+                triaged[action] = triaged.get(action, 0) + 1
+
+        tomorrow = dt.date.today() + dt.timedelta(days=1)
+        due_tomorrow = sum(
+            1 for d in decks.values() for c in d.active
+            if c.due is not None and c.due <= tomorrow and not c.is_new
+        )
+        n = len(reviews)
+        if not n:
+            message = "Nothing answered in this session yet."
+        else:
+            pct = round(100 * correct / n)
+            message = f"{n} answered, {pct}% remembered"
+            if shaky:
+                message += f" — {len(reread) or len(shaky)} passage(s) worth re-reading"
+        return {
+            "since": started.isoformat(),
+            "reviewed": n,
+            "correct": correct,
+            "accuracy": round(correct / n, 3) if n else None,
+            "minutes": round(seconds / 60, 1),
+            "by_subject": [{"subject": k, **v} for k, v in sorted(by_subject.items())],
+            "shaky": shaky[:20],
+            "reread": reread,
+            "leeches": [r for r in shaky if r.get("leech") or r.get("status") == "suspended"],
+            "triaged": triaged,
+            "due_tomorrow": due_tomorrow,
+            "leech_lapses": int(getattr(self.cfg.study, "leech_lapses", 8) or 0),
+            "message": message,
         }
 
     def study_reminder(self, at: Optional[dt.datetime] = None) -> Dict[str, Any]:
@@ -4362,3 +4758,22 @@ def _tag(text: str) -> str:
     import re
 
     return re.sub(r"[^\w/-]", "-", text.strip()).strip("-").lower() or "skill"
+
+
+def _parse_moment(value: Any) -> Optional[dt.datetime]:
+    """An ISO moment from a browser or a log line, always timezone-aware."""
+    if isinstance(value, dt.datetime):
+        moment = value
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            moment = dt.datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.astimezone()
+    return moment

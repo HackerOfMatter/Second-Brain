@@ -32,7 +32,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import frontmatter, quality
+from . import frontmatter, guide as guidemod, quality
 from .cards import CLOZE, Card, Deck, fingerprint
 from .config import Config
 from .llm import resolve_provider
@@ -62,6 +62,9 @@ same label for cards of the same kind. It is used to mix question types \
 within a session, so a generic label is worse than none.
 - If the passage is boilerplate, navigation, or too thin to test, return an \
 empty list. Returning nothing is a correct answer.
+- When you are told the key ideas of a passage, test those first — they are \
+what the whole note is built around. Name the idea in the question itself; \
+never write "this chapter", "this section" or "the reading".
 
 "format" is how the card should be asked. Pick the one the material calls for:
 - "basic" — the default. Read the question, recall the answer, grade yourself.
@@ -179,6 +182,18 @@ class GenerationResult:
     kinds: Dict[str, int] = field(default_factory=dict)
     #: Choice cards that lost their options, by the rule that took them.
     downgraded: Dict[str, int] = field(default_factory=dict)
+    #: How each kept card is supported — "verbatim" when the model's own
+    #: quote is in the passage, "recovered" when a passage sentence carrying
+    #: the answer was found instead (sb/guide.ground). Unsupported cards are
+    #: dropped under the rule "ungrounded".
+    grounding: Dict[str, int] = field(default_factory=dict)
+    #: The study guide's key ideas, heaviest first (sb/guide.py).
+    concepts: List[Dict[str, Any]] = field(default_factory=list)
+    #: Passage indexes visited, in the order they were asked about.
+    visited: List[int] = field(default_factory=list)
+    #: Which passages have cards once this run is attached (add_to_deck).
+    coverage: Dict[str, Any] = field(default_factory=dict)
+    guide: Any = None
     note: str = ""
 
     def _drop(self, rule: str) -> None:
@@ -248,11 +263,19 @@ def generate(
     max_cards: int = 20,
     per_chunk: int = 3,
     existing: Optional[Sequence[Card]] = None,
+    fill_gaps: bool = False,
+    focus: str = "",
 ) -> GenerationResult:
-    """Draft cards from `source`. Nothing here writes to disk."""
+    """Draft cards from `source`. Nothing here writes to disk.
+
+    `fill_gaps` visits only passages no existing card was drawn from.
+    `focus` is an extra instruction for every passage — the leech rewrite
+    uses it to say which card keeps failing.
+    """
     max_answer_words = (
         cfg.study.max_answer_words if getattr(cfg.study, "enforce_card_quality", True) else 0
     )
+    require_grounding = bool(getattr(cfg.study, "require_grounding", True))
     passages = chunk(source)
     seen = {_norm(c.front) for c in (existing or [])}
     result = GenerationResult(chunks=len(passages))
@@ -265,9 +288,34 @@ def generate(
     choices_made = 0
     provider = resolve_provider(cfg.llm, "generate")
     result.provider = provider.name
+
+    # NotebookLM's move: read the whole note before writing a question.
+    study_guide = guidemod.build(
+        frontmatter.strip(source or ""),
+        passages,
+        provider=provider,
+        use_model=bool(getattr(cfg.study, "study_guide", True)),
+        subject=subject,
+    )
+    result.guide = study_guide
+    result.concepts = study_guide.summary()
+    order = guidemod.plan(
+        study_guide,
+        guidemod.covered_counts(existing or [], passages),
+        per_chunk=per_chunk,
+        skip_covered=fill_gaps,
+    )
+    if not order:
+        result.note = (
+            "Every passage already has cards — nothing left to fill."
+            if fill_gaps else "Every passage already has its share of cards."
+        )
+        return result
+
     if not getattr(provider, "is_llm", False):
         result.degraded = True
-        result.cards = _heuristic_cards(passages, max_cards, seen)
+        result.visited = list(order)
+        result.cards = _heuristic_cards([passages[i] for i in order], max_cards, seen)
         for card in result.cards:
             result._count(card)
         result.note = (
@@ -276,12 +324,19 @@ def generate(
         )
         return result
 
-    for passage in passages:
+    for index in order:
         if len(result.cards) >= max_cards:
             break
+        passage = passages[index]
+        result.visited.append(index)
         try:
             raw = provider.complete_json(
-                _user_prompt(passage, subject, per_chunk),
+                _user_prompt(
+                    passage, subject, per_chunk,
+                    heading=study_guide.heading(index),
+                    terms=study_guide.terms_for(index),
+                    focus=focus,
+                ),
                 system=SYSTEM_PROMPT,
                 schema_hint=SCHEMA_HINT,
             )
@@ -291,7 +346,12 @@ def generate(
         for item in _coerce_cards(raw):
             if len(result.cards) >= max_cards:
                 break
-            made, rule = _validate(item, passage, subject, max_answer_words=max_answer_words)
+            made, rule = _validate(
+                item, passage, subject,
+                max_answer_words=max_answer_words,
+                require_grounding=require_grounding,
+                grounding=result.grounding,
+            )
             if not made:
                 result._drop(rule or "unusable")
                 continue
@@ -326,8 +386,23 @@ def generate(
     return result
 
 
-def _user_prompt(passage: str, subject: str, per_chunk: int) -> str:
-    head = f'These are notes from "{subject}".\n\n' if subject else ""
+def _user_prompt(
+    passage: str,
+    subject: str,
+    per_chunk: int,
+    *,
+    heading: str = "",
+    terms: Sequence[str] = (),
+    focus: str = "",
+) -> str:
+    head = f'These are notes from "{subject}".\n' if subject else ""
+    if heading:
+        head += f'Section: "{heading}"\n'
+    if terms:
+        head += "Key ideas in this passage: " + "; ".join(terms) + "\n"
+    if focus:
+        head += focus.strip() + "\n"
+    head = head + "\n" if head else ""
     return (
         f"{head}Passage:\n\"\"\"\n{passage.strip()}\n\"\"\"\n\n"
         f"Write at most {per_chunk} flashcards testing what this passage "
@@ -359,6 +434,8 @@ def _validate(
     subject: str,
     *,
     max_answer_words: int = quality.MAX_ANSWER_WORDS,
+    require_grounding: bool = True,
+    grounding: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[Card], str]:
     """One model card in, zero to four real cards out.
 
@@ -381,14 +458,33 @@ def _validate(
     if subject and _norm(back) == _norm(subject):
         return [], "title-as-answer"
     # "As mentioned above" questions are unanswerable outside their passage.
-    if re.search(r"\b(the above|as mentioned|this passage|the text|the note)\b", front, re.I):
+    if re.search(
+        r"\b(the above|as mentioned|this passage|the text|the note|"
+        r"this (?:chapter|section|reading|lesson)|the reading)\b", front, re.I
+    ):
         return [], "not-self-contained"
     if not re.search(r"[?？]$", front) and not CLOZE.search(front):
         front = front.rstrip(".") + "?"
 
-    quote = why if _quote_is_real(why, passage) else ""
     topic = _topic(item)
     fmt = _format(item)
+
+    if require_grounding:
+        # NotebookLM's rule: every answer points at a line of the source. A
+        # card that cannot is dropped, not shipped without its citation —
+        # the old behaviour, which kept exactly the cards most likely to be
+        # the model's rather than the note's.
+        if CLOZE.search(front):
+            asked, answered = "", CLOZE.sub(lambda m: m.group(1), front)
+        else:
+            asked, answered = front, back
+        quote, how = guidemod.ground(asked, answered, why, passage, explain=(fmt == "explain"))
+        if not how:
+            return [], "ungrounded"
+        if grounding is not None:
+            grounding[how] = grounding.get(how, 0) + 1
+    else:
+        quote = why if _quote_is_real(why, passage) else ""
 
     def card(f: str, b: str, src: str, *, choices=None, mode: str = "") -> Card:
         return Card(
@@ -601,7 +697,13 @@ def _heuristic_cards(passages: List[str], max_cards: int, seen: set) -> List[Car
 
 
 def add_to_deck(
-    deck: Deck, source: str, cfg: Config, *, max_cards: int = 20
+    deck: Deck,
+    source: str,
+    cfg: Config,
+    *,
+    max_cards: int = 20,
+    fill_gaps: bool = False,
+    focus: str = "",
 ) -> GenerationResult:
     """Generate and append, assigning real ids and skipping duplicates."""
     result = generate(
@@ -609,7 +711,10 @@ def add_to_deck(
         cfg,
         subject=deck.subject,
         max_cards=max_cards,
+        per_chunk=max(1, int(getattr(cfg.study, "generate_per_passage", 3) or 3)),
         existing=deck.cards,
+        fill_gaps=fill_gaps,
+        focus=focus,
     )
     attached: List[Card] = []
     for card in result.cards:
@@ -627,5 +732,7 @@ def add_to_deck(
             )
         )
     result.cards = attached
+    if result.guide is not None:
+        result.coverage = guidemod.coverage(deck.cards, result.guide)
     deck.source_fingerprint = fingerprint(source)
     return result

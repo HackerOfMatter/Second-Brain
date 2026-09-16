@@ -2678,7 +2678,15 @@ def test_study_api():
         check("drafts are not schedulable yet", deck["active"] == 0)
 
         session = client.post("/api/study/session", json={}).json()
-        check("drafts do not reach a session", session["queue"] == [], session)
+        check("drafts reach a session only as drafts to look over",
+              session["queue"] and all(q["reason"] == "draft" for q in session["queue"]),
+              session)
+        check("with nothing of the answer in the page",
+              all(q["front"] == "" and q["answer"] == "" for q in session["queue"]))
+        cfg.study.drafts_in_session = False
+        session = client.post("/api/study/session", json={}).json()
+        check("drafts do not reach a session when switched off", session["queue"] == [], session)
+        cfg.study.drafts_in_session = True
 
         client.post(f"/api/decks/{nid}/approve", json={})
         deck = client.get(f"/api/decks/{nid}").json()
@@ -8173,6 +8181,482 @@ def test_ollama_doctor():
             check(f"{page} loads the banner", "/static/ollama.js" in client.get(page).text)
 
 
+# --------------------------------------------------------------------------
+# phase 17 — Anki x NotebookLM
+# --------------------------------------------------------------------------
+
+
+def _passage_fake(concepts=None):
+    """A model that answers every passage with one card grounded in it, and
+    the outline pass with `concepts`. Records the order it was asked in."""
+    import re as _re
+
+    class Fake:
+        name = "fake"
+        is_llm = True
+
+        def __init__(self):
+            self.asked = []
+            self.prompts = []
+
+        def available(self):
+            return True
+
+        def complete_text(self, prompt, system=None):
+            return ""
+
+        def complete_json(self, prompt, system=None, schema_hint=None):
+            self.prompts.append(prompt)
+            if "Outline:" in prompt:
+                return {"concepts": concepts or []}
+            m = _re.search(r'Passage:\n"""\n(.*?)\n"""', prompt, _re.S)
+            passage = m.group(1) if m else ""
+            num = _re.search(r"Term(\d+)", passage)
+            i = int(num.group(1)) if num else -1
+            self.asked.append(i)
+            first = passage.split(". ")[0].strip() + "."
+            return {"cards": [{"q": f"Which term is idea number {i} in the series?",
+                               "a": f"Term{i}", "why": first, "format": "basic"}]}
+
+    return Fake()
+
+
+def _long_note(n):
+    parts = []
+    for i in range(n):
+        parts.append(f"## Part {i}\n\nTerm{i} is idea number {i} in the series of "
+                     f"tested ideas. It is explained here with enough words to be "
+                     f"a passage of its own, well past the minimum a chunk needs, "
+                     f"so the chunker keeps it separate from part {i + 1}.")
+    return "\n\n".join(parts)
+
+
+def test_study_guide_reads_the_whole_note():
+    section("study guide: key terms, plan, coverage")
+    from sb import guide as G
+
+    text = (
+        "## Basics\n\nCommunication is the transmission of meaning. Anything that "
+        "interrupts the transmission is called noise. Receivers ask What's in it "
+        "for me (WIIFM).\n\n"
+        "## Channels\n\n**Channel richness** matters when a message is sensitive. "
+        "The cost of the channel also matters for routine updates.\n\n"
+        "## Glossary\n\n- Feedback: the receiver's response to a message sent to them.\n"
+    )
+    passages = ["Communication is the transmission of meaning. Anything that interrupts "
+                "the transmission is called noise. Receivers ask What's in it for me (WIIFM).",
+                "**Channel richness** matters when a message is sensitive. The cost of the "
+                "channel also matters for routine updates.",
+                "- Feedback: the receiver's response to a message sent to them."]
+    g = G.build(text, passages)
+    terms = {c.term.lower(): c for c in g.concepts}
+    check("a definition subject is a key term", "communication" in terms, list(terms))
+    check("'is called X' names X", "noise" in terms, list(terms))
+    check("a vague sentence subject is not a term",
+          not any(t.startswith("anything") for t in terms), list(terms))
+    check("bold text is a key term", "channel richness" in terms, list(terms))
+    check("an acronym is a key term", "wiifm" in terms, list(terms))
+    check("a glossary line is a key term", "feedback" in terms, list(terms))
+    check("headings are found for each passage",
+          g.headings == ["Basics", "Channels", "Glossary"], g.headings)
+
+    check("spread order starts at both ends of the note",
+          G.spread_order(8)[:3] == [0, 4, 2], G.spread_order(8))
+    check("spread order is a permutation", sorted(G.spread_order(13)) == list(range(13)))
+
+    plain = G.Guide(passages=[f"p{i}" for i in range(8)])
+    order = G.plan(plain, per_chunk=3)
+    check("an unmarked note is sampled evenly, not read from the top",
+          order[:3] == [0, 4, 2], order)
+    order = G.plan(plain, {0: 1, 4: 3}, per_chunk=3)
+    check("uncovered passages come first", order[0] not in (0, 4) and order[-1] == 0, order)
+    check("a full passage is skipped", 4 not in order, order)
+    check("fill gaps skips anything covered",
+          0 not in G.plan(plain, {0: 1}, skip_covered=True))
+
+    cards = [cardsmod.Card(id="c1", front="What is sent?", back="meaning",
+                           source="Communication is the transmission of meaning.")]
+    cov = G.coverage(cards, g)
+    check("coverage places a card by its citation",
+          cov["rows"][0]["cards"] == 1 and cov["covered"] == 1, cov["rows"])
+    check("and lists the ideas nothing tests",
+          "channel richness" in [t.lower() for t in cov["missing_concepts"]], cov)
+
+    # The model pass may add ideas, never invent them.
+    fake = _passage_fake(concepts=[
+        {"term": "channel", "passage": 1, "importance": 3, "why": "picks the medium"},
+        {"term": "quantum entanglement", "passage": 0, "importance": 3},
+    ])
+    g2 = G.build(text, passages, provider=fake, use_model=True)
+    names = [c.term.lower() for c in g2.concepts]
+    check("a model concept found in the note is kept", "channel" in names, names)
+    check("a model concept the note never mentions is dropped",
+          "quantum entanglement" not in names, names)
+    broken = _fake_llm(RuntimeError("boom"))[0](None)
+    g3 = G.build(text, passages, provider=broken, use_model=True)
+    check("a failing concept pass still returns the rules guide",
+          g3.concepts and "skipped" in g3.note, g3.note)
+
+
+def test_generation_covers_the_whole_note():
+    section("generation: spread across the note, fill the gaps")
+    cfg = Config()
+    cfg.study.study_guide = False
+    fake = _passage_fake()
+    saved = generate.resolve_provider
+    generate.resolve_provider = lambda llm, role="": fake
+    try:
+        source = _long_note(12)
+        check("the long note is twelve passages", len(generate.chunk(source)) == 12,
+              len(generate.chunk(source)))
+        r = generate.generate(source, cfg, subject="Series", max_cards=4, per_chunk=1)
+        check("the budget is spent", len(r.cards) == 4, r.rejections)
+        check("and not on the first four passages",
+              max(fake.asked) >= 6 and fake.asked[:2] == [0, 6], fake.asked)
+        check("every card is grounded", sum(r.grounding.values()) == 4, r.grounding)
+        check("the section heading reaches the prompt",
+              'Section: "Part 0"' in fake.prompts[0], fake.prompts[0][:200])
+        check("key ideas reach the prompt",
+              "Key ideas in this passage: Term0" in fake.prompts[0], fake.prompts[0][:200])
+
+        deck = cardsmod.Deck(note_id="n1", subject="Series")
+        first = generate.add_to_deck(deck, source, cfg, max_cards=4)
+        check("coverage is reported after attaching",
+              first.coverage["covered"] == 4 and first.coverage["passages"] == 12,
+              first.coverage)
+        fake.asked.clear()
+        second = generate.add_to_deck(deck, source, cfg, max_cards=20, fill_gaps=True)
+        check("fill gaps never revisits a covered passage",
+              not set(fake.asked) & {0, 6, 3, 9}, fake.asked)
+        check("and covers the rest", second.coverage["covered"] == 12, second.coverage)
+        third = generate.add_to_deck(deck, source, cfg, max_cards=20, fill_gaps=True)
+        check("a fully covered note says so", third.cards == [] and "nothing left" in third.note,
+              third.note)
+
+        # The focus line (leech rewrite) is carried into every prompt.
+        fake.prompts.clear()
+        generate.generate(source, cfg, max_cards=1, per_chunk=1, focus="The learner keeps forgetting X.")
+        check("a focus instruction reaches the prompt",
+              "keeps forgetting X" in fake.prompts[-1])
+    finally:
+        generate.resolve_provider = saved
+
+    # Offline, the heuristic path uses the same spread.
+    cfg2 = Config()
+    cfg2.llm.provider = "heuristic"
+    r2 = generate.generate(_long_note(12), cfg2, max_cards=3)
+    fronts = " ".join(c.front for c in r2.cards)
+    check("the offline path is spread too", "Term6" in fronts or "Term4" in fronts, fronts)
+
+
+def test_grounding_keeps_only_what_the_note_says():
+    section("grounding: every answer points at a line")
+    from sb import guide as G
+
+    passage = ("Communication is unsuccessful if the receiver does not understand the "
+               "meaning intended by the sender. Anything that interrupts the "
+               "transmission is called noise. Channels differ in richness.")
+    quote, how = G.ground("What is noise?", "noise",
+                          "Anything that interrupts the transmission is called noise.", passage)
+    check("a real quote is verbatim", how == "verbatim")
+    quote, how = G.ground("What makes communication succeed?",
+                          "the receiver understands the meaning intended by the sender",
+                          "Receivers must get the sender's meaning.", passage)
+    check("a paraphrased quote is recovered from the passage",
+          how == "recovered" and quote.startswith("Communication is unsuccessful"), (how, quote))
+    quote, how = G.ground("Who founded the field?", "Claude Shannon in 1948", "", passage)
+    check("an answer the passage never gives is ungrounded", how == "" and quote == "")
+    quote, how = G.ground("What interrupts it?", "noise", "", passage)
+    check("a one-word answer finds its sentence", how == "recovered" and "noise" in quote)
+
+    made, rule = generate._validate(
+        {"q": "Who founded information theory?", "a": "Claude Shannon",
+         "why": "Shannon founded it."}, passage, "Comm")
+    check("an invented card is dropped as ungrounded", made == [] and rule == "ungrounded", rule)
+    made, rule = generate._validate(
+        {"q": "What is anything that interrupts a transmission called?", "a": "noise",
+         "why": "interruptions are noise"}, passage, "Comm")
+    check("a true card with a bad quote keeps a real citation",
+          len(made) == 1 and made[0].source.startswith("Anything that interrupts"),
+          (rule, made and made[0].source))
+    made, rule = generate._validate(
+        {"q": "Who founded information theory?", "a": "Claude Shannon", "why": ""},
+        passage, "Comm", require_grounding=False)
+    check("grounding can be switched off", len(made) == 1 and made[0].source == "", rule)
+    made, rule = generate._validate(
+        {"q": "The {{receiver}} must understand the meaning intended by the sender.",
+         "a": "receiver"}, passage, "Comm")
+    check("a model cloze is grounded on its sentence", len(made) == 1, rule)
+
+
+def test_long_list_clozes_overlap():
+    section("overlapping cloze for long lists")
+    s = ("Select the best channel by considering the available technology, importance "
+         "of the message, the amount and speed of feedback required, the necessity of a "
+         "permanent record, the cost of the channel, the degree of formality desired, the "
+         "confidentiality and sensitivity of the message, and the receiver's preference "
+         "and technical expertise.")
+    triples = quality.split_to_cloze(
+        "available technology, the cost of the channel, the degree of formality", s, s)
+    check("three cards", len(triples) == 3, triples)
+    check("every front is much shorter than the sentence",
+          all(quality.words(f) < quality.words(s) * 0.6 for f, _, _ in triples),
+          [f for f, _, _ in triples])
+    check("the stem is kept on every card",
+          all(f.startswith("Select the best channel by considering") for f, _, _ in triples))
+    check("cut context is marked", all(quality.ELLIPSIS in f for f, _, _ in triples))
+    check("the citation stays the whole sentence", all(src == s for _, _, src in triples))
+    short = "Branches are {{legislative}}, executive, and judicial."
+    check("a short list is left alone", quality.trim_list_context(short) == short)
+    made = [cardsmod.Card(id=f"c{i}", front=f, back=b, source=src)
+            for i, (f, b, src) in enumerate(triples)]
+    check("cards cut from one sentence are siblings",
+          len({c.sibling_key for c in made}) == 1 and made[0].sibling_key)
+    check("a card without a citation has no siblings",
+          cardsmod.Card(id="x", front="q?", back="a").sibling_key == "")
+    back = made[1]
+    check("the trimmed card still reveals its blank",
+          "**" in back.answer() and "[ ... ]" in back.question(), back.question())
+
+
+def test_sessions_bury_siblings_and_carry_drafts():
+    section("session: siblings buried, drafts to look over")
+    cfg = Config()
+    cfg.study.new_cards_per_day = 10
+    sentence = "The three branches of government are legislative, executive, and judicial."
+    deck = cardsmod.Deck(note_id="n-gov", subject="Civics")
+    for item in ("legislative", "executive", "judicial"):
+        deck.add(front=sentence.replace(item, "{{" + item + "}}"), back=item,
+                 source=sentence, status="active")
+    deck.add(front="Who signs bills?", back="the president",
+             source="Bills become law when the president signs them.", status="active")
+    s = tutor.build_session([deck], cfg)
+    ids = [q.card.id for q in s.queue]
+    check("one sibling per session", len(ids) == 2 and s.buried == 2, (ids, s.buried))
+    cfg.study.bury_siblings = False
+    check("burying can be switched off", len(tutor.build_session([deck], cfg).queue) == 4)
+    cfg.study.bury_siblings = True
+
+    # A due sibling buries a new one.
+    deck.cards[0].reps, deck.cards[0].stability = 3, 5.0
+    deck.cards[0].due = dt.date.today()
+    deck.cards[0].last_review = dt.datetime.now().astimezone() - dt.timedelta(days=5)
+    s = tutor.build_session([deck], cfg)
+    reasons = sorted(q.reason for q in s.queue)
+    check("the due sibling wins", reasons == ["due", "new"] and s.buried == 2, (reasons, s.buried))
+
+    drafts = cardsmod.Deck(note_id="n-d", subject="Drafts")
+    for i in range(6):
+        drafts.add(front=f"Draft question {i}?", back=f"answer {i}",
+                   source=f"Sentence number {i} that supports draft answer {i}.")
+    cfg.study.new_cards_per_day = 3
+    s = tutor.build_session([drafts], cfg)
+    check("drafts come up as drafts", s.queue and all(q.reason == "draft" for q in s.queue),
+          [q.reason for q in s.queue])
+    check("inside the new-card budget", len(s.queue) == 3 and s.drafts_available == 6,
+          (len(s.queue), s.drafts_available))
+    check("in the order the note wrote them", [q.card.id for q in s.queue] == ["c1", "c2", "c3"])
+    check("the message says what they are", "to look over" in s.message, s.message)
+    s = tutor.build_session([drafts], cfg, introduced_today=3)
+    check("and the budget counts them", s.queue == [], s.message)
+    cfg.study.drafts_in_session = False
+    check("drafts can be kept out of sessions",
+          tutor.build_session([drafts], cfg).queue == [])
+
+    both = cardsmod.Deck(note_id="n-b", subject="Both")
+    both.add(front="Draft one?", back="x", source="A draft sentence long enough to count.")
+    both.add(front="Approved one?", back="y", status="active")
+    cfg.study.drafts_in_session = True
+    cfg.study.new_cards_per_day = 1
+    s = tutor.build_session([both], cfg)
+    check("approved new cards are introduced before drafts",
+          [q.reason for q in s.queue] == ["new"], [q.reason for q in s.queue])
+
+
+def test_exam_dates_cap_the_schedule():
+    section("exam cap: a deadline is a review that cannot be late")
+    today = dt.date(2026, 9, 16)
+    exam = dt.date(2026, 9, 21)
+    check("a due date past the eve is pulled back",
+          tutor.exam_cap(dt.date(2026, 10, 2), exam, today) == dt.date(2026, 9, 20))
+    check("a due date before the eve is left alone",
+          tutor.exam_cap(dt.date(2026, 9, 18), exam, today) == dt.date(2026, 9, 18))
+    check("the eve of the exam is not capped again",
+          tutor.exam_cap(dt.date(2026, 9, 30), exam, dt.date(2026, 9, 20)) == dt.date(2026, 9, 30))
+    check("no deadline, no change", tutor.exam_cap(dt.date(2026, 9, 30), None, today)
+          == dt.date(2026, 9, 30))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+        pid = engine.capture(
+            "Learn cellular respiration for the biology exam\n"
+            "- read the chapter on mitochondria", "project")["note"]["id"]
+        note = engine.note(pid)
+        deadline = dt.date.today() + dt.timedelta(days=5)
+        note.project.deadline = deadline
+        engine.vault.save(note)
+        deck = engine.deck(pid, create=True)
+        deck.add(front="What do mitochondria generate?", back="ATP", status="active",
+                 source="Mitochondria generate most of the cell's ATP.")
+        engine.decks.save(deck)
+
+        session = engine.study_session()
+        card = session["queue"][0]
+        check("the session knows the exam", card["exam"] == deadline.isoformat(), card["exam"])
+        check("the buttons show capped intervals",
+              card["intervals"]["easy"] <= 4, card["intervals"])
+        r = engine.study_answer(pid, card["id"], grade=4)
+        eve = deadline - dt.timedelta(days=1)
+        check("Easy is pulled back to the eve", r["capped_to"] == eve and r["due"] == eve, r)
+        log = list(engine.decks.reviews())
+        check("the log records the cap", log[-1].get("exam_cap") == eve.isoformat(), log[-1])
+
+        cfg.study.exam_cap = False
+        other = engine.deck(pid)
+        other.add(front="What does the citric acid cycle release?", back="stored energy",
+                  status="active", source="The citric acid cycle releases stored energy.")
+        engine.decks.save(other)
+        r2 = engine.study_answer(pid, other.cards[-1].id, grade=4)
+        check("switched off, FSRS decides alone", r2["capped_to"] is None and r2["interval_days"] > 4, r2)
+
+
+def test_leeches_are_suspended_and_rewritten():
+    section("leeches: suspended, then rewritten from source")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        engine = Engine(cfg)
+        nid = engine.capture(
+            "Oxidative phosphorylation is the final stage of cellular respiration and "
+            "produces the bulk of the ATP a cell uses. Glycolysis is the first stage "
+            "and happens in the cytoplasm.", "resource")["note"]["id"]
+        deck = engine.deck(nid, create=True)
+        card = deck.add(front="Which stage produces most ATP?", back="oxidative phosphorylation",
+                        status="active",
+                        source="Oxidative phosphorylation is the final stage of cellular "
+                               "respiration and produces the bulk of the ATP a cell uses.")
+        card.reps, card.lapses, card.stability, card.difficulty = 9, 7, 2.0, 8.0
+        card.due = dt.date.today()
+        card.last_review = dt.datetime.now().astimezone() - dt.timedelta(days=3)
+        engine.decks.save(deck)
+
+        r = engine.study_answer(nid, card.id, grade=1)
+        check("the eighth lapse is a leech", r["leech"] and r["suspended"], r)
+        check("a leech leaves the session",
+              all(q["id"] != card.id for q in engine.study_session()["queue"]))
+        over = engine.study_overview()
+        check("the overview lists it", any(l["card_id"] == card.id for l in over["leeches"]),
+              over["leeches"])
+
+        out = engine.study_rewrite(nid, card.id)
+        check("the rewrite makes drafts from the source", out["made"] >= 1, out)
+        check("which are drafts", all(c["status"] == "draft" for c in out["cards"]))
+        check("and cited", all(c["source"] for c in out["cards"]))
+        deck = engine.deck(nid)
+        check("the leech keeps its history", deck.card(card.id).lapses == 8
+              and deck.card(card.id).status == "suspended")
+        triage = list(engine.decks.triage())
+        check("the rewrite is logged", triage and triage[-1]["action"] == "rewrite", triage)
+
+        cfg.study.leech_action = "tag"
+        c2 = deck.add(front="Where does glycolysis happen?", back="the cytoplasm",
+                      status="active",
+                      source="Glycolysis is the first stage and happens in the cytoplasm.")
+        c2.reps, c2.lapses, c2.stability = 9, 7, 2.0
+        c2.due = dt.date.today()
+        c2.last_review = dt.datetime.now().astimezone() - dt.timedelta(days=3)
+        engine.decks.save(deck)
+        r = engine.study_answer(nid, c2.id, grade=1)
+        check("leech_action tag flags without suspending", r["leech"] and not r["suspended"], r)
+
+
+def test_triage_source_and_debrief_over_the_api():
+    section("triage, citation in context, debrief — over HTTP")
+    from starlette.testclient import TestClient
+    from sb.api import build_app
+
+    body = (
+        "Mitochondria are the organelles that generate most of the cell's ATP. "
+        "The citric acid cycle is a series of reactions that releases stored energy. "
+        "Oxidative phosphorylation is the final stage of cellular respiration and "
+        "produces the bulk of the ATP a cell uses."
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(vault=Path(tmp) / "vault")
+        cfg.llm.provider = "heuristic"
+        cfg.calendar.sink = "ics"
+        client = TestClient(build_app(cfg))
+        nid = client.post("/api/capture", json={"text": body, "bucket": "resource"}).json()["note"]["id"]
+        gen = client.post(f"/api/decks/{nid}/generate", json={}).json()
+        check("generation reports coverage", gen["coverage"]["passages"] >= 1, gen.get("coverage"))
+        check("and its key ideas", any(c["term"] == "Mitochondria" for c in gen["concepts"]),
+              gen["concepts"])
+
+        session = client.post("/api/study/session", json={}).json()
+        started = session["started_at"]
+        ids = [q["id"] for q in session["queue"]]
+        check("the drafts are in the session", len(ids) == 3 and
+              all(q["reason"] == "draft" for q in session["queue"]), session["message"])
+        over = client.get("/api/study/overview").json()
+        check("a folder of drafts is somewhere you can study",
+              any(f["drafts"] == 3 for f in over["folders"]), over["folders"])
+
+        kept = client.post(f"/api/study/{nid}/{ids[0]}/triage", json={"action": "keep"}).json()
+        check("keep activates", kept["card"]["status"] == "active", kept)
+        fixed = client.post(f"/api/study/{nid}/{ids[1]}/triage",
+                            json={"action": "fix", "front": "What does the citric acid cycle release?",
+                                  "back": "stored energy"}).json()
+        check("fix rewrites the question", fixed["card"]["question"] ==
+              "What does the citric acid cycle release?", fixed)
+        check("and hides the answer again", fixed["card"]["answer"] == "")
+        dropped = client.post(f"/api/study/{nid}/{ids[2]}/triage", json={"action": "drop"}).json()
+        check("drop removes the card", dropped["card"] is None and dropped["deck"]["cards"] == 2,
+              dropped["deck"])
+        bad = client.post(f"/api/study/{nid}/{ids[0]}/triage", json={"action": "burn"})
+        check("an unknown action is refused", bad.status_code >= 400, bad.status_code)
+        log = [json.loads(l) for l in
+               (Path(tmp) / "vault" / "_decks" / "_triage.jsonl").read_text().splitlines()]
+        check("every action is logged with its text",
+              [e["action"] for e in log] == ["keep", "fix", "drop"]
+              and log[2]["before"]["front"], log)
+
+        src = client.get(f"/api/study/{nid}/{ids[0]}/source").json()
+        check("the citation is found in its passage",
+              src["found"] and src["quote"] and src["quote"] in src["passage"], src)
+        check("with a link into Obsidian",
+              src["obsidian_uri"].startswith("obsidian://open?vault=vault&file="), src["obsidian_uri"])
+
+        client.post(f"/api/study/{nid}/{ids[0]}/answer", json={"grade": 1, "confidence": "sure"})
+        client.post(f"/api/study/{nid}/{ids[1]}/answer", json={"grade": 3})
+        deb = client.post("/api/study/debrief", json={"since": started}).json()
+        check("the debrief counts the session", deb["reviewed"] == 2 and deb["correct"] == 1, deb)
+        check("the miss is listed, sure-and-wrong first",
+              deb["shaky"] and deb["shaky"][0]["card_id"] == ids[0]
+              and deb["shaky"][0]["overconfident"], deb["shaky"])
+        check("with the passage to re-read",
+              deb["reread"] and "Mitochondria" in deb["reread"][0]["passage"], deb["reread"])
+        check("and what was triaged", deb["triaged"] == {"keep": 1, "fix": 1, "drop": 1},
+              deb["triaged"])
+        later = client.post("/api/study/debrief",
+                            json={"since": (dt.datetime.now(dt.timezone.utc)
+                                            + dt.timedelta(minutes=5)).isoformat()}).json()
+        check("a debrief only covers its own session", later["reviewed"] == 0, later)
+
+        cov = client.get(f"/api/decks/{nid}/coverage").json()
+        check("coverage over HTTP", cov["passages"] >= 1 and "rows" in cov, cov)
+        gaps = client.post(f"/api/decks/{nid}/generate", json={"fill_gaps": True}).json()
+        check("fill gaps over HTTP", gaps["fill_gaps"] is True and gaps["generated"] == 0, gaps)
+        rw = client.post(f"/api/study/{nid}/{ids[0]}/rewrite", json={}).json()
+        check("rewrite over HTTP", "made" in rw and rw["note"], rw)
+        page = client.get("/study").text
+        check("the study page carries the new controls",
+              all(k in page for k in ('id="triagebar"', 'id="sourcebox2"', "/debrief", "fill_gaps")))
+
+
 def main():
     for fn in [
         test_frontmatter, test_dates, test_steps_and_prior, test_coercion,
@@ -8266,6 +8750,15 @@ def main():
         test_the_capture_box_reads_a_selection,
         test_parsing_and_creation_hardening,
         test_ollama_doctor,
+        # -- phase 17: Anki x NotebookLM
+        test_study_guide_reads_the_whole_note,
+        test_generation_covers_the_whole_note,
+        test_grounding_keeps_only_what_the_note_says,
+        test_long_list_clozes_overlap,
+        test_sessions_bury_siblings_and_carry_drafts,
+        test_exam_dates_cap_the_schedule,
+        test_leeches_are_suspended_and_rewritten,
+        test_triage_source_and_debrief_over_the_api,
     ]:
         try:
             fn()

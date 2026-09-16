@@ -59,6 +59,10 @@ REVIEW_LOG = "_reviews.jsonl"
 #: line that is not would quietly skew the streak, the heatmap and any
 #: future FSRS fit.
 EXPLAIN_LOG = "_explanations.jsonl"
+#: What lj did with a drafted card when it first came up in a session —
+#: keep, fix or drop — with the text before and after. Every drop is a
+#: labelled example of a card the generator should not have written.
+TRIAGE_LOG = "_triage.jsonl"
 
 #: One card block in a deck body. The id in the heading is the join key.
 #: The trailing `.*` swallows the decorative status marker the renderer adds
@@ -236,6 +240,19 @@ class Card(BaseModel):
         self.lapses = scheduled.memory.lapses
         self.due = scheduled.due
         self.last_review = _now()
+
+    @property
+    def sibling_key(self) -> str:
+        """Cards cut from the same sentence share this; others get "".
+
+        Anki buries a note's other cards for the day, because seeing
+        "{{legislative}}, executive and judicial" answers the next card's
+        blank before you reach it. Here the note is implicit — the source
+        sentence — so the key is derived, not stored, and a hand-edited
+        citation regroups the card by itself.
+        """
+        src = re.sub(r"[^a-z0-9]+", " ", (self.source or "").lower()).strip()
+        return src if len(src) >= 20 else ""
 
     # -- rendering ----------------------------------------------------------
 
@@ -607,6 +624,16 @@ class DeckStore:
 
     def log_review(self, entry: Dict[str, Any]) -> None:
         self._append(self.log_path, entry)
+
+    @property
+    def triage_log_path(self) -> Path:
+        return self.root / TRIAGE_LOG
+
+    def log_triage(self, entry: Dict[str, Any]) -> None:
+        self._append(self.triage_log_path, entry)
+
+    def triage(self) -> Iterator[Dict[str, Any]]:
+        return _read_jsonl(self.triage_log_path)
 
     def log_explanation(self, entry: Dict[str, Any]) -> None:
         self._append(self.explain_log_path, entry)

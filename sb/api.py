@@ -578,6 +578,46 @@ def build_app(cfg: Config | None = None) -> Starlette:
         return ok(await run_in_threadpool(engine.study_session, subjects, limit, folders))
 
     @guard
+    async def study_debrief(request: Request):
+        body = await body_of(request)
+        return ok(await run_in_threadpool(engine.study_debrief, body.get("since", "")))
+
+    @guard
+    async def study_triage(request: Request):
+        body = await request.json()
+        return ok(await run_in_threadpool(
+            lambda: engine.study_triage(
+                request.path_params["note_id"],
+                request.path_params["card_id"],
+                body.get("action", ""),
+                front=body.get("front"),
+                back=body.get("back"),
+            )
+        ))
+
+    @guard
+    async def study_source(request: Request):
+        return ok(await run_in_threadpool(
+            engine.study_source,
+            request.path_params["note_id"],
+            request.path_params["card_id"],
+        ))
+
+    @guard
+    async def study_rewrite(request: Request):
+        return ok(await run_in_threadpool(
+            engine.study_rewrite,
+            request.path_params["note_id"],
+            request.path_params["card_id"],
+        ))
+
+    @guard
+    async def deck_coverage(request: Request):
+        return ok(await run_in_threadpool(
+            engine.deck_coverage, request.path_params["note_id"]
+        ))
+
+    @guard
     async def study_reveal(request: Request):
         return ok(await run_in_threadpool(
             engine.study_reveal,
@@ -696,6 +736,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
                 request.path_params["note_id"],
                 max_cards=int(body["max_cards"]) if body.get("max_cards") else None,
                 source=body.get("source", ""),
+                fill_gaps=bool(body.get("fill_gaps")),
             )
         ))
 
@@ -896,6 +937,10 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/study/stats", study_stats),
         Route("/api/study/reminder", study_reminder),
         Route("/api/study/session", study_session, methods=["GET", "POST"]),
+        Route("/api/study/debrief", study_debrief, methods=["GET", "POST"]),
+        Route("/api/study/{note_id}/{card_id}/triage", study_triage, methods=["POST"]),
+        Route("/api/study/{note_id}/{card_id}/source", study_source),
+        Route("/api/study/{note_id}/{card_id}/rewrite", study_rewrite, methods=["POST"]),
         Route("/api/study/{note_id}/{card_id}/reveal", study_reveal),
         Route("/api/study/{note_id}/{card_id}/mark", study_mark, methods=["POST"]),
         Route("/api/study/{note_id}/{card_id}/answer", study_answer, methods=["POST"]),
@@ -907,6 +952,7 @@ def build_app(cfg: Config | None = None) -> Starlette:
         Route("/api/notes/{note_id}/connect", connect_note, methods=["POST"]),
         Route("/api/connect", connect_all, methods=["POST"]),
         Route("/api/decks/generate-folder", generate_folder, methods=["POST"]),
+        Route("/api/decks/{note_id}/coverage", deck_coverage),
         Route("/api/decks/{note_id}", get_deck),
         Route("/api/decks/{note_id}/generate", generate_cards, methods=["POST"]),
         Route("/api/decks/{note_id}/approve", approve_cards, methods=["POST"]),

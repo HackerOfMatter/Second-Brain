@@ -311,6 +311,46 @@ def _blank(sentence: str, item: str) -> Tuple[str, str]:
     )
 
 
+#: A list sentence longer than this is trimmed around its blank when it is
+#: split. Anki's community calls the result an *overlapping cloze*: the stem,
+#: the neighbour on each side, and the blank — enough context to cue one item
+#: without handing over the other seven.
+LONG_CLOZE_WORDS = 28
+ELLIPSIS = "…"
+
+
+def trim_list_context(blanked: str) -> str:
+    """Cut a long list sentence down to the stem and the blank's neighbours.
+
+    `blanked` already carries one `{{…}}`. Pieces are the comma/semicolon
+    separated parts of the sentence; the first piece is the stem (it names
+    what the list is *of*) and is always kept. Every kept character is the
+    note's own; the only thing added is an ellipsis where pieces were cut, so
+    the repair still cannot add a fact.
+    """
+    if words(blanked) <= LONG_CLOZE_WORDS or "{{" not in blanked:
+        return blanked
+    pieces = re.split(r"(?<=[,;])\s+", blanked)
+    if len(pieces) < 4:
+        return blanked
+    at = next((i for i, p in enumerate(pieces) if "{{" in p), -1)
+    if at < 0:
+        return blanked
+    keep = sorted({0, max(0, at - 1), at, min(len(pieces) - 1, at + 1)})
+    out: List[str] = []
+    last = -1
+    for i in keep:
+        if last >= 0 and i != last + 1:
+            out.append(ELLIPSIS)
+        out.append(pieces[i])
+        last = i
+    if last < len(pieces) - 1:
+        out.append(ELLIPSIS)
+    text = " ".join(out)
+    text = re.sub(r"\s+" + ELLIPSIS, " " + ELLIPSIS, text)
+    return text if words(text) < words(blanked) else blanked
+
+
 def split_to_cloze(
     back: str, quote: str, passage: str = "", *, max_cards: int = MAX_SPLIT
 ) -> List[Tuple[str, str, str]]:
@@ -335,6 +375,9 @@ def split_to_cloze(
         front, shown = _blank(sentence, item)
         if not front or len(sentence) - len(item) < MIN_CLOZE_CONTEXT:
             continue
+        # The source stays the whole sentence: the citation is the note's
+        # line, the question is the part of it worth reading.
+        front = trim_list_context(front)
         seen.add(item.lower())
         out.append((front, shown, sentence))
     return out if len(out) >= 2 else []
